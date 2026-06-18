@@ -267,6 +267,15 @@ impl Database {
         Ok(())
     }
 
+    /// 清除游戏封面（将 cover_url 和 cover_local 设置为 NULL）
+    pub fn remove_game_cover(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE games SET cover_url = NULL, cover_local = NULL, updated_at = ?1 WHERE id = ?2",
+            params![chrono::Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
     /// 更新游戏信息
     pub fn update_game(&self, game: &Game) -> Result<()> {
         self.conn.execute(

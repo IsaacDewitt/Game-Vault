@@ -102,11 +102,13 @@ pub fn run() {
             commands::games::delete_game,
             commands::games::add_game_manual,
             commands::games::set_game_cover,
+            commands::games::remove_game_cover,
             commands::games::get_all_covers,
             commands::games::fetch_missing_covers,
             commands::games::fetch_game_info_llm,
             commands::games::read_cover_as_base64,
             commands::games::read_covers_batch_as_base64,
+            commands::games::rename_game,
             commands::games::export_game_data,
             // 统计相关
             commands::stats::get_play_stats,

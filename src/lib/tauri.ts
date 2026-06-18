@@ -87,6 +87,10 @@ export async function setGameCover(gameId: string, coverPath: string): Promise<v
   return invoke("set_game_cover", { gameId, coverPath });
 }
 
+export async function removeGameCover(gameId: string): Promise<void> {
+  return invoke("remove_game_cover", { gameId });
+}
+
 export interface CoverFetchResult {
   fetched: number;
   total: number;
@@ -141,4 +145,8 @@ export async function saveSettings(settings: Settings): Promise<void> {
 
 export async function exportGameData(): Promise<string> {
   return invoke("export_game_data");
+}
+
+export async function renameGame(gameId: string, newName: string): Promise<void> {
+  return invoke("rename_game", { gameId, newName });
 }

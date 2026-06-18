@@ -16,6 +16,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { ref, computed } from "vue";
 import { useDebounceFn } from "@vueuse/core";
 import { useGamesStore } from "../stores/games";
+import * as api from "../lib/tauri";
 import GameCard from "../components/GameCard.vue";
 import GameDetail from "../components/GameDetail.vue";
 import ContextMenu from "../components/ContextMenu.vue";
@@ -202,6 +203,26 @@ async function handleRefreshInfo(gameId: string) {
   }
 }
 
+async function handleRemoveCover(gameId: string) {
+  const game = store.games.find((g) => g.id === gameId);
+  const gameName = game?.name || "该游戏";
+  dialog.warning({
+    title: "删除封面",
+    content: `确定要删除「${gameName}」的封面吗？删除后可点击「刷新封面」重新获取。`,
+    positiveText: "删除",
+    negativeText: "取消",
+    onPositiveClick: async () => {
+      try {
+        await api.removeGameCover(gameId);
+        await store.loadGames();
+        message.success("封面已删除");
+      } catch (e) {
+        message.error("删除封面失败");
+      }
+    },
+  });
+}
+
 function handleDeleteGame(gameId: string) {
   const game = store.games.find((g) => g.id === gameId);
   const gameName = game?.name || "该游戏";
@@ -303,6 +324,7 @@ function handleDeleteGame(gameId: string) {
           @delete="handleDeleteGame(game.id)"
           @rename="handleRenameGame(game.id)"
           @refresh-info="handleRefreshInfo(game.id)"
+          @remove-cover="handleRemoveCover(game.id)"
         />
       </div>
     </div>
@@ -406,6 +428,27 @@ function handleDeleteGame(gameId: string) {
 .content-area {
   height: calc(100vh - 140px);
   overflow-y: auto;
+
+  /* Dark scrollbar to match project theme */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+
+.content-area::-webkit-scrollbar {
+  width: 6px;
+}
+
+.content-area::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.content-area::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
+}
+
+.content-area::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.35);
 }
 
 .loading,

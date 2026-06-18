@@ -152,6 +152,16 @@ pub fn set_game_cover(
     db.update_game_cover(&game_id, &cover_path).map_err(|e| e.to_string())
 }
 
+/// 删除游戏封面（清除 cover_url 和 cover_local）
+#[tauri::command]
+pub fn remove_game_cover(
+    db: State<'_, Arc<Mutex<Database>>>,
+    game_id: String,
+) -> Result<(), String> {
+    let db = lock_or_recover(&db);
+    db.remove_game_cover(&game_id).map_err(|e| e.to_string())
+}
+
 /// 获取所有游戏的有效封面路径（供前端通过 asset 协议加载）
 #[tauri::command]
 pub fn get_all_covers(
@@ -406,6 +416,25 @@ pub fn read_cover_as_base64(path: String) -> Result<String, String> {
     let bytes = std::fs::read(&canonical_file).map_err(|e| format!("读取文件失败: {}", e))?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:image/jpeg;base64,{}", b64))
+}
+
+/// 重命名游戏
+#[tauri::command]
+pub fn rename_game(
+    db: State<'_, Arc<Mutex<Database>>>,
+    game_id: String,
+    new_name: String,
+) -> Result<(), String> {
+    if new_name.trim().is_empty() {
+        return Err("游戏名称不能为空".to_string());
+    }
+    let db = lock_or_recover(&db);
+    let mut game = db.get_game_by_id(&game_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "游戏不存在".to_string())?;
+    game.name = new_name.trim().to_string();
+    game.updated_at = Some(chrono::Utc::now().to_rfc3339());
+    db.update_game(&game).map_err(|e| e.to_string())
 }
 
 /// 导出游戏库数据为 JSON 文件

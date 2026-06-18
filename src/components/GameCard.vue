@@ -20,6 +20,7 @@ const emit = defineEmits<{
   delete: [];
   rename: [];
   refreshInfo: [];
+  removeCover: [];
 }>();
 
 const showContextMenu = ref(false);
@@ -54,6 +55,11 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => [
     label: "刷新信息",
     icon: "🔄",
     action: () => emit("refreshInfo"),
+  },
+  {
+    label: "删除封面",
+    icon: "🖼️",
+    action: () => emit("removeCover"),
   },
   { label: "", action: () => {}, divider: true },
   {
