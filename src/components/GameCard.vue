@@ -21,6 +21,7 @@ const emit = defineEmits<{
   rename: [];
   refreshInfo: [];
   removeCover: [];
+  toggleCompleted: [];
 }>();
 
 const showContextMenu = ref(false);
@@ -39,6 +40,12 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => [
     label: props.game.is_favorite ? "取消收藏" : "添加收藏",
     icon: props.game.is_favorite ? "💔" : "❤️",
     action: () => emit("favorite"),
+  },
+  { label: "", action: () => {}, divider: true },
+  {
+    label: props.game.status === "completed" ? "取消通关" : "标记为已通关",
+    icon: props.game.status === "completed" ? "🎮" : "🏆",
+    action: () => emit("toggleCompleted"),
   },
   { label: "", action: () => {}, divider: true },
   {
@@ -117,6 +124,11 @@ function handleContextMenu(e: MouseEvent) {
       <!-- 正在游玩 -->
       <div v-if="isActive" class="playing-badge">
         <span class="pulse"></span> 游玩中
+      </div>
+
+      <!-- 已通关 -->
+      <div v-if="game.status === 'completed'" class="completed-badge">
+        🏆 已通关
       </div>
     </div>
 
@@ -244,6 +256,17 @@ function handleContextMenu(e: MouseEvent) {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+.completed-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: white;
+  background: rgba(34, 197, 94, 0.9);
 }
 
 .pulse {

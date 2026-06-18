@@ -37,6 +37,7 @@ impl Database {
                 last_played TEXT,
                 play_count INTEGER DEFAULT 0,
                 is_favorite INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'unplayed',
                 added_at TEXT NOT NULL,
                 updated_at TEXT
             );
@@ -67,6 +68,51 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_play_sessions_game_id ON play_sessions(game_id);
             CREATE INDEX IF NOT EXISTS idx_play_sessions_start_time ON play_sessions(start_time);
         ")?;
+
+        // 迁移：为旧数据库添加 status 字段（必须在索引创建之前）
+        self.migrate_add_status_column()?;
+
+        // 创建 status 索引（在列存在之后）
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_games_status ON games(status);"
+        )?;
+
+        Ok(())
+    }
+
+    /// 迁移：添加 status 字段到旧数据库
+    fn migrate_add_status_column(&self) -> Result<()> {
+        // 检查 status 列是否存在
+        let has_column: bool = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(games)")?;
+            let columns = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?)
+            })?;
+
+            let mut found = false;
+            for col in columns {
+                match col {
+                    Ok(name) if name == "status" => {
+                        found = true;
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+            found
+        };
+
+        if !has_column {
+            tracing::info!("status 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE games ADD COLUMN status TEXT DEFAULT 'unplayed'"
+            , [])?;
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_games_status ON games(status)"
+            , [])?;
+            tracing::info!("已添加 status 字段到 games 表");
+        }
+
         Ok(())
     }
 
@@ -94,8 +140,9 @@ impl Database {
             last_played: row.get(13)?,
             play_count: row.get::<_, i64>(14).unwrap_or(0).max(0) as u32,
             is_favorite: row.get::<_, i64>(15).unwrap_or(0) != 0,
-            added_at: row.get(16)?,
-            updated_at: row.get(17)?,
+            status: row.get(16).unwrap_or_else(|_| "unplayed".to_string()),
+            added_at: row.get(17)?,
+            updated_at: row.get(18)?,
         })
     }
 
@@ -103,7 +150,7 @@ impl Database {
         id, name, install_path, exe_path, exe_name,
         cover_local, cover_url, description, developer, publisher, release_date,
         genres, play_time_seconds, last_played, play_count,
-        is_favorite, added_at, updated_at
+        is_favorite, status, added_at, updated_at
     ";
 
     // ==================== 游戏 CRUD ====================
@@ -115,9 +162,9 @@ impl Database {
                 id, name, install_path, exe_path, exe_name,
                 cover_local, cover_url, description, developer, publisher, release_date,
                 genres, play_time_seconds, last_played, play_count,
-                is_favorite, added_at, updated_at
+                is_favorite, status, added_at, updated_at
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -134,6 +181,7 @@ impl Database {
                 play_time_seconds = games.play_time_seconds,
                 last_played = games.last_played,
                 play_count = games.play_count,
+                status = excluded.status,
                 updated_at = excluded.updated_at
             ",
             params![
@@ -153,6 +201,7 @@ impl Database {
                 game.last_played,
                 game.play_count as i64,
                 game.is_favorite as i64,
+                game.status,
                 game.added_at,
                 game.updated_at,
             ],
@@ -175,7 +224,7 @@ impl Database {
             "SELECT id, name, install_path, exe_path, exe_name,
                     cover_local, cover_url, description, developer, publisher, release_date,
                     genres, play_time_seconds, last_played, play_count,
-                    is_favorite, added_at, updated_at
+                    is_favorite, status, added_at, updated_at
              FROM games WHERE 1=1"
         );
 
@@ -283,8 +332,8 @@ impl Database {
                 name = ?1, install_path = ?2, exe_path = ?3, exe_name = ?4,
                 cover_local = ?5, cover_url = ?6, description = ?7,
                 developer = ?8, publisher = ?9, release_date = ?10,
-                genres = ?11, is_favorite = ?12, updated_at = ?13
-             WHERE id = ?14",
+                genres = ?11, is_favorite = ?12, status = ?13, updated_at = ?14
+             WHERE id = ?15",
             params![
                 game.name,
                 game.install_path,
@@ -298,9 +347,19 @@ impl Database {
                 game.release_date,
                 serde_json::to_string(&game.genres)?,
                 game.is_favorite as i64,
+                game.status,
                 chrono::Utc::now().to_rfc3339(),
                 game.id,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// 更新游戏状态
+    pub fn set_game_status(&self, id: &str, status: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE games SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status, chrono::Utc::now().to_rfc3339(), id],
         )?;
         Ok(())
     }
@@ -426,5 +485,123 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(total as u64)
+    }
+
+    /// 获取游戏类型统计
+    pub fn get_genre_stats(&self) -> Result<Vec<GenreStats>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT genres, play_time_seconds FROM games WHERE play_time_seconds > 0"
+        )?;
+
+        let mut genre_map: std::collections::HashMap<String, (u64, u32)> = std::collections::HashMap::new();
+
+        let rows = stmt.query_map([], |row| {
+            let genres_str: String = row.get(0)?;
+            let play_time: i64 = row.get(1)?;
+            Ok((genres_str, play_time.max(0) as u64))
+        })?;
+
+        for row in rows {
+            let (genres_str, play_time) = row?;
+            let genres: Vec<String> = serde_json::from_str(&genres_str).unwrap_or_default();
+            for genre in genres {
+                let entry = genre_map.entry(genre).or_insert((0, 0));
+                entry.0 += play_time;
+                entry.1 += 1;
+            }
+        }
+
+        let mut stats: Vec<GenreStats> = genre_map
+            .into_iter()
+            .map(|(genre, (total_seconds, game_count))| GenreStats {
+                genre,
+                total_seconds,
+                game_count,
+            })
+            .collect();
+
+        stats.sort_by(|a, b| b.total_seconds.cmp(&a.total_seconds));
+        Ok(stats)
+    }
+
+    /// 获取热力图数据（按日期聚合游玩时长）
+    pub fn get_heatmap_stats(&self, days: u32) -> Result<Vec<HeatmapDay>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DATE(start_time) as date, SUM(duration_seconds) as total
+             FROM play_sessions
+             WHERE start_time >= DATE('now', '-' || ?1 || ' days')
+             GROUP BY DATE(start_time)
+             ORDER BY date"
+        )?;
+
+        let stats = stmt.query_map(params![days], |row| {
+            Ok(HeatmapDay {
+                date: row.get(0)?,
+                total_seconds: row.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+
+        Ok(stats)
+    }
+
+    /// 获取游玩时段分布（24小时 x 7天）
+    pub fn get_hourly_stats(&self) -> Result<Vec<HourlyStats>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                CAST(strftime('%H', start_time) AS INTEGER) as hour,
+                CAST(strftime('%w', start_time) AS INTEGER) as weekday,
+                SUM(duration_seconds) as total
+             FROM play_sessions
+             GROUP BY hour, weekday
+             ORDER BY weekday, hour"
+        )?;
+
+        let stats = stmt.query_map([], |row| {
+            let weekday_raw: u32 = row.get(1)?;
+            // SQLite strftime('%w'): 0=Sunday, 1=Monday, ..., 6=Saturday
+            // 转换为: 1=Monday, ..., 7=Sunday
+            let weekday = if weekday_raw == 0 { 7 } else { weekday_raw };
+
+            Ok(HourlyStats {
+                hour: row.get(0)?,
+                weekday,
+                total_seconds: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+
+        Ok(stats)
+    }
+
+    /// 获取游戏状态统计
+    pub fn get_status_stats(&self) -> Result<StatusStats> {
+        let mut stmt = self.conn.prepare(
+            "SELECT status, COUNT(*) FROM games GROUP BY status"
+        )?;
+
+        let mut stats = StatusStats {
+            unplayed: 0,
+            playing: 0,
+            completed: 0,
+            abandoned: 0,
+        };
+
+        let rows = stmt.query_map([], |row| {
+            let status: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((status, count as u32))
+        })?;
+
+        for row in rows {
+            let (status, count) = row?;
+            match status.as_str() {
+                "unplayed" => stats.unplayed = count,
+                "playing" => stats.playing = count,
+                "completed" => stats.completed = count,
+                "abandoned" => stats.abandoned = count,
+                _ => {}
+            }
+        }
+
+        Ok(stats)
     }
 }

@@ -62,3 +62,41 @@ pub fn get_overview_stats(
         "today_play_time": today_seconds,
     }))
 }
+
+/// 获取游戏类型统计
+#[tauri::command]
+pub fn get_genre_stats(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<Vec<GenreStats>, String> {
+    let db = lock_or_recover(&db);
+    db.get_genre_stats().map_err(|e| e.to_string())
+}
+
+/// 获取热力图数据
+#[tauri::command]
+pub fn get_heatmap_stats(
+    db: State<'_, Arc<Mutex<Database>>>,
+    days: Option<u32>,
+) -> Result<Vec<HeatmapDay>, String> {
+    let db = lock_or_recover(&db);
+    let days = days.unwrap_or(365);
+    db.get_heatmap_stats(days).map_err(|e| e.to_string())
+}
+
+/// 获取游玩时段分布
+#[tauri::command]
+pub fn get_hourly_stats(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<Vec<HourlyStats>, String> {
+    let db = lock_or_recover(&db);
+    db.get_hourly_stats().map_err(|e| e.to_string())
+}
+
+/// 获取游戏状态统计
+#[tauri::command]
+pub fn get_status_stats(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<StatusStats, String> {
+    let db = lock_or_recover(&db);
+    db.get_status_stats().map_err(|e| e.to_string())
+}

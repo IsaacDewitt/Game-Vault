@@ -223,6 +223,34 @@ async function handleRemoveCover(gameId: string) {
   });
 }
 
+async function handleToggleCompleted(gameId: string) {
+  const game = store.games.find((g) => g.id === gameId);
+  if (!game) return;
+
+  const newStatus = game.status === "completed" ? "unplayed" : "completed";
+  try {
+    await store.setGameStatus(gameId, newStatus);
+    message.success(newStatus === "completed" ? "已标记为通关" : "已取消通关状态");
+  } catch (e) {
+    message.error("设置游戏状态失败");
+  }
+}
+
+async function handleSetGameStatus(gameId: string, status: string) {
+  try {
+    await store.setGameStatus(gameId, status);
+    const statusText: Record<string, string> = {
+      unplayed: "未游玩",
+      playing: "游玩中",
+      completed: "已通关",
+      abandoned: "已弃坑",
+    };
+    message.success(`游戏状态已更新为：${statusText[status] || status}`);
+  } catch (e) {
+    message.error("设置游戏状态失败");
+  }
+}
+
 function handleDeleteGame(gameId: string) {
   const game = store.games.find((g) => g.id === gameId);
   const gameName = game?.name || "该游戏";
@@ -325,6 +353,7 @@ function handleDeleteGame(gameId: string) {
           @rename="handleRenameGame(game.id)"
           @refresh-info="handleRefreshInfo(game.id)"
           @remove-cover="handleRemoveCover(game.id)"
+          @toggle-completed="handleToggleCompleted(game.id)"
         />
       </div>
     </div>
@@ -338,6 +367,7 @@ function handleDeleteGame(gameId: string) {
       @launch="store.launch(store.selectedGame!.id)"
       @favorite="store.toggleFav(store.selectedGame!.id)"
       @delete="handleDeleteGame(store.selectedGame!.id)"
+      @set-status="handleSetGameStatus(store.selectedGame!.id, $event)"
     />
 
     <!-- 输入游戏名称弹窗 -->

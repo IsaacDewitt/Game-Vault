@@ -20,6 +20,8 @@ pub struct Game {
     pub last_played: Option<String>,
     pub play_count: u32,
     pub is_favorite: bool,
+    /// 游戏状态: "unplayed", "playing", "completed", "abandoned"
+    pub status: String,
     pub added_at: String,
     pub updated_at: Option<String>,
 }
@@ -44,6 +46,7 @@ impl Game {
             last_played: None,
             play_count: 0,
             is_favorite: false,
+            status: "unplayed".to_string(),
             added_at: chrono::Utc::now().to_rfc3339(),
             updated_at: None,
         }

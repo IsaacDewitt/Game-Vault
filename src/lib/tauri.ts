@@ -19,6 +19,8 @@ export interface Game {
   last_played: string | null;
   play_count: number;
   is_favorite: boolean;
+  /** 游戏状态: "unplayed", "playing", "completed", "abandoned" */
+  status: string;
   added_at: string;
   updated_at: string | null;
 }
@@ -43,6 +45,30 @@ export interface DailyStats {
   date: string;
   total_seconds: number;
   sessions_count: number;
+}
+
+export interface GenreStats {
+  genre: string;
+  total_seconds: number;
+  game_count: number;
+}
+
+export interface HeatmapDay {
+  date: string;
+  total_seconds: number;
+}
+
+export interface HourlyStats {
+  hour: number;
+  weekday: number;
+  total_seconds: number;
+}
+
+export interface StatusStats {
+  unplayed: number;
+  playing: number;
+  completed: number;
+  abandoned: number;
 }
 
 export interface Settings {
@@ -129,6 +155,26 @@ export async function getOverviewStats(): Promise<{
   today_play_time: number;
 }> {
   return invoke("get_overview_stats");
+}
+
+export async function getGenreStats(): Promise<GenreStats[]> {
+  return invoke("get_genre_stats");
+}
+
+export async function getHeatmapStats(days?: number): Promise<HeatmapDay[]> {
+  return invoke("get_heatmap_stats", { days });
+}
+
+export async function getHourlyStats(): Promise<HourlyStats[]> {
+  return invoke("get_hourly_stats");
+}
+
+export async function getStatusStats(): Promise<StatusStats> {
+  return invoke("get_status_stats");
+}
+
+export async function setGameStatus(gameId: string, status: string): Promise<void> {
+  return invoke("set_game_status", { gameId, status });
 }
 
 export async function fetchGameInfoLlm(gameId: string): Promise<Game> {

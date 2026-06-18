@@ -110,10 +110,15 @@ pub fn run() {
             commands::games::read_covers_batch_as_base64,
             commands::games::rename_game,
             commands::games::export_game_data,
+            commands::games::set_game_status,
             // 统计相关
             commands::stats::get_play_stats,
             commands::stats::get_daily_stats,
             commands::stats::get_overview_stats,
+            commands::stats::get_genre_stats,
+            commands::stats::get_heatmap_stats,
+            commands::stats::get_hourly_stats,
+            commands::stats::get_status_stats,
             // 设置相关
             commands::settings::get_settings,
             commands::settings::save_settings,

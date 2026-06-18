@@ -19,6 +19,8 @@ import {
   TrashOutline,
   GameControllerOutline,
   ImageOutline,
+  CheckmarkCircleOutline,
+  TrophyOutline,
 } from "@vicons/ionicons5";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Game } from "../lib/tauri";
@@ -36,6 +38,7 @@ const emit = defineEmits<{
   launch: [];
   favorite: [];
   delete: [];
+  setStatus: [status: string];
 }>();
 
 const store = useGamesStore();
@@ -202,6 +205,15 @@ async function handleChangeCover() {
               <n-icon :component="PlayOutline" />
             </template>
             {{ isActive ? '游玩中' : '启动游戏' }}
+          </n-button>
+          <n-button
+            :type="game.status === 'completed' ? 'success' : 'default'"
+            @click="emit('setStatus', game.status === 'completed' ? 'unplayed' : 'completed')"
+          >
+            <template #icon>
+              <n-icon :component="game.status === 'completed' ? CheckmarkCircleOutline : TrophyOutline" />
+            </template>
+            {{ game.status === 'completed' ? '已通关' : '标记通关' }}
           </n-button>
           <n-button
             :type="game.is_favorite ? 'error' : 'default'"

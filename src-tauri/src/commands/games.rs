@@ -462,6 +462,29 @@ pub fn rename_game(
     db.update_game(&game).map_err(|e| e.to_string())
 }
 
+/// 设置游戏状态
+#[tauri::command]
+pub fn set_game_status(
+    db: State<'_, Arc<Mutex<Database>>>,
+    game_id: String,
+    status: String,
+) -> Result<(), String> {
+    // 验证状态值
+    let valid_statuses = ["unplayed", "playing", "completed", "abandoned"];
+    if !valid_statuses.contains(&status.as_str()) {
+        return Err(format!("无效的游戏状态: {}，有效值为: {:?}", status, valid_statuses));
+    }
+
+    let db = lock_or_recover(&db);
+
+    // 验证游戏存在
+    let _game = db.get_game_by_id(&game_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "游戏不存在".to_string())?;
+
+    db.set_game_status(&game_id, &status).map_err(|e| e.to_string())
+}
+
 /// 导出游戏库数据为 JSON 文件
 #[tauri::command]
 pub fn export_game_data(

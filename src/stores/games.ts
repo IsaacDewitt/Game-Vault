@@ -246,6 +246,22 @@ export const useGamesStore = defineStore("games", () => {
     }
   }
 
+  async function setGameStatus(gameId: string, status: string) {
+    try {
+      await api.setGameStatus(gameId, status);
+      const game = games.value.find((g) => g.id === gameId);
+      if (game) {
+        game.status = status;
+      }
+      if (selectedGame.value?.id === gameId) {
+        selectedGame.value.status = status;
+      }
+    } catch (e) {
+      console.error("设置游戏状态失败:", e);
+      throw e;
+    }
+  }
+
   function selectGame(game: Game) {
     selectedGame.value = game;
   }
@@ -276,6 +292,7 @@ export const useGamesStore = defineStore("games", () => {
     toggleFav,
     removeGame,
     renameGame,
+    setGameStatus,
     selectGame,
     clearSelection,
     setupEventListeners,

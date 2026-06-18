@@ -130,7 +130,6 @@ onMounted(loadSettings);
           <n-input
             v-model:value="settings.steamgriddb_api_key"
             placeholder="可选，用于自动获取封面图"
-            type="password"
           />
         </n-form-item>
       </n-form>
@@ -175,7 +174,6 @@ onMounted(loadSettings);
           <n-input
             v-model:value="settings.llm_api_key"
             placeholder="输入 API Key"
-            type="password"
           />
         </n-form-item>
       </n-form>

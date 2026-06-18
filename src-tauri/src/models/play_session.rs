@@ -37,3 +37,35 @@ pub struct GamePlayStats {
     pub play_count: u32,
     pub last_played: Option<String>,
 }
+
+/// 游戏类型统计
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenreStats {
+    pub genre: String,
+    pub total_seconds: u64,
+    pub game_count: u32,
+}
+
+/// 热力图日期数据
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeatmapDay {
+    pub date: String,
+    pub total_seconds: u64,
+}
+
+/// 游玩时段统计
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HourlyStats {
+    pub hour: u32,
+    pub weekday: u32,
+    pub total_seconds: u64,
+}
+
+/// 游戏状态统计
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusStats {
+    pub unplayed: u32,
+    pub playing: u32,
+    pub completed: u32,
+    pub abandoned: u32,
+}
