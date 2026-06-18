@@ -13,11 +13,13 @@ import {
 } from "naive-ui";
 import { SearchOutline, CloudDownloadOutline, AddOutline } from "@vicons/ionicons5";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ref } from "vue";
+import { ref, computed } from "vue";
 import { useDebounceFn } from "@vueuse/core";
 import { useGamesStore } from "../stores/games";
 import GameCard from "../components/GameCard.vue";
 import GameDetail from "../components/GameDetail.vue";
+import ContextMenu from "../components/ContextMenu.vue";
+import type { ContextMenuItem } from "../components/ContextMenu.vue";
 
 const store = useGamesStore();
 const message = useMessage();
@@ -29,6 +31,39 @@ const pendingExePath = ref("");
 const gameNameInput = ref("");
 // 封面获取 loading 状态
 const refreshingCovers = ref(false);
+
+// 主页右键菜单状态
+const showHomeContextMenu = ref(false);
+const homeContextMenuX = ref(0);
+const homeContextMenuY = ref(0);
+
+function handleHomeContextMenu(e: MouseEvent) {
+  homeContextMenuX.value = e.clientX;
+  homeContextMenuY.value = e.clientY;
+  showHomeContextMenu.value = true;
+}
+
+const homeContextMenuItems = computed<ContextMenuItem[]>(() => [
+  {
+    label: "添加游戏",
+    icon: "🎮",
+    action: () => handleAddGame(),
+  },
+  {
+    label: "刷新封面",
+    icon: "🖼️",
+    action: () => handleRefreshCovers(),
+  },
+  { label: "", icon: "", action: () => {}, divider: true },
+  {
+    label: "刷新列表",
+    icon: "🔄",
+    action: async () => {
+      await store.loadGames();
+      message.success("游戏列表已刷新");
+    },
+  },
+]);
 
 async function handleAddGame() {
   try {
@@ -138,7 +173,7 @@ function handleDeleteGame(gameId: string) {
 </script>
 
 <template>
-  <div class="home-view">
+  <div class="home-view" @contextmenu.prevent="handleHomeContextMenu">
     <!-- 顶部工具栏 -->
     <div class="toolbar">
       <n-space align="center" justify="space-between" style="width: 100%">
@@ -255,6 +290,15 @@ function handleDeleteGame(gameId: string) {
         </n-space>
       </template>
     </n-modal>
+
+    <!-- 主页右键菜单 -->
+    <ContextMenu
+      v-if="showHomeContextMenu"
+      :items="homeContextMenuItems"
+      :x="homeContextMenuX"
+      :y="homeContextMenuY"
+      @close="showHomeContextMenu = false"
+    />
   </div>
 </template>
 
