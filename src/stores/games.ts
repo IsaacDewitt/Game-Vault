@@ -230,6 +230,22 @@ export const useGamesStore = defineStore("games", () => {
     }
   }
 
+  async function renameGame(gameId: string, newName: string) {
+    try {
+      await api.renameGame(gameId, newName);
+      const idx = games.value.findIndex((g) => g.id === gameId);
+      if (idx !== -1) {
+        games.value[idx].name = newName;
+      }
+      if (selectedGame.value?.id === gameId) {
+        selectedGame.value.name = newName;
+      }
+    } catch (e) {
+      console.error("重命名失败:", e);
+      throw e;
+    }
+  }
+
   function selectGame(game: Game) {
     selectedGame.value = game;
   }
@@ -259,6 +275,7 @@ export const useGamesStore = defineStore("games", () => {
     launch,
     toggleFav,
     removeGame,
+    renameGame,
     selectGame,
     clearSelection,
     setupEventListeners,

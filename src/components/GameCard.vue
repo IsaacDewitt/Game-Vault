@@ -18,6 +18,8 @@ const emit = defineEmits<{
   launch: [];
   favorite: [];
   delete: [];
+  rename: [];
+  refreshInfo: [];
 }>();
 
 const showContextMenu = ref(false);
@@ -42,6 +44,16 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => [
     label: "查看详情",
     icon: "📋",
     action: () => emit("click"),
+  },
+  {
+    label: "重命名游戏",
+    icon: "✏️",
+    action: () => emit("rename"),
+  },
+  {
+    label: "刷新信息",
+    icon: "🔄",
+    action: () => emit("refreshInfo"),
   },
   { label: "", action: () => {}, divider: true },
   {

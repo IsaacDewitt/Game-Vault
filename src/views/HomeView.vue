@@ -29,6 +29,10 @@ const dialog = useDialog();
 const showNameModal = ref(false);
 const pendingExePath = ref("");
 const gameNameInput = ref("");
+// 重命名游戏弹窗状态
+const showRenameModal = ref(false);
+const renamingGameId = ref("");
+const renameInput = ref("");
 // 封面获取 loading 状态
 const refreshingCovers = ref(false);
 
@@ -117,6 +121,36 @@ function handleCancelAddGame() {
   gameNameInput.value = "";
 }
 
+function handleRenameGame(gameId: string) {
+  const game = store.games.find((g) => g.id === gameId);
+  if (game) {
+    renamingGameId.value = gameId;
+    renameInput.value = game.name;
+    showRenameModal.value = true;
+  }
+}
+
+async function handleConfirmRename() {
+  const newName = renameInput.value.trim();
+  if (!newName) {
+    message.warning("请输入游戏名称");
+    return;
+  }
+  try {
+    await store.renameGame(renamingGameId.value, newName);
+    message.success("重命名成功");
+    showRenameModal.value = false;
+  } catch (e) {
+    message.error("重命名失败");
+  }
+}
+
+function handleCancelRename() {
+  showRenameModal.value = false;
+  renamingGameId.value = "";
+  renameInput.value = "";
+}
+
 // 搜索去抖动（300ms）
 const handleSearch = useDebounceFn((value: string) => {
   store.searchQuery = value;
@@ -151,6 +185,20 @@ async function handleRefreshCovers() {
     message.error("获取封面失败");
   } finally {
     refreshingCovers.value = false;
+  }
+}
+
+async function handleRefreshInfo(gameId: string) {
+  const game = store.games.find((g) => g.id === gameId);
+  const gameName = game?.name || "该游戏";
+  const loadingMsg = message.loading(`正在为「${gameName}」刷新信息...`);
+  try {
+    await store.fetchGameInfoLlm(gameId);
+    loadingMsg.destroy();
+    message.success(`「${gameName}」信息已刷新`);
+  } catch (e) {
+    loadingMsg.destroy();
+    message.error("刷新信息失败，请检查 LLM 配置");
   }
 }
 
@@ -253,6 +301,8 @@ function handleDeleteGame(gameId: string) {
           @launch="store.launch(game.id)"
           @favorite="store.toggleFav(game.id)"
           @delete="handleDeleteGame(game.id)"
+          @rename="handleRenameGame(game.id)"
+          @refresh-info="handleRefreshInfo(game.id)"
         />
       </div>
     </div>
@@ -289,6 +339,31 @@ function handleDeleteGame(gameId: string) {
         <n-space justify="end">
           <n-button @click="handleCancelAddGame()">取消</n-button>
           <n-button type="primary" @click="handleConfirmAddGame()">确认添加</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <!-- 重命名游戏弹窗 -->
+    <n-modal
+      :show="showRenameModal"
+      preset="card"
+      title="重命名游戏"
+      style="width: 450px"
+      :closable="true"
+      @close="handleCancelRename()"
+    >
+      <p style="margin-bottom: 12px; color: #999;">
+        请输入新的游戏名称：
+      </p>
+      <n-input
+        v-model:value="renameInput"
+        placeholder="游戏名称"
+        @keyup.enter="handleConfirmRename()"
+      />
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="handleCancelRename()">取消</n-button>
+          <n-button type="primary" @click="handleConfirmRename()">确认修改</n-button>
         </n-space>
       </template>
     </n-modal>
