@@ -46,6 +46,9 @@ impl Default for LlmConfig {
 /// LLM 返回的游戏元数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmGameMeta {
+    /// LLM 纠正后的完整游戏名称（与原始输入语言一致）
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -76,6 +79,7 @@ fn build_system_prompt() -> String {
      \n\
      JSON 格式如下：\n\
      {\n\
+       \"name\": \"游戏的完整正式名称\",\n\
        \"description\": \"游戏的简短描述（中文，100字以内）\",\n\
        \"developer\": \"开发商名称\",\n\
        \"publisher\": \"发行商名称\",\n\
@@ -84,6 +88,8 @@ fn build_system_prompt() -> String {
      }\n\
      \n\
      注意事项：\n\
+     - 如果用户输入的名称是缩写、不完整或有误，请返回该游戏最正确、最完整的正式名称，语言与用户输入保持一致\n\
+     - 如果名称已经是正确的，也请返回完整的正式名称\n\
      - 某项信息确实无法确定时，填 null\n\
      - genres 不确定时填空数组 []\n\
      - 不要用 markdown 代码块包裹，直接返回 JSON"

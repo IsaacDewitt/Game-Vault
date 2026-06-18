@@ -391,6 +391,13 @@ pub async fn fetch_game_info_llm(
     let db_guard = lock_or_recover(&db);
 
     let mut updated = game;
+    if let Some(name) = meta.name {
+        let trimmed = name.trim().to_string();
+        if !trimmed.is_empty() && trimmed != updated.name {
+            tracing::info!("LLM 纠正游戏名称: '{}' -> '{}'", updated.name, trimmed);
+            updated.name = trimmed;
+        }
+    }
     if let Some(desc) = meta.description {
         if !desc.is_empty() {
             updated.description = Some(desc);
