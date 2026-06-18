@@ -126,11 +126,14 @@ impl Database {
                 exe_name = excluded.exe_name,
                 cover_local = COALESCE(excluded.cover_local, games.cover_local),
                 cover_url = COALESCE(excluded.cover_url, games.cover_url),
-                description = excluded.description,
-                developer = excluded.developer,
-                publisher = excluded.publisher,
-                release_date = excluded.release_date,
+                description = COALESCE(excluded.description, games.description),
+                developer = COALESCE(excluded.developer, games.developer),
+                publisher = COALESCE(excluded.publisher, games.publisher),
+                release_date = COALESCE(excluded.release_date, games.release_date),
                 genres = excluded.genres,
+                play_time_seconds = games.play_time_seconds,
+                last_played = games.last_played,
+                play_count = games.play_count,
                 updated_at = excluded.updated_at
             ",
             params![
@@ -310,19 +313,22 @@ impl Database {
 
     // ==================== 游戏会话 ====================
 
-    /// 记录游戏会话
+    /// 记录游戏会话（使用事务保证原子性）
     pub fn add_play_session(&self, game_id: &str, start_time: &str, duration_seconds: u64) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+
+        tx.execute(
             "INSERT INTO play_sessions (game_id, start_time, end_time, duration_seconds) VALUES (?1, ?2, ?3, ?4)",
             params![game_id, start_time, chrono::Utc::now().to_rfc3339(), duration_seconds as i64],
         )?;
 
         // 更新游戏总时长和启动次数
-        self.conn.execute(
+        tx.execute(
             "UPDATE games SET play_time_seconds = play_time_seconds + ?1, play_count = play_count + 1, last_played = ?2, updated_at = ?2 WHERE id = ?3",
             params![duration_seconds as i64, chrono::Utc::now().to_rfc3339(), game_id],
         )?;
 
+        tx.commit()?;
         Ok(())
     }
 

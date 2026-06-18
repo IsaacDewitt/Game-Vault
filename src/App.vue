@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, defineAsyncComponent, h } from "vue";
+import { ref, computed, onMounted, onUnmounted, defineAsyncComponent, h, type Component } from "vue";
 import { darkTheme, NConfigProvider, NLayout, NLayoutSider, NLayoutContent, NMenu, NIcon, NMessageProvider, NDialogProvider } from "naive-ui";
 import type { MenuOption } from "naive-ui";
 import { HomeOutline, StatsChartOutline, SettingsOutline, GameControllerOutline } from "@vicons/ionicons5";
@@ -13,6 +13,15 @@ const SettingsView = defineAsyncComponent(() => import("./views/SettingsView.vue
 const gamesStore = useGamesStore();
 const activeView = ref("home");
 const collapsed = ref(false);
+
+// 视图组件映射，配合 keep-alive 和 component :is 使用
+const viewComponents: Record<string, Component> = {
+  home: HomeView,
+  stats: StatsView,
+  settings: SettingsView,
+};
+
+const currentComponent = computed(() => viewComponents[activeView.value]);
 
 const menuOptions: MenuOption[] = [
   {
@@ -40,6 +49,11 @@ function handleMenuUpdate(key: string) {
 onMounted(async () => {
   await gamesStore.setupEventListeners();
   await gamesStore.loadGames();
+});
+
+// 清理事件监听器
+onUnmounted(() => {
+  gamesStore.cleanupEventListeners();
 });
 </script>
 
@@ -81,9 +95,7 @@ onMounted(async () => {
         <n-layout-content :native-scrollbar="false" style="height: 100vh">
           <div class="main-content">
             <keep-alive>
-              <HomeView v-if="activeView === 'home'" />
-              <StatsView v-else-if="activeView === 'stats'" />
-              <SettingsView v-else-if="activeView === 'settings'" />
+              <component :is="currentComponent" />
             </keep-alive>
           </div>
         </n-layout-content>

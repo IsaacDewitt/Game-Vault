@@ -20,6 +20,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             // 初始化数据库
             let db_path = utils::path::get_database_path();
@@ -106,6 +107,7 @@ pub fn run() {
             commands::games::fetch_game_info_llm,
             commands::games::read_cover_as_base64,
             commands::games::read_covers_batch_as_base64,
+            commands::games::export_game_data,
             // 统计相关
             commands::stats::get_play_stats,
             commands::stats::get_daily_stats,
