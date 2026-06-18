@@ -9,6 +9,7 @@ pub struct Game {
     pub exe_path: Option<String>,
     pub exe_name: Option<String>,
     pub cover_local: Option<String>,
+    /// 实际存储的是本地封面缓存文件路径（如 covers/{uuid}.jpg），而非远程 URL
     pub cover_url: Option<String>,
     pub description: Option<String>,
     pub developer: Option<String>,

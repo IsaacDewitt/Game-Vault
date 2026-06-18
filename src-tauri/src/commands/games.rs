@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{State, Emitter};
 use std::sync::{Arc, Mutex};
 use crate::core::{Database, PlayTimeTracker, GameLauncher};
 use crate::core::cover_fetcher::CoverFetcher;
@@ -53,15 +53,17 @@ pub fn launch_game(
     // 阶段 3：开始追踪时长（独立获取 Tracker 锁）
     if let Some(ref exe_name) = game.exe_name {
         let mut tracker_guard = lock_or_recover(&tracker);
-        if let Some(finished_session) = tracker_guard.start_tracking(&game_id, exe_name) {
+        if let Some(finished_session) = tracker_guard.start_tracking(&game_id, exe_name, game.exe_path.as_deref()) {
             // 如果有旧会话结束，持久化到数据库
             drop(tracker_guard);  // 释放 Tracker 锁再获取 DB 锁
             let db_guard = lock_or_recover(&db);
-            let _ = db_guard.add_play_session(
+            if let Err(e) = db_guard.add_play_session(
                 &finished_session.game_id,
                 &finished_session.start_time,
                 finished_session.duration_seconds,
-            );
+            ) {
+                tracing::error!("保存旧游戏会话失败 (game_id: {}): {}", finished_session.game_id, e);
+            }
         }
     }
 
@@ -84,12 +86,31 @@ pub fn delete_game(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
 ) -> Result<(), String> {
-    let db = lock_or_recover(&db);
-    db.delete_game(&game_id).map_err(|e| e.to_string())?;
+    // 先获取游戏信息以清理封面文件
+    let cover_local = {
+        let db_guard = lock_or_recover(&db);
+        let game = db_guard.get_game_by_id(&game_id).map_err(|e| e.to_string())?;
+        db_guard.delete_game(&game_id).map_err(|e| e.to_string())?;
+        game.and_then(|g| g.cover_local)
+    };
 
-    // 清理对应的封面图片缓存
-    let cover_path = utils::path::get_covers_dir().join(format!("{}.jpg", game_id));
-    let _ = std::fs::remove_file(cover_path);
+    // 清理封面缓存文件（.jpg 和 .png）
+    let covers_dir = utils::path::get_covers_dir();
+    for ext in &["jpg", "png"] {
+        let cover_path = covers_dir.join(format!("{}.{}", game_id, ext));
+        let _ = std::fs::remove_file(cover_path);
+    }
+
+    // 清理 cover_local 指向的文件（仅当在 covers 目录下时）
+    if let Some(ref local_path) = cover_local {
+        let path = std::path::Path::new(local_path);
+        if let Ok(canonical) = path.canonicalize() {
+            let covers_canonical = covers_dir.canonicalize().unwrap_or(covers_dir.clone());
+            if canonical.starts_with(&covers_canonical) {
+                let _ = std::fs::remove_file(&canonical);
+            }
+        }
+    }
 
     Ok(())
 }
@@ -160,10 +181,11 @@ pub fn get_all_covers(
     Ok(covers)
 }
 
-/// 获取缺失封面的游戏封面
+/// 获取缺失封面的游戏封面（异步版本，带进度通知）
 #[tauri::command]
-pub fn fetch_missing_covers(
+pub async fn fetch_missing_covers(
     db: State<'_, Arc<Mutex<Database>>>,
+    app_handle: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
     // 第一阶段：收集需要获取封面的游戏信息，然后立即释放数据库锁
     let (games_without_cover, api_key) = {
@@ -237,8 +259,15 @@ pub fn fetch_missing_covers(
     let mut errors: Vec<String> = Vec::new();
     let total_missing = games_without_cover.len() as u32;
 
-    for game in &games_without_cover {
-        match fetcher.fetch_cover(game) {
+    for (index, game) in games_without_cover.iter().enumerate() {
+        // 发送进度事件
+        let _ = app_handle.emit("cover-fetch-progress", serde_json::json!({
+            "current": index + 1,
+            "total": total_missing,
+            "game_name": game.name,
+        }));
+
+        match fetcher.fetch_cover(game).await {
             Ok(Some(cover_url)) => {
                 // 第三阶段：单次获取锁更新封面，然后立即释放
                 let update_result = {
@@ -361,14 +390,59 @@ pub async fn fetch_game_info_llm(
 }
 
 /// 读取本地图片文件并返回 base64 data URL（绕过 asset protocol）
+/// 仅允许读取 covers 目录下的文件，防止路径遍历攻击
 #[tauri::command]
 pub fn read_cover_as_base64(path: String) -> Result<String, String> {
     use base64::Engine as _;
+
     let file_path = std::path::Path::new(&path);
-    if !file_path.exists() {
-        return Err(format!("文件不存在: {}", path));
+
+    // 安全检查：验证路径在 covers 目录下（防止路径遍历）
+    let covers_dir = utils::path::get_covers_dir();
+    let canonical_covers = covers_dir.canonicalize()
+        .unwrap_or(covers_dir.clone());
+    let canonical_file = file_path.canonicalize()
+        .map_err(|_| format!("文件不存在: {}", path))?;
+
+    if !canonical_file.starts_with(&canonical_covers) {
+        return Err("不允许读取 covers 目录之外的文件".to_string());
     }
-    let bytes = std::fs::read(file_path).map_err(|e| format!("读取文件失败: {}", e))?;
+
+    let bytes = std::fs::read(&canonical_file).map_err(|e| format!("读取文件失败: {}", e))?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:image/jpeg;base64,{}", b64))
+}
+
+/// 批量读取封面图片为 base64 data URL（减少 IPC 调用次数）
+/// 仅允许读取 covers 目录下的文件
+#[tauri::command]
+pub fn read_covers_batch_as_base64(paths: Vec<String>) -> Result<std::collections::HashMap<String, String>, String> {
+    use base64::Engine as _;
+
+    let covers_dir = utils::path::get_covers_dir();
+    let canonical_covers = covers_dir.canonicalize()
+        .unwrap_or(covers_dir.clone());
+
+    let mut result = std::collections::HashMap::new();
+
+    for path in paths {
+        let file_path = std::path::Path::new(&path);
+
+        // 安全检查
+        let canonical_file = match file_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue, // 文件不存在，跳过
+        };
+
+        if !canonical_file.starts_with(&canonical_covers) {
+            continue; // 不在 covers 目录下，跳过
+        }
+
+        if let Ok(bytes) = std::fs::read(&canonical_file) {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            result.insert(path, format!("data:image/jpeg;base64,{}", b64));
+        }
+    }
+
+    Ok(result)
 }

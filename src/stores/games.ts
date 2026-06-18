@@ -11,8 +11,14 @@ export const useGamesStore = defineStore("games", () => {
   const searchQuery = ref("");
   const selectedGame = ref<Game | null>(null);
   const activeGames = ref<string[]>([]);
-  // 封面文件路径映射 (game_id -> 本地文件路径)，前端需用 convertFileSrc 转换
+  // 封面文件路径映射 (game_id -> 本地文件路径)
   const coverPaths = ref<Record<string, string>>({});
+  // 封面 base64 缓存 (game_id -> data URL)
+  const coverBase64Cache = ref<Record<string, string>>({});
+  // 封面加载状态
+  const coversLoading = ref(false);
+  // 封面获取进度
+  const coverFetchProgress = ref<{ current: number; total: number; game_name: string } | null>(null);
 
   // 监听后端游戏停止事件，清理 activeGames
   let unlistenGameStopped: (() => void) | null = null;
@@ -28,6 +34,14 @@ export const useGamesStore = defineStore("games", () => {
       // 刷新游戏数据以更新时长
       loadGames();
     });
+
+    // 监听封面获取进度事件
+    listen<{ current: number; total: number; game_name: string }>(
+      "cover-fetch-progress",
+      (event) => {
+        coverFetchProgress.value = event.payload;
+      }
+    );
   }
 
   // 计算属性
@@ -62,8 +76,35 @@ export const useGamesStore = defineStore("games", () => {
   async function loadAllCovers() {
     try {
       coverPaths.value = await api.getAllCovers();
+      // 批量加载所有封面的 base64 数据
+      await loadCoversBatch();
     } catch (e) {
       console.error("加载封面路径失败:", e);
+    }
+  }
+
+  async function loadCoversBatch() {
+    const paths = Object.values(coverPaths.value);
+    if (paths.length === 0) {
+      coverBase64Cache.value = {};
+      return;
+    }
+
+    coversLoading.value = true;
+    try {
+      const result = await api.readCoversBatchAsBase64(paths);
+      // 将路径映射转换为 game_id 映射
+      const cache: Record<string, string> = {};
+      for (const [gameId, filePath] of Object.entries(coverPaths.value)) {
+        if (result[filePath]) {
+          cache[gameId] = result[filePath];
+        }
+      }
+      coverBase64Cache.value = cache;
+    } catch (e) {
+      console.error("批量加载封面失败:", e);
+    } finally {
+      coversLoading.value = false;
     }
   }
 
@@ -92,15 +133,20 @@ export const useGamesStore = defineStore("games", () => {
 
   async function fetchCovers() {
     try {
+      coverFetchProgress.value = null;
       const result = await api.fetchMissingCovers();
+      coverFetchProgress.value = null;
       if (result.fetched > 0) {
         await loadGames();
       }
       if (result.errors.length > 0) {
         console.warn("封面获取:", result.errors);
       }
+      return result;
     } catch (e) {
+      coverFetchProgress.value = null;
       console.error("获取封面失败:", e);
+      throw e;
     }
   }
 
@@ -115,8 +161,7 @@ export const useGamesStore = defineStore("games", () => {
         }
       }
       // 同时刷新封面路径
-      const allCovers = await api.getAllCovers();
-      coverPaths.value = allCovers;
+      await loadAllCovers();
     } catch (e) {
       console.error("刷新封面失败:", e);
     }
@@ -163,6 +208,9 @@ export const useGamesStore = defineStore("games", () => {
       if (selectedGame.value?.id === gameId) {
         selectedGame.value = null;
       }
+      // 清理封面缓存
+      delete coverPaths.value[gameId];
+      delete coverBase64Cache.value[gameId];
     } catch (e) {
       console.error("删除游戏失败:", e);
       throw e;  // 向上传播错误，让调用方可以提示用户
@@ -184,6 +232,9 @@ export const useGamesStore = defineStore("games", () => {
     selectedGame,
     activeGames,
     coverPaths,
+    coverBase64Cache,
+    coversLoading,
+    coverFetchProgress,
     filteredGames,
     loadGames,
     loadAllCovers,

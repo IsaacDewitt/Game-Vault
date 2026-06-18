@@ -7,14 +7,15 @@ import {
   NSpin,
   NEmpty,
   NModal,
+  NProgress,
   useMessage,
   useDialog,
 } from "naive-ui";
 import { SearchOutline, CloudDownloadOutline, AddOutline } from "@vicons/ionicons5";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ref } from "vue";
+import { useDebounceFn } from "@vueuse/core";
 import { useGamesStore } from "../stores/games";
-import * as api from "../lib/tauri";
 import GameCard from "../components/GameCard.vue";
 import GameDetail from "../components/GameDetail.vue";
 
@@ -26,6 +27,8 @@ const dialog = useDialog();
 const showNameModal = ref(false);
 const pendingExePath = ref("");
 const gameNameInput = ref("");
+// 封面获取 loading 状态
+const refreshingCovers = ref(false);
 
 async function handleAddGame() {
   try {
@@ -50,7 +53,7 @@ async function handleAddGame() {
     }
   } catch (e) {
     console.error(e);
-    message.error("选择文件失败: " + (e as Error).toString());
+    message.error("选择文件失败");
   }
 }
 
@@ -67,7 +70,7 @@ async function handleConfirmAddGame() {
     pendingExePath.value = "";
     gameNameInput.value = "";
   } catch (e) {
-    message.error("添加游戏失败: " + (e as Error).toString());
+    message.error("添加游戏失败");
   }
 }
 
@@ -77,38 +80,40 @@ function handleCancelAddGame() {
   gameNameInput.value = "";
 }
 
-function handleSearch(value: string) {
+// 搜索去抖动（300ms）
+const handleSearch = useDebounceFn((value: string) => {
   store.searchQuery = value;
-}
+}, 300);
 
 async function handleRefreshCovers() {
+  refreshingCovers.value = true;
   try {
-    const result = await api.fetchMissingCovers();
+    const result = await store.fetchCovers();
 
     // 检查是否有 API Key 认证失败
-    const authError = result.errors.find((e) =>
+    const authError = result.errors.find((e: string) =>
       e.includes("API Key 无效") || e.includes("401") || e.includes("403")
     );
 
     if (authError) {
       message.error("SteamGridDB API Key 无效，请在设置中重新配置");
     } else if (result.fetched > 0) {
-      await store.loadGames();
       message.success(`已获取 ${result.fetched} 个游戏的封面`);
     } else if (result.total > 0) {
-      // 有游戏缺少封面但一个都没找到（API Key 没问题，但游戏名搜不到）
       message.warning(
         `${result.total} 个游戏缺少封面，但在 SteamGridDB 中未找到。可尝试手动设置封面`
       );
-      result.errors.forEach((e) => console.warn("封面获取:", e));
+      result.errors.forEach((e: string) => console.warn("封面获取:", e));
     } else if (result.errors.length === 0) {
       message.info("所有游戏封面已是最新");
     } else {
       message.error(result.errors[0]);
-      result.errors.slice(1).forEach((e) => console.warn("封面获取:", e));
+      result.errors.slice(1).forEach((e: string) => console.warn("封面获取:", e));
     }
   } catch (e) {
-    message.error("获取封面失败: " + (e as Error).toString());
+    message.error("获取封面失败");
+  } finally {
+    refreshingCovers.value = false;
   }
 }
 
@@ -125,7 +130,7 @@ function handleDeleteGame(gameId: string) {
         await store.removeGame(gameId);
         message.success("已删除游戏");
       } catch (e) {
-        message.error("删除失败: " + (e as Error).toString());
+        message.error("删除失败");
       }
     },
   });
@@ -151,7 +156,7 @@ function handleDeleteGame(gameId: string) {
         </n-space>
 
         <n-space>
-          <n-button @click="handleRefreshCovers">
+          <n-button @click="handleRefreshCovers" :loading="refreshingCovers">
             <template #icon>
               <n-icon :component="CloudDownloadOutline" />
             </template>
@@ -165,6 +170,20 @@ function handleDeleteGame(gameId: string) {
           </n-button>
         </n-space>
       </n-space>
+    </div>
+
+    <!-- 封面获取进度条 -->
+    <div v-if="store.coverFetchProgress" class="cover-progress">
+      <n-progress
+        type="line"
+        :percentage="Math.round((store.coverFetchProgress.current / store.coverFetchProgress.total) * 100)"
+        :show-indicator="true"
+        processing
+      />
+      <span class="progress-text">
+        正在获取封面 ({{ store.coverFetchProgress.current }}/{{ store.coverFetchProgress.total }}):
+        {{ store.coverFetchProgress.game_name }}
+      </span>
     </div>
 
     <!-- 游戏内容区 -->
@@ -247,6 +266,20 @@ function handleDeleteGame(gameId: string) {
 
 .toolbar {
   margin-bottom: 16px;
+}
+
+.cover-progress {
+  margin-bottom: 16px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+}
+
+.progress-text {
+  display: block;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #888;
 }
 
 .content-area {

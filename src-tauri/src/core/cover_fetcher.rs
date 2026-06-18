@@ -1,9 +1,9 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use crate::models::*;
 
-/// 封面图获取器
+/// 封面图获取器（异步版本）
 pub struct CoverFetcher {
     cache_dir: PathBuf,
     steamgriddb_api_key: String,
@@ -28,8 +28,8 @@ impl CoverFetcher {
         }
     }
 
-    /// 获取游戏封面
-    pub fn fetch_cover(&self, game: &Game) -> Result<Option<String>> {
+    /// 获取游戏封面（异步）
+    pub async fn fetch_cover(&self, game: &Game) -> Result<Option<String>> {
         // 1. 检查缓存（需要验证文件有效性）
         let cache_path = self.get_cache_path(&game.id);
         if cache_path.exists() {
@@ -56,9 +56,9 @@ impl CoverFetcher {
         // 3. 尝试 SteamGridDB（先用游戏名搜索，再用文件夹名搜索）
         if !self.steamgriddb_api_key.is_empty() {
             // 用游戏名搜索
-            match self.search_steamgriddb(&game.name) {
+            match self.search_steamgriddb(&game.name).await {
                 Ok(Some(cover_url)) => {
-                    if self.download_image(&cover_url, &cache_path).is_ok() {
+                    if self.download_image(&cover_url, &cache_path).await.is_ok() {
                         return Ok(Some(cache_path.to_string_lossy().to_string()));
                     }
                 }
@@ -75,9 +75,9 @@ impl CoverFetcher {
                 if let Some(ref folder) = folder_name {
                     if *folder != game.name {
                         tracing::info!("尝试用文件夹名搜索封面: {}", folder);
-                        match self.search_steamgriddb(folder) {
+                        match self.search_steamgriddb(folder).await {
                             Ok(Some(cover_url)) => {
-                                if self.download_image(&cover_url, &cache_path).is_ok() {
+                                if self.download_image(&cover_url, &cache_path).await.is_ok() {
                                     return Ok(Some(cache_path.to_string_lossy().to_string()));
                                 }
                             }
@@ -138,8 +138,8 @@ impl CoverFetcher {
         None
     }
 
-    /// 搜索 SteamGridDB
-    fn search_steamgriddb(&self, game_name: &str) -> Result<Option<String>> {
+    /// 搜索 SteamGridDB（异步）
+    async fn search_steamgriddb(&self, game_name: &str) -> Result<Option<String>> {
         // 搜索游戏（URL 编码游戏名，支持中文等非 ASCII 字符）
         let encoded_name = urlencoding::encode(game_name);
         let search_url = format!(
@@ -150,7 +150,8 @@ impl CoverFetcher {
         let response = self.client
             .get(&search_url)
             .header("Authorization", format!("Bearer {}", self.steamgriddb_api_key))
-            .send()?;
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -162,7 +163,7 @@ impl CoverFetcher {
             return Ok(None);
         }
 
-        let data: serde_json::Value = response.json()?;
+        let data: serde_json::Value = response.json().await?;
         let games = data["data"].as_array();
 
         if let Some(games) = games {
@@ -179,10 +180,11 @@ impl CoverFetcher {
                 let grids_response = self.client
                     .get(&grids_url)
                     .header("Authorization", format!("Bearer {}", self.steamgriddb_api_key))
-                    .send()?;
+                    .send()
+                    .await?;
 
                 if grids_response.status().is_success() {
-                    let grids_data: serde_json::Value = grids_response.json()?;
+                    let grids_data: serde_json::Value = grids_response.json().await?;
                     if let Some(grids) = grids_data["data"].as_array() {
                         if let Some(first_grid) = grids.first() {
                             let thumb_url = first_grid["thumb"].as_str().unwrap_or_default();
@@ -202,15 +204,15 @@ impl CoverFetcher {
         Ok(None)
     }
 
-    /// 下载图片
-    fn download_image(&self, url: &str, save_path: &Path) -> Result<()> {
-        let response = self.client.get(url).send()?;
+    /// 下载图片（异步）
+    async fn download_image(&self, url: &str, save_path: &Path) -> Result<()> {
+        let response = self.client.get(url).send().await?;
 
         if !response.status().is_success() {
             anyhow::bail!("下载失败: HTTP {}", response.status());
         }
 
-        let bytes = response.bytes()?;
+        let bytes = response.bytes().await?;
 
         // 检查下载的内容是否有效（至少 100 字节）
         if bytes.len() < 100 {
@@ -232,22 +234,5 @@ impl CoverFetcher {
         std::fs::rename(&temp_path, save_path)?;
 
         Ok(())
-    }
-
-    /// 批量获取封面
-    pub fn fetch_covers_batch(&self, games: &[Game]) -> Vec<(String, Option<String>)> {
-        let mut results = Vec::new();
-
-        for game in games {
-            match self.fetch_cover(game) {
-                Ok(cover_path) => results.push((game.id.clone(), cover_path)),
-                Err(e) => {
-                    tracing::warn!("获取封面失败 {}: {}", game.name, e);
-                    results.push((game.id.clone(), None));
-                }
-            }
-        }
-
-        results
     }
 }

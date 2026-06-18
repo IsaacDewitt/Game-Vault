@@ -29,7 +29,7 @@ impl PlayTimeTracker {
 
     /// 开始追踪游戏
     /// 如果已有同 ID 的活跃会话，先结束旧会话并返回其数据供外部持久化
-    pub fn start_tracking(&mut self, game_id: &str, exe_name: &str) -> Option<FinishedSession> {
+    pub fn start_tracking(&mut self, game_id: &str, exe_name: &str, exe_path: Option<&str>) -> Option<FinishedSession> {
         let finished = if self.active_sessions.contains_key(game_id) {
             self.stop_tracking_internal(game_id)
         } else {
@@ -41,11 +41,12 @@ impl PlayTimeTracker {
             ActiveSession {
                 game_id: game_id.to_string(),
                 exe_name: exe_name.to_string(),
+                exe_path: exe_path.map(|s| s.to_string()),
                 start_time: chrono::Utc::now(),
             },
         );
 
-        tracing::info!("开始追踪游戏: {} (exe: {})", game_id, exe_name);
+        tracing::info!("开始追踪游戏: {} (exe: {}, path: {:?})", game_id, exe_name, exe_path);
         finished
     }
 
@@ -81,21 +82,28 @@ impl PlayTimeTracker {
         // 增量刷新进程列表，而非全量重建
         self.sys.refresh_processes();
 
-        let running_processes: Vec<String> = self.sys
-            .processes()
-            .values()
-            .map(|p| p.name().to_lowercase())
-            .collect();
-
         // 收集需要检查的会话信息，避免借用冲突
-        let sessions_to_check: Vec<(String, String)> = self.active_sessions
+        let sessions_to_check: Vec<(String, String, Option<String>)> = self.active_sessions
             .iter()
-            .map(|(id, session)| (id.clone(), session.exe_name.clone()))
+            .map(|(id, session)| (id.clone(), session.exe_name.clone(), session.exe_path.clone()))
             .collect();
 
-        for (game_id, exe_name) in sessions_to_check {
+        for (game_id, exe_name, exe_path) in sessions_to_check {
             let exe_lower = exe_name.to_lowercase();
-            let still_running = running_processes.iter().any(|p| p == &exe_lower);
+
+            // 优先用完整路径匹配，回退到文件名匹配
+            let still_running = if let Some(ref expected_path) = exe_path {
+                let expected_lower = expected_path.to_lowercase();
+                self.sys.processes().values().any(|p| {
+                    p.exe().map_or(false, |exe| {
+                        exe.to_string_lossy().to_lowercase() == expected_lower
+                    })
+                })
+            } else {
+                self.sys.processes().values().any(|p| {
+                    p.name().to_lowercase() == exe_lower
+                })
+            };
 
             if !still_running {
                 tracing::info!("游戏 {} 已退出", game_id);

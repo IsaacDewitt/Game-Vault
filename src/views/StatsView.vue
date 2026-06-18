@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from "vue";
+import { ref, onMounted, onActivated, computed } from "vue";
 import {
   NCard,
   NGrid,
@@ -130,7 +130,8 @@ function formatHours(seconds: number): string {
   return (seconds / 3600).toFixed(1);
 }
 
-onMounted(async () => {
+async function loadStats() {
+  loading.value = true;
   try {
     const [ov, ps, ds] = await Promise.all([
       api.getOverviewStats(),
@@ -145,7 +146,12 @@ onMounted(async () => {
   } finally {
     loading.value = false;
   }
-});
+}
+
+onMounted(loadStats);
+
+// keep-alive 缓存的组件再次激活时刷新数据
+onActivated(loadStats);
 </script>
 
 <template>
