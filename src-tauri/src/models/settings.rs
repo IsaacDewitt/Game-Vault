@@ -47,3 +47,38 @@ impl Default for Settings {
         }
     }
 }
+
+impl Settings {
+    /// 从数据库加载设置
+    pub fn load_from_db(db: &crate::core::Database) -> anyhow::Result<Self> {
+        let get = |key: &str, default: &str| -> String {
+            db.get_setting(key).ok().flatten().unwrap_or_else(|| default.to_string())
+        };
+
+        Ok(Self {
+            theme: get("theme", "dark"),
+            language: get("language", "zh-CN"),
+            steamgriddb_api_key: get("steamgriddb_api_key", ""),
+            llm_provider: get("llm_provider", DEFAULT_LLM_PROVIDER),
+            llm_protocol: get("llm_protocol", DEFAULT_LLM_PROTOCOL),
+            llm_api_key: get("llm_api_key", ""),
+            llm_base_url: get("llm_base_url", DEFAULT_LLM_BASE_URL),
+            llm_model: get("llm_model", DEFAULT_LLM_MODEL),
+            llm_enabled: get("llm_enabled", "false") == "true",
+        })
+    }
+
+    /// 保存设置到数据库
+    pub fn save_to_db(&self, db: &crate::core::Database) -> anyhow::Result<()> {
+        db.set_setting("theme", &self.theme)?;
+        db.set_setting("language", &self.language)?;
+        db.set_setting("steamgriddb_api_key", &self.steamgriddb_api_key)?;
+        db.set_setting("llm_provider", &self.llm_provider)?;
+        db.set_setting("llm_protocol", &self.llm_protocol)?;
+        db.set_setting("llm_api_key", &self.llm_api_key)?;
+        db.set_setting("llm_base_url", &self.llm_base_url)?;
+        db.set_setting("llm_model", &self.llm_model)?;
+        db.set_setting("llm_enabled", &self.llm_enabled.to_string())?;
+        Ok(())
+    }
+}

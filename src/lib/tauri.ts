@@ -138,3 +138,7 @@ export async function getSettings(): Promise<Settings> {
 export async function saveSettings(settings: Settings): Promise<void> {
   return invoke("save_settings", { settings });
 }
+
+export async function exportGameData(): Promise<string> {
+  return invoke("export_game_data");
+}

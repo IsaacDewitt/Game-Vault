@@ -22,6 +22,7 @@ export const useGamesStore = defineStore("games", () => {
 
   // 监听后端游戏停止事件，清理 activeGames
   let unlistenGameStopped: (() => void) | null = null;
+  let unlistenCoverProgress: (() => void) | null = null;
 
   async function setupEventListeners() {
     if (unlistenGameStopped) return;
@@ -36,12 +37,24 @@ export const useGamesStore = defineStore("games", () => {
     });
 
     // 监听封面获取进度事件
-    listen<{ current: number; total: number; game_name: string }>(
+    unlistenCoverProgress = await listen<{ current: number; total: number; game_name: string }>(
       "cover-fetch-progress",
       (event) => {
         coverFetchProgress.value = event.payload;
       }
     );
+  }
+
+  // 清理事件监听器（应用退出时调用）
+  function cleanupEventListeners() {
+    if (unlistenGameStopped) {
+      unlistenGameStopped();
+      unlistenGameStopped = null;
+    }
+    if (unlistenCoverProgress) {
+      unlistenCoverProgress();
+      unlistenCoverProgress = null;
+    }
   }
 
   // 计算属性
@@ -249,5 +262,6 @@ export const useGamesStore = defineStore("games", () => {
     selectGame,
     clearSelection,
     setupEventListeners,
+    cleanupEventListeners,
   };
 });

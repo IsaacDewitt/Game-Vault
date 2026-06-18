@@ -4,7 +4,7 @@ use crate::core::{Database, PlayTimeTracker, GameLauncher};
 use crate::core::cover_fetcher::CoverFetcher;
 use crate::core::llm_fetcher::{self, LlmConfig, LlmProtocol, LlmProvider};
 use crate::models::*;
-use crate::models::settings::*;
+use crate::models::settings::Settings;
 use crate::utils;
 use super::lock_or_recover;
 
@@ -314,27 +314,22 @@ pub async fn fetch_game_info_llm(
         let game = db_guard.get_game_by_id(&game_id).map_err(|e| e.to_string())?;
         let game = game.ok_or_else(|| "游戏不存在".to_string())?;
 
-        // 从设置中读取 LLM 配置
-        let provider_str = db_guard.get_setting("llm_provider").map_err(|e| e.to_string())?.unwrap_or_else(|| DEFAULT_LLM_PROVIDER.to_string());
-        let protocol_str = db_guard.get_setting("llm_protocol").map_err(|e| e.to_string())?.unwrap_or_else(|| DEFAULT_LLM_PROTOCOL.to_string());
-        let api_key = db_guard.get_setting("llm_api_key").map_err(|e| e.to_string())?.unwrap_or_default();
-        let base_url = db_guard.get_setting("llm_base_url").map_err(|e| e.to_string())?.unwrap_or_else(|| DEFAULT_LLM_BASE_URL.to_string());
-        let model = db_guard.get_setting("llm_model").map_err(|e| e.to_string())?.unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string());
-        let enabled = db_guard.get_setting("llm_enabled").map_err(|e| e.to_string())?.unwrap_or_else(|| "false".to_string()) == "true";
+        // 使用统一的设置加载方法
+        let settings = Settings::load_from_db(&db_guard).map_err(|e| e.to_string())?;
 
-        if !enabled {
+        if !settings.llm_enabled {
             return Err("未启用 LLM 获取游戏信息，请在设置中配置".to_string());
         }
 
-        if api_key.is_empty() {
+        if settings.llm_api_key.is_empty() {
             return Err("未配置 LLM API Key，请在设置中填写".to_string());
         }
 
-        let provider = match provider_str.as_str() {
+        let provider = match settings.llm_provider.as_str() {
             "deepseek" => LlmProvider::Deepseek,
             _ => LlmProvider::Xiaomi,
         };
-        let protocol = match protocol_str.as_str() {
+        let protocol = match settings.llm_protocol.as_str() {
             "anthropic" => LlmProtocol::Anthropic,
             _ => LlmProtocol::Openai,
         };
@@ -343,9 +338,9 @@ pub async fn fetch_game_info_llm(
             enabled: true,
             provider,
             protocol,
-            api_key,
-            base_url,
-            model,
+            api_key: settings.llm_api_key,
+            base_url: settings.llm_base_url,
+            model: settings.llm_model,
         };
 
         (game, config)
@@ -411,6 +406,35 @@ pub fn read_cover_as_base64(path: String) -> Result<String, String> {
     let bytes = std::fs::read(&canonical_file).map_err(|e| format!("读取文件失败: {}", e))?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:image/jpeg;base64,{}", b64))
+}
+
+/// 导出游戏库数据为 JSON 文件
+#[tauri::command]
+pub fn export_game_data(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<String, String> {
+    let db_guard = lock_or_recover(&db);
+
+    // 获取所有游戏数据
+    let filter = GameFilter::default();
+    let games = db_guard.get_games(&filter).map_err(|e| e.to_string())?;
+
+    // 获取设置
+    let settings = Settings::load_from_db(&db_guard).map_err(|e| e.to_string())?;
+
+    // 构建导出数据结构
+    let export_data = serde_json::json!({
+        "version": "1.0",
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "games": games,
+        "settings": settings,
+    });
+
+    // 序列化为 JSON
+    let json = serde_json::to_string_pretty(&export_data)
+        .map_err(|e| format!("序列化失败: {}", e))?;
+
+    Ok(json)
 }
 
 /// 批量读取封面图片为 base64 data URL（减少 IPC 调用次数）

@@ -9,8 +9,12 @@ import {
   NButton,
   NSpace,
   NSelect,
+  NIcon,
   useMessage,
 } from "naive-ui";
+import { DownloadOutline } from "@vicons/ionicons5";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
 import * as api from "../lib/tauri";
 import type { Settings } from "../lib/tauri";
 
@@ -61,6 +65,7 @@ watch(() => settings.value.llm_provider, (provider) => {
 });
 
 const saving = ref(false);
+const exporting = ref(false);
 
 async function loadSettings() {
   try {
@@ -80,6 +85,34 @@ async function saveSettings() {
     message.error("保存失败");
   } finally {
     saving.value = false;
+  }
+}
+
+async function handleExportData() {
+  exporting.value = true;
+  try {
+    const jsonData = await api.exportGameData();
+
+    // 弹出保存文件对话框
+    const filePath = await save({
+      defaultPath: "gamevault-backup.json",
+      filters: [
+        {
+          name: "JSON 文件",
+          extensions: ["json"],
+        },
+      ],
+    });
+
+    if (filePath) {
+      await writeTextFile(filePath, jsonData);
+      message.success("数据导出成功");
+    }
+  } catch (e) {
+    console.error("导出数据失败:", e);
+    message.error("导出失败: " + (e as Error).toString());
+  } finally {
+    exporting.value = false;
   }
 }
 
@@ -154,6 +187,23 @@ onMounted(loadSettings);
         保存设置
       </n-button>
     </n-space>
+
+    <!-- 数据管理 -->
+    <n-card title="数据管理" style="margin-top: 16px">
+      <n-form label-placement="left" label-width="140">
+        <n-form-item label="导出游戏数据">
+          <n-button :loading="exporting" @click="handleExportData">
+            <template #icon>
+              <n-icon :component="DownloadOutline" />
+            </template>
+            导出备份
+          </n-button>
+          <span style="margin-left: 12px; font-size: 12px; color: #888">
+            导出所有游戏信息和设置为 JSON 文件
+          </span>
+        </n-form-item>
+      </n-form>
+    </n-card>
   </div>
 </template>
 
