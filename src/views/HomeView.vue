@@ -38,6 +38,8 @@ const homeContextMenuX = ref(0);
 const homeContextMenuY = ref(0);
 
 function handleHomeContextMenu(e: MouseEvent) {
+  e.preventDefault();
+  e.stopPropagation();
   homeContextMenuX.value = e.clientX;
   homeContextMenuY.value = e.clientY;
   showHomeContextMenu.value = true;
@@ -173,7 +175,7 @@ function handleDeleteGame(gameId: string) {
 </script>
 
 <template>
-  <div class="home-view" @contextmenu.prevent="handleHomeContextMenu">
+  <div class="home-view" @contextmenu="handleHomeContextMenu">
     <!-- 顶部工具栏 -->
     <div class="toolbar">
       <n-space align="center" justify="space-between" style="width: 100%">
