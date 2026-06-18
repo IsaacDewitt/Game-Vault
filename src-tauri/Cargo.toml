@@ -1,0 +1,55 @@
+[package]
+name = "game-vault"
+version = "0.1.0"
+description = "Game Vault - 轻量级游戏管理器"
+authors = ["Isaac"]
+edition = "2021"
+
+[lib]
+name = "game_vault_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri 框架
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 数据库
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# 进程监控（游戏时长追踪）
+sysinfo = "0.30"
+
+# 网络请求（封面图/元数据抓取）
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+
+# 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID 生成
+uuid = { version = "1", features = ["v4"] }
+
+# URL 编码
+urlencoding = "2"
+
+# Base64 编码（封面图 data URL）
+base64 = "0.22"
+
+# 错误处理
+anyhow = "1"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 系统目录
+dirs = "5"
+

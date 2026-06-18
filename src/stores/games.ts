@@ -1,0 +1,202 @@
+import { defineStore } from "pinia";
+import { ref, computed } from "vue";
+import { listen } from "@tauri-apps/api/event";
+import type { Game } from "../lib/tauri";
+import * as api from "../lib/tauri";
+
+export const useGamesStore = defineStore("games", () => {
+  // 状态
+  const games = ref<Game[]>([]);
+  const loading = ref(false);
+  const searchQuery = ref("");
+  const selectedGame = ref<Game | null>(null);
+  const activeGames = ref<string[]>([]);
+  // 封面文件路径映射 (game_id -> 本地文件路径)，前端需用 convertFileSrc 转换
+  const coverPaths = ref<Record<string, string>>({});
+
+  // 监听后端游戏停止事件，清理 activeGames
+  let unlistenGameStopped: (() => void) | null = null;
+
+  async function setupEventListeners() {
+    if (unlistenGameStopped) return;
+    unlistenGameStopped = await listen<string>("game-stopped", (event) => {
+      const gameId = event.payload;
+      const idx = activeGames.value.indexOf(gameId);
+      if (idx !== -1) {
+        activeGames.value.splice(idx, 1);
+      }
+      // 刷新游戏数据以更新时长
+      loadGames();
+    });
+  }
+
+  // 计算属性
+  const filteredGames = computed(() => {
+    let result = games.value;
+
+    // 搜索筛选
+    if (searchQuery.value) {
+      const query = searchQuery.value.toLowerCase();
+      result = result.filter((g) => g.name.toLowerCase().includes(query));
+    }
+
+    return result;
+  });
+
+  // 方法
+  async function loadGames() {
+    loading.value = true;
+    try {
+      games.value = await api.getGames({
+        sort_by: "last_played",
+        sort_order: "desc",
+      });
+      await loadAllCovers();
+    } catch (e) {
+      console.error("加载游戏列表失败:", e);
+    } finally {
+      loading.value = false;
+    }
+  }
+
+  async function loadAllCovers() {
+    try {
+      coverPaths.value = await api.getAllCovers();
+    } catch (e) {
+      console.error("加载封面路径失败:", e);
+    }
+  }
+
+  async function addGameManual(name: string, exePath: string) {
+    try {
+      await api.addGameManual(name, exePath);
+      await loadGames();
+      fetchCovers();
+    } catch (e) {
+      console.error("添加游戏失败:", e);
+      throw e;
+    }
+  }
+
+  async function fetchGameInfoLlm(gameId: string) {
+    const updated = await api.fetchGameInfoLlm(gameId);
+    const idx = games.value.findIndex((g) => g.id === gameId);
+    if (idx !== -1) {
+      games.value[idx] = updated;
+    }
+    if (selectedGame.value?.id === gameId) {
+      selectedGame.value = updated;
+    }
+    return updated;
+  }
+
+  async function fetchCovers() {
+    try {
+      const result = await api.fetchMissingCovers();
+      if (result.fetched > 0) {
+        await loadGames();
+      }
+      if (result.errors.length > 0) {
+        console.warn("封面获取:", result.errors);
+      }
+    } catch (e) {
+      console.error("获取封面失败:", e);
+    }
+  }
+
+  async function refreshCover(gameId: string) {
+    try {
+      // 重新获取单个游戏的数据以更新封面
+      const game = await api.getGameDetail(gameId);
+      if (game) {
+        const idx = games.value.findIndex((g) => g.id === gameId);
+        if (idx !== -1) {
+          games.value[idx] = game;
+        }
+      }
+      // 同时刷新封面路径
+      const allCovers = await api.getAllCovers();
+      coverPaths.value = allCovers;
+    } catch (e) {
+      console.error("刷新封面失败:", e);
+    }
+  }
+
+  async function setCover(gameId: string, coverPath: string) {
+    try {
+      await api.setGameCover(gameId, coverPath);
+      await loadGames();
+    } catch (e) {
+      console.error("设置封面失败:", e);
+      throw e;
+    }
+  }
+
+  async function launch(gameId: string) {
+    try {
+      await api.launchGame(gameId);
+      if (!activeGames.value.includes(gameId)) {
+        activeGames.value.push(gameId);
+      }
+    } catch (e) {
+      console.error("启动游戏失败:", e);
+      throw e;
+    }
+  }
+
+  async function toggleFav(gameId: string) {
+    try {
+      const isFav = await api.toggleFavorite(gameId);
+      const game = games.value.find((g) => g.id === gameId);
+      if (game) {
+        game.is_favorite = isFav;
+      }
+    } catch (e) {
+      console.error("切换收藏失败:", e);
+    }
+  }
+
+  async function removeGame(gameId: string) {
+    try {
+      await api.deleteGame(gameId);
+      games.value = games.value.filter((g) => g.id !== gameId);
+      if (selectedGame.value?.id === gameId) {
+        selectedGame.value = null;
+      }
+    } catch (e) {
+      console.error("删除游戏失败:", e);
+      throw e;  // 向上传播错误，让调用方可以提示用户
+    }
+  }
+
+  function selectGame(game: Game) {
+    selectedGame.value = game;
+  }
+
+  function clearSelection() {
+    selectedGame.value = null;
+  }
+
+  return {
+    games,
+    loading,
+    searchQuery,
+    selectedGame,
+    activeGames,
+    coverPaths,
+    filteredGames,
+    loadGames,
+    loadAllCovers,
+    addGameManual,
+    fetchGameInfoLlm,
+    fetchCovers,
+    refreshCover,
+    setCover,
+    launch,
+    toggleFav,
+    removeGame,
+    selectGame,
+    clearSelection,
+    setupEventListeners,
+  };
+});

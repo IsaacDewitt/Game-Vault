@@ -1,0 +1,273 @@
+<script setup lang="ts">
+import {
+  NSpace,
+  NInput,
+  NButton,
+  NIcon,
+  NSpin,
+  NEmpty,
+  NModal,
+  useMessage,
+  useDialog,
+} from "naive-ui";
+import { SearchOutline, CloudDownloadOutline, AddOutline } from "@vicons/ionicons5";
+import { open } from "@tauri-apps/plugin-dialog";
+import { ref } from "vue";
+import { useGamesStore } from "../stores/games";
+import * as api from "../lib/tauri";
+import GameCard from "../components/GameCard.vue";
+import GameDetail from "../components/GameDetail.vue";
+
+const store = useGamesStore();
+const message = useMessage();
+const dialog = useDialog();
+
+// 添加游戏弹窗状态
+const showNameModal = ref(false);
+const pendingExePath = ref("");
+const gameNameInput = ref("");
+
+async function handleAddGame() {
+  try {
+    const selected = await open({
+      multiple: false,
+      title: "选择游戏程序",
+      filters: [
+        {
+          name: "可执行文件",
+          extensions: ["exe"],
+        },
+      ],
+    });
+    if (selected) {
+      const exePath = selected as string;
+      // 从 exe 路径提取文件名（不含扩展名）作为默认游戏名
+      const fileName = exePath.split(/[/\\]/).pop() || "";
+      const defaultName = fileName.replace(/\.exe$/i, "");
+      pendingExePath.value = exePath;
+      gameNameInput.value = defaultName;
+      showNameModal.value = true;
+    }
+  } catch (e) {
+    console.error(e);
+    message.error("选择文件失败: " + (e as Error).toString());
+  }
+}
+
+async function handleConfirmAddGame() {
+  const name = gameNameInput.value.trim();
+  if (!name) {
+    message.warning("请输入游戏名称");
+    return;
+  }
+  try {
+    await store.addGameManual(name, pendingExePath.value);
+    message.success(`已添加游戏: ${name}`);
+    showNameModal.value = false;
+    pendingExePath.value = "";
+    gameNameInput.value = "";
+  } catch (e) {
+    message.error("添加游戏失败: " + (e as Error).toString());
+  }
+}
+
+function handleCancelAddGame() {
+  showNameModal.value = false;
+  pendingExePath.value = "";
+  gameNameInput.value = "";
+}
+
+function handleSearch(value: string) {
+  store.searchQuery = value;
+}
+
+async function handleRefreshCovers() {
+  try {
+    const result = await api.fetchMissingCovers();
+
+    // 检查是否有 API Key 认证失败
+    const authError = result.errors.find((e) =>
+      e.includes("API Key 无效") || e.includes("401") || e.includes("403")
+    );
+
+    if (authError) {
+      message.error("SteamGridDB API Key 无效，请在设置中重新配置");
+    } else if (result.fetched > 0) {
+      await store.loadGames();
+      message.success(`已获取 ${result.fetched} 个游戏的封面`);
+    } else if (result.total > 0) {
+      // 有游戏缺少封面但一个都没找到（API Key 没问题，但游戏名搜不到）
+      message.warning(
+        `${result.total} 个游戏缺少封面，但在 SteamGridDB 中未找到。可尝试手动设置封面`
+      );
+      result.errors.forEach((e) => console.warn("封面获取:", e));
+    } else if (result.errors.length === 0) {
+      message.info("所有游戏封面已是最新");
+    } else {
+      message.error(result.errors[0]);
+      result.errors.slice(1).forEach((e) => console.warn("封面获取:", e));
+    }
+  } catch (e) {
+    message.error("获取封面失败: " + (e as Error).toString());
+  }
+}
+
+function handleDeleteGame(gameId: string) {
+  const game = store.games.find((g) => g.id === gameId);
+  const gameName = game?.name || "该游戏";
+  dialog.warning({
+    title: "确认删除",
+    content: `确定要删除「${gameName}」吗？此操作不可撤销，游戏的游玩记录将一并删除。`,
+    positiveText: "删除",
+    negativeText: "取消",
+    onPositiveClick: async () => {
+      try {
+        await store.removeGame(gameId);
+        message.success("已删除游戏");
+      } catch (e) {
+        message.error("删除失败: " + (e as Error).toString());
+      }
+    },
+  });
+}
+</script>
+
+<template>
+  <div class="home-view">
+    <!-- 顶部工具栏 -->
+    <div class="toolbar">
+      <n-space align="center" justify="space-between" style="width: 100%">
+        <n-space align="center">
+          <n-input
+            placeholder="搜索游戏..."
+            clearable
+            style="width: 300px"
+            @update:value="handleSearch"
+          >
+            <template #prefix>
+              <n-icon :component="SearchOutline" />
+            </template>
+          </n-input>
+        </n-space>
+
+        <n-space>
+          <n-button @click="handleRefreshCovers">
+            <template #icon>
+              <n-icon :component="CloudDownloadOutline" />
+            </template>
+            刷新封面
+          </n-button>
+          <n-button type="primary" @click="handleAddGame">
+            <template #icon>
+              <n-icon :component="AddOutline" />
+            </template>
+            添加游戏
+          </n-button>
+        </n-space>
+      </n-space>
+    </div>
+
+    <!-- 游戏内容区 -->
+    <div class="content-area">
+      <!-- 加载中 -->
+      <div v-if="store.loading" class="loading">
+        <n-spin size="large" />
+        <p>加载游戏列表...</p>
+      </div>
+
+      <!-- 空状态 -->
+      <div v-else-if="store.filteredGames.length === 0" class="empty">
+        <n-empty description="还没有游戏，点击上方按钮添加">
+          <template #extra>
+            <n-button type="primary" @click="handleAddGame">
+              添加游戏
+            </n-button>
+          </template>
+        </n-empty>
+      </div>
+
+      <!-- 游戏网格 -->
+      <div v-else class="game-grid">
+        <GameCard
+          v-for="game in store.filteredGames"
+          :key="game.id"
+          :game="game"
+          :is-active="store.activeGames.includes(game.id)"
+          @click="store.selectGame(game)"
+          @launch="store.launch(game.id)"
+          @favorite="store.toggleFav(game.id)"
+          @delete="handleDeleteGame(game.id)"
+        />
+      </div>
+    </div>
+
+    <!-- 游戏详情面板 -->
+    <GameDetail
+      v-if="store.selectedGame"
+      :game="store.selectedGame"
+      :is-active="store.activeGames.includes(store.selectedGame.id)"
+      @close="store.clearSelection()"
+      @launch="store.launch(store.selectedGame!.id)"
+      @favorite="store.toggleFav(store.selectedGame!.id)"
+      @delete="handleDeleteGame(store.selectedGame!.id)"
+    />
+
+    <!-- 输入游戏名称弹窗 -->
+    <n-modal
+      :show="showNameModal"
+      preset="card"
+      title="添加游戏"
+      style="width: 450px"
+      :closable="true"
+      @close="handleCancelAddGame()"
+    >
+      <p style="margin-bottom: 12px; color: #999;">
+        请输入游戏名称：
+      </p>
+      <n-input
+        v-model:value="gameNameInput"
+        placeholder="游戏名称"
+        @keyup.enter="handleConfirmAddGame()"
+      />
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="handleCancelAddGame()">取消</n-button>
+          <n-button type="primary" @click="handleConfirmAddGame()">确认添加</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+  </div>
+</template>
+
+<style scoped>
+.home-view {
+  position: relative;
+  height: calc(100vh - 48px);
+}
+
+.toolbar {
+  margin-bottom: 16px;
+}
+
+.content-area {
+  height: calc(100vh - 140px);
+  overflow-y: auto;
+}
+
+.loading,
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 400px;
+  gap: 16px;
+}
+
+.game-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 16px;
+  padding-bottom: 24px;
+}
+</style>
