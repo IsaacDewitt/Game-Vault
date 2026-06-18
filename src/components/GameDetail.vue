@@ -163,21 +163,6 @@ async function handleChangeCover() {
         <div v-else class="cover-placeholder">
           <n-icon :component="GameControllerOutline" :size="48" />
         </div>
-        <n-tooltip trigger="hover">
-          <template #trigger>
-            <n-button
-              size="small"
-              class="change-cover-btn"
-              @click="handleChangeCover"
-            >
-              <template #icon>
-                <n-icon :component="ImageOutline" />
-              </template>
-              更换封面
-            </n-button>
-          </template>
-          选择本地图片作为封面
-        </n-tooltip>
         <!-- 标签角标 -->
         <div v-if="game.genres && game.genres.length > 0" class="cover-tags">
           <span
@@ -189,6 +174,24 @@ async function handleChangeCover() {
             {{ genre }}
           </span>
         </div>
+      </div>
+      <!-- 更换封面按钮 -->
+      <div class="change-cover-section">
+        <n-tooltip trigger="hover">
+          <template #trigger>
+            <n-button
+              size="small"
+              quaternary
+              @click="handleChangeCover"
+            >
+              <template #icon>
+                <n-icon :component="ImageOutline" />
+              </template>
+              更换封面
+            </n-button>
+          </template>
+          选择本地图片作为封面
+        </n-tooltip>
       </div>
 
       <!-- 操作按钮 -->
@@ -303,10 +306,26 @@ async function handleChangeCover() {
 }
 
 .cover-section {
-  margin-bottom: 16px;
+  margin-bottom: 8px;
   border-radius: 8px;
   overflow: hidden;
   position: relative;
+}
+
+.cover-tags {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.cover-tag {
+  font-size: 11px;
+  color: #fff;
+  padding: 2px 8px;
+  border-radius: 4px;
 }
 
 .cover-img {
@@ -325,10 +344,10 @@ async function handleChangeCover() {
   color: #555;
 }
 
-.change-cover-btn {
-  position: absolute;
-  bottom: 8px;
-  right: 8px;
+.change-cover-section {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 16px;
 }
 
 .actions-section {
