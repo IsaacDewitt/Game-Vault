@@ -105,6 +105,7 @@ pub fn run() {
             commands::games::fetch_missing_covers,
             commands::games::fetch_game_info_llm,
             commands::games::read_cover_as_base64,
+            commands::games::read_covers_batch_as_base64,
             // 统计相关
             commands::stats::get_play_stats,
             commands::stats::get_daily_stats,

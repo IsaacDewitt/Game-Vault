@@ -16,15 +16,16 @@ import type { Settings } from "../lib/tauri";
 
 const message = useMessage();
 
+// 默认值仅用于表单初始显示，实际默认值从后端 API 获取
 const settings = ref<Settings>({
   theme: "dark",
   language: "zh-CN",
   steamgriddb_api_key: "",
-  llm_provider: "xiaomi",
-  llm_protocol: "openai",
+  llm_provider: "",
+  llm_protocol: "",
   llm_api_key: "",
-  llm_base_url: "https://api.xiaomimimo.com/v1",
-  llm_model: "mimo-v2.5-pro",
+  llm_base_url: "",
+  llm_model: "",
   llm_enabled: false,
 });
 

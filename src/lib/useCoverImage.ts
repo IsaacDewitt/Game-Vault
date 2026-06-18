@@ -1,48 +1,28 @@
-import { computed, ref, watch, type Ref } from "vue";
+import { computed, type Ref } from "vue";
 import type { Game } from "./tauri";
-import { readCoverAsBase64 } from "./tauri";
 import { useGamesStore } from "../stores/games";
 
 /**
  * 封面图片逻辑 composable
- * 通过 Tauri 命令读取本地文件为 base64 data URL，绕过 asset protocol
+ * 从 store 的批量 base64 缓存中读取封面，避免单独 IPC 调用
  */
 export function useCoverImage(game: Ref<Game>) {
   const store = useGamesStore();
-  const imgFailed = ref(false);
-  const coverImage = ref<string | null>(null);
 
-  // 计算封面文件路径
-  const coverPath = computed(() => {
-    const cachedPath = store.coverPaths[game.value.id];
-    if (cachedPath) return cachedPath;
-    if (game.value.cover_local) return game.value.cover_local;
-    if (game.value.cover_url) return game.value.cover_url;
-    return null;
+  // 直接从 store 的 base64 缓存中获取封面
+  const coverImage = computed(() => {
+    return store.coverBase64Cache[game.value.id] || null;
   });
 
-  // 当路径变化时，异步加载 base64
-  watch(
-    coverPath,
-    async (newPath) => {
-      if (!newPath) {
-        coverImage.value = null;
-        return;
-      }
-      try {
-        imgFailed.value = false;
-        coverImage.value = await readCoverAsBase64(newPath);
-      } catch (e) {
-        console.error("[CoverImage] 加载封面失败:", e);
-        coverImage.value = null;
-        imgFailed.value = true;
-      }
-    },
-    { immediate: true }
-  );
+  // 如果缓存中没有且有封面路径，说明加载失败或正在加载
+  const imgFailed = computed(() => {
+    const hasPath = store.coverPaths[game.value.id] || game.value.cover_local || game.value.cover_url;
+    return !!hasPath && !coverImage.value && !store.coversLoading;
+  });
 
   function handleImageError() {
-    imgFailed.value = true;
+    // 图片加载失败时的处理（base64 data URL 通常不会加载失败）
+    console.warn("[CoverImage] 图片渲染失败:", game.value.name);
   }
 
   return {

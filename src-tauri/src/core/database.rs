@@ -61,6 +61,11 @@ impl Database {
             INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_scan_on_start', 'true');
             INSERT OR IGNORE INTO settings (key, value) VALUES ('scan_depth', '3');
             INSERT OR IGNORE INTO settings (key, value) VALUES ('steamgriddb_api_key', '');
+
+            -- 索引：提升查询性能
+            CREATE INDEX IF NOT EXISTS idx_games_name ON games(name);
+            CREATE INDEX IF NOT EXISTS idx_play_sessions_game_id ON play_sessions(game_id);
+            CREATE INDEX IF NOT EXISTS idx_play_sessions_start_time ON play_sessions(start_time);
         ")?;
         Ok(())
     }
@@ -121,10 +126,10 @@ impl Database {
                 exe_name = excluded.exe_name,
                 cover_local = COALESCE(excluded.cover_local, games.cover_local),
                 cover_url = COALESCE(excluded.cover_url, games.cover_url),
-                description = COALESCE(excluded.description, games.description),
-                developer = COALESCE(excluded.developer, games.developer),
-                publisher = COALESCE(excluded.publisher, games.publisher),
-                release_date = COALESCE(excluded.release_date, games.release_date),
+                description = excluded.description,
+                developer = excluded.developer,
+                publisher = excluded.publisher,
+                release_date = excluded.release_date,
                 genres = excluded.genres,
                 updated_at = excluded.updated_at
             ",
@@ -181,7 +186,7 @@ impl Database {
             sql.push_str(" AND is_favorite = 1");
         }
 
-        // 排序
+        // 排序（白名单校验防止注入）
         let sort_column = match filter.sort_by.as_str() {
             "name" => "name",
             "last_played" => "last_played",
@@ -189,7 +194,10 @@ impl Database {
             "added_at" => "added_at",
             _ => "last_played",
         };
-        let sort_order = if filter.sort_order == "asc" { "ASC" } else { "DESC" };
+        let sort_order = match filter.sort_order.as_str() {
+            "asc" => "ASC",
+            _ => "DESC",
+        };
         sql.push_str(&format!(" ORDER BY {} {}", sort_column, sort_order));
 
         let mut stmt = self.conn.prepare(&sql)?;

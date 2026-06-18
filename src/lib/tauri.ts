@@ -105,6 +105,10 @@ export async function readCoverAsBase64(path: string): Promise<string> {
   return invoke("read_cover_as_base64", { path });
 }
 
+export async function readCoversBatchAsBase64(paths: string[]): Promise<Record<string, string>> {
+  return invoke("read_covers_batch_as_base64", { paths });
+}
+
 
 export async function getPlayStats(limit?: number): Promise<PlayStats[]> {
   return invoke("get_play_stats", { limit });
