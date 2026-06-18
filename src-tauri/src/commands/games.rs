@@ -152,14 +152,39 @@ pub fn set_game_cover(
     db.update_game_cover(&game_id, &cover_path).map_err(|e| e.to_string())
 }
 
-/// 删除游戏封面（清除 cover_url 和 cover_local）
+/// 删除游戏封面（清除 cover_url 和 cover_local，同时删除本地文件）
 #[tauri::command]
 pub fn remove_game_cover(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
 ) -> Result<(), String> {
-    let db = lock_or_recover(&db);
-    db.remove_game_cover(&game_id).map_err(|e| e.to_string())
+    let db_guard = lock_or_recover(&db);
+
+    // 先获取游戏信息，拿到封面文件路径
+    let game = db_guard.get_game_by_id(&game_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "游戏不存在".to_string())?;
+
+    // 删除本地封面文件
+    if let Some(ref cover_url) = game.cover_url {
+        let path = std::path::Path::new(cover_url);
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(path) {
+                tracing::warn!("删除封面文件失败 {}: {}", cover_url, e);
+            }
+        }
+    }
+    if let Some(ref cover_local) = game.cover_local {
+        let path = std::path::Path::new(cover_local);
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(path) {
+                tracing::warn!("删除封面文件失败 {}: {}", cover_local, e);
+            }
+        }
+    }
+
+    // 清除数据库记录
+    db_guard.remove_game_cover(&game_id).map_err(|e| e.to_string())
 }
 
 /// 获取所有游戏的有效封面路径（供前端通过 asset 协议加载）
