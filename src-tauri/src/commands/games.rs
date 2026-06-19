@@ -421,6 +421,15 @@ pub async fn fetch_game_info_llm(
     if !meta.genres.is_empty() {
         updated.genres = meta.genres;
     }
+    if let Some(v) = meta.hltb_main_story {
+        updated.hltb_main_story = Some(v);
+    }
+    if let Some(v) = meta.hltb_main_extra {
+        updated.hltb_main_extra = Some(v);
+    }
+    if let Some(v) = meta.hltb_completionist {
+        updated.hltb_completionist = Some(v);
+    }
 
     db_guard.update_game(&updated).map_err(|e| e.to_string())?;
     Ok(updated)
@@ -519,6 +528,68 @@ pub fn export_game_data(
         .map_err(|e| format!("序列化失败: {}", e))?;
 
     Ok(json)
+}
+
+/// 导入游戏库数据（从 JSON 备份恢复）
+#[tauri::command]
+pub fn import_game_data(
+    db: State<'_, Arc<Mutex<Database>>>,
+    json_data: String,
+) -> Result<serde_json::Value, String> {
+    let import_data: serde_json::Value = serde_json::from_str(&json_data)
+        .map_err(|e| format!("JSON 解析失败: {}", e))?;
+
+    let db_guard = lock_or_recover(&db);
+
+    // 导入游戏
+    let mut imported_games = 0u32;
+    if let Some(games_array) = import_data["games"].as_array() {
+        for game_json in games_array {
+            match serde_json::from_value::<Game>(game_json.clone()) {
+                Ok(game) => {
+                    if let Err(e) = db_guard.upsert_game(&game) {
+                        tracing::warn!("导入游戏失败 {}: {}", game.name, e);
+                    } else {
+                        imported_games += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("解析游戏数据失败: {}", e);
+                }
+            }
+        }
+    }
+
+    // 导入设置
+    let mut settings_restored = false;
+    if let Some(settings_json) = import_data.get("settings") {
+        match serde_json::from_value::<Settings>(settings_json.clone()) {
+            Ok(settings) => {
+                if let Err(e) = settings.save_to_db(&db_guard) {
+                    tracing::warn!("导入设置失败: {}", e);
+                } else {
+                    settings_restored = true;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("解析设置数据失败: {}", e);
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "imported_games": imported_games,
+        "settings_restored": settings_restored,
+    }))
+}
+
+/// 获取所有游戏类型（去重列表）
+#[tauri::command]
+pub fn get_all_genres(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<Vec<String>, String> {
+    let db = lock_or_recover(&db);
+    db.get_all_genres().map_err(|e| e.to_string())
 }
 
 /// 批量读取封面图片为 base64 data URL（减少 IPC 调用次数）

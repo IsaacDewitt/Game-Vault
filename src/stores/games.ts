@@ -19,6 +19,10 @@ export const useGamesStore = defineStore("games", () => {
   const coversLoading = ref(false);
   // 封面获取进度
   const coverFetchProgress = ref<{ current: number; total: number; game_name: string } | null>(null);
+  // 筛选状态
+  const statusFilter = ref("");
+  const genreFilter = ref("");
+  const allGenres = ref<string[]>([]);
 
   // 监听后端游戏停止事件，清理 activeGames
   let unlistenGameStopped: (() => void) | null = null;
@@ -67,6 +71,23 @@ export const useGamesStore = defineStore("games", () => {
       result = result.filter((g) => g.name.toLowerCase().includes(query));
     }
 
+    // 状态筛选
+    if (statusFilter.value) {
+      if (statusFilter.value === "favorites") {
+        result = result.filter((g) => g.is_favorite);
+      } else {
+        result = result.filter((g) => g.status === statusFilter.value);
+      }
+    }
+
+    // 类型筛选
+    if (genreFilter.value) {
+      const genre = genreFilter.value.toLowerCase();
+      result = result.filter((g) =>
+        g.genres.some((gr) => gr.toLowerCase().includes(genre))
+      );
+    }
+
     return result;
   });
 
@@ -79,10 +100,19 @@ export const useGamesStore = defineStore("games", () => {
         sort_order: "desc",
       });
       await loadAllCovers();
+      await loadAllGenres();
     } catch (e) {
       console.error("加载游戏列表失败:", e);
     } finally {
       loading.value = false;
+    }
+  }
+
+  async function loadAllGenres() {
+    try {
+      allGenres.value = await api.getAllGenres();
+    } catch (e) {
+      console.error("加载游戏类型失败:", e);
     }
   }
 
@@ -280,9 +310,13 @@ export const useGamesStore = defineStore("games", () => {
     coverBase64Cache,
     coversLoading,
     coverFetchProgress,
+    statusFilter,
+    genreFilter,
+    allGenres,
     filteredGames,
     loadGames,
     loadAllCovers,
+    loadAllGenres,
     addGameManual,
     fetchGameInfoLlm,
     fetchCovers,

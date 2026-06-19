@@ -100,3 +100,17 @@ pub fn get_status_stats(
     let db = lock_or_recover(&db);
     db.get_status_stats().map_err(|e| e.to_string())
 }
+
+/// 获取游玩会话历史
+#[tauri::command]
+pub fn get_play_sessions(
+    db: State<'_, Arc<Mutex<Database>>>,
+    game_id: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Vec<PlaySessionDetail>, String> {
+    let db = lock_or_recover(&db);
+    let limit = limit.unwrap_or(50);
+    let offset = offset.unwrap_or(0);
+    db.get_play_sessions(game_id.as_deref(), limit, offset).map_err(|e| e.to_string())
+}

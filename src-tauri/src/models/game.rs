@@ -24,6 +24,12 @@ pub struct Game {
     pub status: String,
     pub added_at: String,
     pub updated_at: Option<String>,
+    /// HLTB 主线时长（分钟）
+    pub hltb_main_story: Option<u32>,
+    /// HLTB 主线+支线时长（分钟）
+    pub hltb_main_extra: Option<u32>,
+    /// HLTB 完美通关时长（分钟）
+    pub hltb_completionist: Option<u32>,
 }
 
 impl Game {
@@ -49,6 +55,9 @@ impl Game {
             status: "unplayed".to_string(),
             added_at: chrono::Utc::now().to_rfc3339(),
             updated_at: None,
+            hltb_main_story: None,
+            hltb_main_extra: None,
+            hltb_completionist: None,
         }
     }
 
@@ -70,6 +79,10 @@ impl Game {
 pub struct GameFilter {
     pub search: Option<String>,
     pub favorites_only: bool,
+    /// 按状态筛选: "unplayed", "playing", "completed", "abandoned"
+    pub status: Option<String>,
+    /// 按类型标签筛选（模糊匹配 genres JSON 字段）
+    pub genre: Option<String>,
     pub sort_by: String,       // "name", "last_played", "play_time", "added_at"
     pub sort_order: String,    // "asc" or "desc"
 }
@@ -79,6 +92,8 @@ impl Default for GameFilter {
         Self {
             search: None,
             favorites_only: false,
+            status: None,
+            genre: None,
             sort_by: "last_played".to_string(),
             sort_order: "desc".to_string(),
         }

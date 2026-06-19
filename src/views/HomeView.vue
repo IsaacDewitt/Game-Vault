@@ -8,6 +8,8 @@ import {
   NEmpty,
   NModal,
   NProgress,
+  NSelect,
+  NButtonGroup,
   useMessage,
   useDialog,
 } from "naive-ui";
@@ -21,6 +23,7 @@ import GameCard from "../components/GameCard.vue";
 import GameDetail from "../components/GameDetail.vue";
 import ContextMenu from "../components/ContextMenu.vue";
 import type { ContextMenuItem } from "../components/ContextMenu.vue";
+import { formatPlayTime } from "../lib/format";
 
 const store = useGamesStore();
 const message = useMessage();
@@ -41,6 +44,30 @@ const refreshingCovers = ref(false);
 const showHomeContextMenu = ref(false);
 const homeContextMenuX = ref(0);
 const homeContextMenuY = ref(0);
+
+// 状态筛选选项
+const statusOptions = [
+  { label: "全部", value: "" },
+  { label: "未游玩", value: "unplayed" },
+  { label: "游玩中", value: "playing" },
+  { label: "已通关", value: "completed" },
+  { label: "已弃坑", value: "abandoned" },
+  { label: "收藏", value: "favorites" },
+];
+
+// 类型筛选选项（从 store 动态加载）
+const genreSelectOptions = computed(() => [
+  { label: "全部类型", value: "" },
+  ...store.allGenres.map((g) => ({ label: g, value: g })),
+]);
+
+// 最近游玩的游戏（取最近 8 个有游玩记录的）
+const recentGames = computed(() => {
+  return store.games
+    .filter((g) => g.last_played && g.play_time_seconds > 0)
+    .sort((a, b) => (b.last_played || "").localeCompare(a.last_played || ""))
+    .slice(0, 8);
+});
 
 function handleHomeContextMenu(e: MouseEvent) {
   e.preventDefault();
@@ -269,10 +296,41 @@ function handleDeleteGame(gameId: string) {
     },
   });
 }
+
 </script>
 
 <template>
   <div class="home-view" @contextmenu="handleHomeContextMenu">
+    <!-- 最近游玩条带 -->
+    <div v-if="recentGames.length > 0" class="recent-section">
+      <div class="recent-header">
+        <span class="recent-title">最近游玩</span>
+      </div>
+      <div class="recent-strip">
+        <div
+          v-for="game in recentGames"
+          :key="game.id"
+          class="recent-card"
+          @click="store.selectGame(game)"
+        >
+          <div class="recent-cover">
+            <img
+              v-if="store.coverBase64Cache[game.id]"
+              :src="store.coverBase64Cache[game.id]"
+              :alt="game.name"
+              loading="lazy"
+            />
+            <div v-else class="recent-cover-placeholder">{{ game.name.charAt(0) }}</div>
+            <button class="recent-launch" @click.stop="store.launch(game.id)" title="启动">▶</button>
+          </div>
+          <div class="recent-info">
+            <div class="recent-name">{{ game.name }}</div>
+            <div class="recent-time">{{ formatPlayTime(game.play_time_seconds) }}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 顶部工具栏 -->
     <div class="toolbar">
       <n-space align="center" justify="space-between" style="width: 100%">
@@ -280,13 +338,36 @@ function handleDeleteGame(gameId: string) {
           <n-input
             placeholder="搜索游戏..."
             clearable
-            style="width: 300px"
+            style="width: 240px"
             @update:value="handleSearch"
           >
             <template #prefix>
               <n-icon :component="SearchOutline" />
             </template>
           </n-input>
+
+          <!-- 状态筛选 -->
+          <n-button-group>
+            <n-button
+              v-for="opt in statusOptions"
+              :key="opt.value"
+              :type="store.statusFilter === opt.value ? 'primary' : 'default'"
+              size="small"
+              @click="store.statusFilter = opt.value"
+            >
+              {{ opt.label }}
+            </n-button>
+          </n-button-group>
+
+          <!-- 类型筛选 -->
+          <n-select
+            v-model:value="store.genreFilter"
+            :options="genreSelectOptions"
+            placeholder="游戏类型"
+            clearable
+            style="width: 150px"
+            size="small"
+          />
         </n-space>
 
         <n-space>
@@ -437,6 +518,122 @@ function handleDeleteGame(gameId: string) {
   height: calc(100vh - 48px);
 }
 
+/* 最近游玩区域 */
+.recent-section {
+  margin-bottom: 16px;
+}
+
+.recent-header {
+  margin-bottom: 8px;
+}
+
+.recent-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #aaa;
+}
+
+.recent-strip {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 8px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+}
+
+.recent-strip::-webkit-scrollbar {
+  height: 4px;
+}
+
+.recent-strip::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+}
+
+.recent-card {
+  flex-shrink: 0;
+  width: 110px;
+  cursor: pointer;
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.05);
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.recent-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.recent-cover {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 3/4;
+  overflow: hidden;
+  background: #2a2a3e;
+}
+
+.recent-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.recent-cover-placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 28px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.15);
+  background: linear-gradient(135deg, #2a2a3e 0%, #1a1a2e 100%);
+}
+
+.recent-launch {
+  position: absolute;
+  bottom: 4px;
+  right: 4px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent-color, #6366f1);
+  color: white;
+  font-size: 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.recent-card:hover .recent-launch {
+  opacity: 1;
+}
+
+.recent-info {
+  padding: 6px 8px;
+}
+
+.recent-name {
+  font-size: 11px;
+  font-weight: 500;
+  color: #ddd;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.recent-time {
+  font-size: 10px;
+  color: #888;
+  margin-top: 2px;
+}
+
 .toolbar {
   margin-bottom: 16px;
 }
@@ -456,7 +653,7 @@ function handleDeleteGame(gameId: string) {
 }
 
 .content-area {
-  height: calc(100vh - 140px);
+  height: calc(100vh - 260px);
   overflow-y: auto;
 
   /* Dark scrollbar to match project theme */

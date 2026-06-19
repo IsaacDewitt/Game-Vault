@@ -60,6 +60,15 @@ pub struct LlmGameMeta {
     /// LLM 可能返回 null 或 []，统一用 deserialize_with 处理
     #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub genres: Vec<String>,
+    /// HLTB 主线时长（分钟）
+    #[serde(default)]
+    pub hltb_main_story: Option<u32>,
+    /// HLTB 主线+支线时长（分钟）
+    #[serde(default)]
+    pub hltb_main_extra: Option<u32>,
+    /// HLTB 完美通关时长（分钟）
+    #[serde(default)]
+    pub hltb_completionist: Option<u32>,
 }
 
 /// 反序列化：null / [] / ["a","b"] 都能正确处理
@@ -84,7 +93,10 @@ fn build_system_prompt() -> String {
        \"developer\": \"开发商名称\",\n\
        \"publisher\": \"发行商名称\",\n\
        \"release_date\": \"发售日期（格式：YYYY-MM-DD）\",\n\
-       \"genres\": [\"类型1\", \"类型2\"]\n\
+       \"genres\": [\"类型1\", \"类型2\"],\n\
+       \"hltb_main_story\": 主线通关时长（分钟，整数，无法确定填 null）,\n\
+       \"hltb_main_extra\": 主线+支线时长（分钟，整数，无法确定填 null）,\n\
+       \"hltb_completionist\": 完美通关时长（分钟，整数，无法确定填 null）\n\
      }\n\
      \n\
      注意事项：\n\
@@ -92,6 +104,7 @@ fn build_system_prompt() -> String {
      - 如果名称已经是正确的，也请返回完整的正式名称\n\
      - 某项信息确实无法确定时，填 null\n\
      - genres 不确定时填空数组 []\n\
+     - hltb 时长请根据 HowLongToBeat 数据或你的知识估算，单位为分钟。如《塞尔达传说：旷野之息》主线约50小时则填 3000\n\
      - 不要用 markdown 代码块包裹，直接返回 JSON"
         .to_string()
 }

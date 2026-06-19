@@ -9,6 +9,10 @@ import {
   NTabs,
   NTabPane,
   NSpin,
+  NSelect,
+  NEmpty,
+  NSpace,
+  NButton,
 } from "naive-ui";
 import {
   GameControllerOutline,
@@ -41,8 +45,10 @@ import type {
   HeatmapDay,
   HourlyStats,
   StatusStats,
+  PlaySessionDetail,
 } from "../lib/tauri";
 import { useGamesStore } from "../stores/games";
+import { formatPlayTime, formatDate } from "../lib/format";
 
 const gamesStore = useGamesStore();
 
@@ -84,8 +90,25 @@ const statusStats = ref<StatusStats>({
   abandoned: 0,
 });
 
+// 游玩会话历史
+const sessionHistory = ref<PlaySessionDetail[]>([]);
+const sessionGameFilter = ref<string>("");
+const sessionLoading = ref(false);
+const sessionOffset = ref(0);
+const sessionHasMore = ref(true);
+const SESSION_PAGE_SIZE = 50;
+
+// 游戏筛选选项（用于会话历史）
+const gameFilterOptions = computed(() => [
+  { label: "全部游戏", value: "" },
+  ...gamesStore.games.map((g) => ({ label: g.name, value: g.id })),
+]);
+
 // 游戏主色调缓存 (game_id -> hex color)
 const gameColors = ref<Record<string, string>>({});
+
+// 当前活跃的 tab
+const activeTab = ref("overview");
 
 // 响应式网格列数
 const gridCols = ref(4);
@@ -694,6 +717,44 @@ function formatHours(seconds: number): string {
   return (seconds / 3600).toFixed(1);
 }
 
+// 加载游玩会话历史
+async function loadSessionHistory(reset = false) {
+  if (reset) {
+    sessionOffset.value = 0;
+    sessionHistory.value = [];
+    sessionHasMore.value = true;
+  }
+
+  if (!sessionHasMore.value) return;
+
+  sessionLoading.value = true;
+  try {
+    const gameId = sessionGameFilter.value || undefined;
+    const sessions = await api.getPlaySessions(gameId, SESSION_PAGE_SIZE, sessionOffset.value);
+    if (sessions.length < SESSION_PAGE_SIZE) {
+      sessionHasMore.value = false;
+    }
+    sessionHistory.value.push(...sessions);
+    sessionOffset.value += sessions.length;
+  } catch (e) {
+    console.error("加载会话历史失败:", e);
+  } finally {
+    sessionLoading.value = false;
+  }
+}
+
+// 筛选游戏变化时重新加载
+watch(sessionGameFilter, () => {
+  loadSessionHistory(true);
+});
+
+// 切换到游玩记录 tab 时加载数据
+watch(activeTab, (tab) => {
+  if (tab === "sessions" && sessionHistory.value.length === 0) {
+    loadSessionHistory(true);
+  }
+});
+
 function getHeatmapRange(): string[] {
   const end = new Date();
   const start = new Date();
@@ -772,7 +833,7 @@ onUnmounted(() => {
       </n-grid>
 
       <!-- 图表 -->
-      <n-tabs type="line">
+      <n-tabs v-model:value="activeTab" type="line">
         <!-- 概览 Tab -->
         <n-tab-pane name="overview" tab="概览">
           <n-grid :cols="chartGridCols" :x-gap="16" :y-gap="16" responsive="screen">
@@ -906,6 +967,57 @@ onUnmounted(() => {
             </div>
           </n-card>
         </n-tab-pane>
+
+        <!-- 游玩记录 Tab -->
+        <n-tab-pane name="sessions" tab="游玩记录">
+          <n-card>
+            <template #header>
+              <n-space align="center" justify="space-between">
+                <span>游玩会话历史</span>
+                <n-select
+                  v-model:value="sessionGameFilter"
+                  :options="gameFilterOptions"
+                  placeholder="筛选游戏"
+                  clearable
+                  style="width: 200px"
+                  size="small"
+                />
+              </n-space>
+            </template>
+
+            <div v-if="sessionHistory.length === 0 && !sessionLoading" style="padding: 40px 0">
+              <n-empty description="暂无游玩记录" />
+            </div>
+
+            <div v-else class="session-list">
+              <div
+                v-for="session in sessionHistory"
+                :key="session.id"
+                class="session-item"
+              >
+                <div class="session-game-name">{{ session.game_name }}</div>
+                <div class="session-details">
+                  <span class="session-time">{{ formatDate(session.start_time) }}</span>
+                  <span class="session-duration">{{ formatPlayTime(session.duration_seconds) }}</span>
+                </div>
+              </div>
+            </div>
+
+            <div v-if="sessionHasMore && sessionHistory.length > 0" style="text-align: center; margin-top: 16px">
+              <n-button
+                :loading="sessionLoading"
+                @click="loadSessionHistory(false)"
+                size="small"
+              >
+                加载更多
+              </n-button>
+            </div>
+
+            <div v-if="sessionLoading && sessionHistory.length === 0" style="text-align: center; padding: 40px 0">
+              <n-spin size="medium" />
+            </div>
+          </n-card>
+        </n-tab-pane>
       </n-tabs>
     </n-spin>
   </div>
@@ -1033,6 +1145,58 @@ onUnmounted(() => {
   color: rgba(255, 255, 255, 0.9);
   white-space: nowrap;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+
+/* 游玩会话列表 */
+.session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.session-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+
+.session-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.session-game-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: #ddd;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-details {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.session-time {
+  font-size: 12px;
+  color: #888;
+}
+
+.session-duration {
+  font-size: 12px;
+  font-weight: 500;
+  color: #aaa;
+  min-width: 60px;
+  text-align: right;
 }
 
 /* 类型详情网格 */

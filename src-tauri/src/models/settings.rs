@@ -30,6 +30,13 @@ pub struct Settings {
     /// 是否启用 LLM 获取游戏信息
     #[serde(default)]
     pub llm_enabled: bool,
+    /// 主题色（hex）
+    #[serde(default = "default_accent_color")]
+    pub accent_color: String,
+}
+
+fn default_accent_color() -> String {
+    "#6366f1".to_string()
 }
 
 impl Default for Settings {
@@ -44,6 +51,7 @@ impl Default for Settings {
             llm_base_url: DEFAULT_LLM_BASE_URL.to_string(),
             llm_model: DEFAULT_LLM_MODEL.to_string(),
             llm_enabled: false,
+            accent_color: default_accent_color(),
         }
     }
 }
@@ -65,6 +73,7 @@ impl Settings {
             llm_base_url: get("llm_base_url", DEFAULT_LLM_BASE_URL),
             llm_model: get("llm_model", DEFAULT_LLM_MODEL),
             llm_enabled: get("llm_enabled", "false") == "true",
+            accent_color: get("accent_color", &default_accent_color()),
         })
     }
 
@@ -79,6 +88,7 @@ impl Settings {
         db.set_setting("llm_base_url", &self.llm_base_url)?;
         db.set_setting("llm_model", &self.llm_model)?;
         db.set_setting("llm_enabled", &self.llm_enabled.to_string())?;
+        db.set_setting("accent_color", &self.accent_color)?;
         Ok(())
     }
 }

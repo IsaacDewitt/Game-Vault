@@ -10,6 +10,17 @@ pub struct PlaySession {
     pub duration_seconds: u64,
 }
 
+/// 游戏会话详情（联表查询，含游戏名）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaySessionDetail {
+    pub id: i64,
+    pub game_id: String,
+    pub game_name: String,
+    pub start_time: String,
+    pub end_time: Option<String>,
+    pub duration_seconds: u64,
+}
+
 /// 活跃的游戏会话（内存中）
 #[derive(Debug, Clone)]
 pub struct ActiveSession {

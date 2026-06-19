@@ -23,11 +23,19 @@ export interface Game {
   status: string;
   added_at: string;
   updated_at: string | null;
+  /** HLTB 主线时长（分钟） */
+  hltb_main_story: number | null;
+  /** HLTB 主线+支线时长（分钟） */
+  hltb_main_extra: number | null;
+  /** HLTB 完美通关时长（分钟） */
+  hltb_completionist: number | null;
 }
 
 export interface GameFilter {
   search?: string;
   favorites_only?: boolean;
+  status?: string;
+  genre?: string;
   sort_by?: string;
   sort_order?: string;
 }
@@ -81,6 +89,7 @@ export interface Settings {
   llm_base_url: string;
   llm_model: string;
   llm_enabled: boolean;
+  accent_color: string;
 }
 
 // ==================== Tauri 命令封装 ====================
@@ -195,4 +204,25 @@ export async function exportGameData(): Promise<string> {
 
 export async function renameGame(gameId: string, newName: string): Promise<void> {
   return invoke("rename_game", { gameId, newName });
+}
+
+export async function importGameData(jsonData: string): Promise<{ imported_games: number; settings_restored: boolean }> {
+  return invoke("import_game_data", { jsonData });
+}
+
+export async function getAllGenres(): Promise<string[]> {
+  return invoke("get_all_genres");
+}
+
+export interface PlaySessionDetail {
+  id: number;
+  game_id: string;
+  game_name: string;
+  start_time: string;
+  end_time: string | null;
+  duration_seconds: number;
+}
+
+export async function getPlaySessions(gameId?: string, limit?: number, offset?: number): Promise<PlaySessionDetail[]> {
+  return invoke("get_play_sessions", { gameId, limit, offset });
 }

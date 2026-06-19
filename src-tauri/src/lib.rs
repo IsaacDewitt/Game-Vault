@@ -5,6 +5,8 @@ mod utils;
 
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use tauri::{Emitter, Manager};
+use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButtonState, MouseButton};
+use tauri::menu::{Menu, MenuItem};
 
 /// 初始化应用
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -91,6 +93,57 @@ pub fn run() {
             // 保存 running 标记以便退出时清理
             app.manage(running);
 
+            // 创建系统托盘
+            let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("Game Vault")
+                .menu(&menu)
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
+            // 拦截窗口关闭事件，最小化到托盘而非退出
+            if let Some(window) = app.get_webview_window("main") {
+                let window_clone = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        // 阻止默认关闭行为，改为隐藏窗口
+                        api.prevent_close();
+                        let _ = window_clone.hide();
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -111,6 +164,8 @@ pub fn run() {
             commands::games::rename_game,
             commands::games::export_game_data,
             commands::games::set_game_status,
+            commands::games::import_game_data,
+            commands::games::get_all_genres,
             // 统计相关
             commands::stats::get_play_stats,
             commands::stats::get_daily_stats,
@@ -119,6 +174,7 @@ pub fn run() {
             commands::stats::get_heatmap_stats,
             commands::stats::get_hourly_stats,
             commands::stats::get_status_stats,
+            commands::stats::get_play_sessions,
             // 设置相关
             commands::settings::get_settings,
             commands::settings::save_settings,

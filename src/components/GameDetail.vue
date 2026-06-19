@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, toRef } from "vue";
+import { ref, toRef, computed } from "vue";
 import {
   NDrawer,
   NDrawerContent,
@@ -10,6 +10,7 @@ import {
   NGrid,
   NGi,
   NTooltip,
+  NProgress,
   useMessage,
 } from "naive-ui";
 import {
@@ -21,6 +22,7 @@ import {
   ImageOutline,
   CheckmarkCircleOutline,
   TrophyOutline,
+  TimeOutline,
 } from "@vicons/ionicons5";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Game } from "../lib/tauri";
@@ -44,6 +46,36 @@ const emit = defineEmits<{
 const store = useGamesStore();
 const message = useMessage();
 const fetchingLlm = ref(false);
+
+// HLTB 数据计算
+const hasHltb = computed(() =>
+  props.game.hltb_main_story || props.game.hltb_main_extra || props.game.hltb_completionist
+);
+
+// 实际游玩时长（分钟）
+const playedMinutes = computed(() => Math.round(props.game.play_time_seconds / 60));
+
+// 主线进度百分比
+const hltbProgress = computed(() => {
+  if (!props.game.hltb_main_story || props.game.hltb_main_story === 0) return 0;
+  return Math.min(100, Math.round((playedMinutes.value / props.game.hltb_main_story) * 100));
+});
+
+// 预计剩余时间（基于主线）
+const hltbRemaining = computed(() => {
+  if (!props.game.hltb_main_story) return null;
+  const remaining = props.game.hltb_main_story - playedMinutes.value;
+  if (remaining <= 0) return 0;
+  return remaining;
+});
+
+function formatMinutes(minutes: number): string {
+  if (minutes < 60) return `${minutes}分钟`;
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  if (mins === 0) return `${hours}小时`;
+  return `${hours}小时${mins}分钟`;
+}
 
 const { coverImage, imgFailed, handleImageError } = useCoverImage(toRef(props, "game"));
 
@@ -263,6 +295,55 @@ async function handleChangeCover() {
         </n-grid>
       </div>
 
+      <!-- HLTB 通关时长信息 -->
+      <div v-if="hasHltb" class="hltb-section">
+        <div class="section-title">
+          <n-icon :component="TimeOutline" size="14" />
+          预估通关时长
+        </div>
+        <n-grid :cols="3" :x-gap="8" :y-gap="8">
+          <n-gi v-if="game.hltb_main_story">
+            <div class="hltb-card">
+              <div class="hltb-label">主线</div>
+              <div class="hltb-value">{{ formatMinutes(game.hltb_main_story) }}</div>
+            </div>
+          </n-gi>
+          <n-gi v-if="game.hltb_main_extra">
+            <div class="hltb-card">
+              <div class="hltb-label">主线+支线</div>
+              <div class="hltb-value">{{ formatMinutes(game.hltb_main_extra) }}</div>
+            </div>
+          </n-gi>
+          <n-gi v-if="game.hltb_completionist">
+            <div class="hltb-card">
+              <div class="hltb-label">完美通关</div>
+              <div class="hltb-value">{{ formatMinutes(game.hltb_completionist) }}</div>
+            </div>
+          </n-gi>
+        </n-grid>
+        <!-- 主线进度 -->
+        <div v-if="game.hltb_main_story && playedMinutes > 0" class="hltb-progress">
+          <div class="hltb-progress-header">
+            <span>主线进度</span>
+            <span>{{ hltbProgress }}%</span>
+          </div>
+          <n-progress
+            type="line"
+            :percentage="hltbProgress"
+            :show-indicator="false"
+            :height="8"
+            :border-radius="4"
+          />
+          <div class="hltb-progress-footer">
+            <span>已玩 {{ formatMinutes(playedMinutes) }}</span>
+            <span v-if="hltbRemaining !== null && hltbRemaining > 0">
+              剩余约 {{ formatMinutes(hltbRemaining) }}
+            </span>
+            <span v-else-if="hltbRemaining === 0" style="color: #22c55e">已通关！</span>
+          </div>
+        </div>
+      </div>
+
       <n-divider />
 
       <!-- 获取游戏信息按钮 -->
@@ -429,5 +510,61 @@ async function handleChangeCover() {
 
 .description-section {
   margin-bottom: 16px;
+}
+
+.hltb-section {
+  margin-bottom: 16px;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #aaa;
+  margin-bottom: 10px;
+}
+
+.hltb-card {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 6px;
+  padding: 8px;
+  text-align: center;
+}
+
+.hltb-label {
+  font-size: 11px;
+  color: #888;
+  margin-bottom: 2px;
+}
+
+.hltb-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e0e0e0;
+}
+
+.hltb-progress {
+  margin-top: 10px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 6px;
+}
+
+.hltb-progress-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #aaa;
+  margin-bottom: 6px;
+}
+
+.hltb-progress-footer {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #888;
+  margin-top: 6px;
 }
 </style>

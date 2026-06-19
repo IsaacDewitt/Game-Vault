@@ -72,6 +72,9 @@ impl Database {
         // 迁移：为旧数据库添加 status 字段（必须在索引创建之前）
         self.migrate_add_status_column()?;
 
+        // 迁移：为旧数据库添加 HLTB 字段
+        self.migrate_add_hltb_columns()?;
+
         // 创建 status 索引（在列存在之后）
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_games_status ON games(status);"
@@ -143,6 +146,9 @@ impl Database {
             status: row.get(16).unwrap_or_else(|_| "unplayed".to_string()),
             added_at: row.get(17)?,
             updated_at: row.get(18)?,
+            hltb_main_story: row.get::<_, Option<i64>>(19)?.map(|v| v.max(0) as u32),
+            hltb_main_extra: row.get::<_, Option<i64>>(20)?.map(|v| v.max(0) as u32),
+            hltb_completionist: row.get::<_, Option<i64>>(21)?.map(|v| v.max(0) as u32),
         })
     }
 
@@ -150,7 +156,8 @@ impl Database {
         id, name, install_path, exe_path, exe_name,
         cover_local, cover_url, description, developer, publisher, release_date,
         genres, play_time_seconds, last_played, play_count,
-        is_favorite, status, added_at, updated_at
+        is_favorite, status, added_at, updated_at,
+        hltb_main_story, hltb_main_extra, hltb_completionist
     ";
 
     // ==================== 游戏 CRUD ====================
@@ -162,9 +169,10 @@ impl Database {
                 id, name, install_path, exe_path, exe_name,
                 cover_local, cover_url, description, developer, publisher, release_date,
                 genres, play_time_seconds, last_played, play_count,
-                is_favorite, status, added_at, updated_at
+                is_favorite, status, added_at, updated_at,
+                hltb_main_story, hltb_main_extra, hltb_completionist
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -182,7 +190,10 @@ impl Database {
                 last_played = games.last_played,
                 play_count = games.play_count,
                 status = excluded.status,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                hltb_main_story = COALESCE(excluded.hltb_main_story, games.hltb_main_story),
+                hltb_main_extra = COALESCE(excluded.hltb_main_extra, games.hltb_main_extra),
+                hltb_completionist = COALESCE(excluded.hltb_completionist, games.hltb_completionist)
             ",
             params![
                 game.id,
@@ -204,6 +215,9 @@ impl Database {
                 game.status,
                 game.added_at,
                 game.updated_at,
+                game.hltb_main_story.map(|v| v as i64),
+                game.hltb_main_extra.map(|v| v as i64),
+                game.hltb_completionist.map(|v| v as i64),
             ],
         )?;
         Ok(())
@@ -224,7 +238,8 @@ impl Database {
             "SELECT id, name, install_path, exe_path, exe_name,
                     cover_local, cover_url, description, developer, publisher, release_date,
                     genres, play_time_seconds, last_played, play_count,
-                    is_favorite, status, added_at, updated_at
+                    is_favorite, status, added_at, updated_at,
+                    hltb_main_story, hltb_main_extra, hltb_completionist
              FROM games WHERE 1=1"
         );
 
@@ -236,6 +251,18 @@ impl Database {
         }
         if filter.favorites_only {
             sql.push_str(" AND is_favorite = 1");
+        }
+        if let Some(ref status) = filter.status {
+            if !status.is_empty() {
+                sql.push_str(&format!(" AND status = ?{}", bind_values.len() + 1));
+                bind_values.push(status.clone());
+            }
+        }
+        if let Some(ref genre) = filter.genre {
+            if !genre.is_empty() {
+                sql.push_str(&format!(" AND genres LIKE ?{}", bind_values.len() + 1));
+                bind_values.push(format!("%{}%", genre));
+            }
         }
 
         // 排序（白名单校验防止注入）
@@ -332,8 +359,9 @@ impl Database {
                 name = ?1, install_path = ?2, exe_path = ?3, exe_name = ?4,
                 cover_local = ?5, cover_url = ?6, description = ?7,
                 developer = ?8, publisher = ?9, release_date = ?10,
-                genres = ?11, is_favorite = ?12, status = ?13, updated_at = ?14
-             WHERE id = ?15",
+                genres = ?11, is_favorite = ?12, status = ?13, updated_at = ?14,
+                hltb_main_story = ?15, hltb_main_extra = ?16, hltb_completionist = ?17
+             WHERE id = ?18",
             params![
                 game.name,
                 game.install_path,
@@ -349,6 +377,9 @@ impl Database {
                 game.is_favorite as i64,
                 game.status,
                 chrono::Utc::now().to_rfc3339(),
+                game.hltb_main_story.map(|v| v as i64),
+                game.hltb_main_extra.map(|v| v as i64),
+                game.hltb_completionist.map(|v| v as i64),
                 game.id,
             ],
         )?;
@@ -603,5 +634,121 @@ impl Database {
         }
 
         Ok(stats)
+    }
+
+    /// 获取所有游戏类型（去重）
+    pub fn get_all_genres(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT genres FROM games")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(row.get::<_, String>(0)?)
+        })?;
+
+        let mut genre_set = std::collections::HashSet::new();
+        for row in rows {
+            let genres_str = row?;
+            let genres: Vec<String> = serde_json::from_str(&genres_str).unwrap_or_default();
+            for genre in genres {
+                if !genre.is_empty() {
+                    genre_set.insert(genre);
+                }
+            }
+        }
+
+        let mut genres: Vec<String> = genre_set.into_iter().collect();
+        genres.sort();
+        Ok(genres)
+    }
+
+    /// 获取游玩会话详情（联表查询，含游戏名）
+    pub fn get_play_sessions(
+        &self,
+        game_id: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<PlaySessionDetail>> {
+        let mut sql = String::from(
+            "SELECT ps.id, ps.game_id, g.name, ps.start_time, ps.end_time, ps.duration_seconds
+             FROM play_sessions ps
+             JOIN games g ON ps.game_id = g.id
+             WHERE 1=1"
+        );
+
+        let mut bind_values: Vec<String> = Vec::new();
+
+        if let Some(gid) = game_id {
+            if !gid.is_empty() {
+                sql.push_str(&format!(" AND ps.game_id = ?{}", bind_values.len() + 1));
+                bind_values.push(gid.to_string());
+            }
+        }
+
+        let limit_val = limit as i64;
+        let offset_val = offset as i64;
+
+        sql.push_str(" ORDER BY ps.start_time DESC");
+        sql.push_str(&format!(" LIMIT ?{} OFFSET ?{}", bind_values.len() + 1, bind_values.len() + 2));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = bind_values
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        params.push(&limit_val);
+        params.push(&offset_val);
+
+        let sessions = stmt.query_map(params.as_slice(), |row| {
+            Ok(PlaySessionDetail {
+                id: row.get(0)?,
+                game_id: row.get(1)?,
+                game_name: row.get(2)?,
+                start_time: row.get(3)?,
+                end_time: row.get(4)?,
+                duration_seconds: row.get::<_, i64>(5).unwrap_or(0).max(0) as u64,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+
+        Ok(sessions)
+    }
+
+    /// 迁移：添加 HLTB 字段到旧数据库
+    fn migrate_add_hltb_columns(&self) -> Result<()> {
+        let columns_to_add = [
+            ("hltb_main_story", "INTEGER"),
+            ("hltb_main_extra", "INTEGER"),
+            ("hltb_completionist", "INTEGER"),
+        ];
+
+        for (col_name, col_type) in &columns_to_add {
+            let has_column: bool = {
+                let mut stmt = self.conn.prepare("PRAGMA table_info(games)")?;
+                let columns = stmt.query_map([], |row| {
+                    Ok(row.get::<_, String>(1)?)
+                })?;
+
+                let mut found = false;
+                for col in columns {
+                    match col {
+                        Ok(name) if name == *col_name => {
+                            found = true;
+                            break;
+                        }
+                        _ => continue,
+                    }
+                }
+                found
+            };
+
+            if !has_column {
+                tracing::info!("{} 字段不存在，正在添加...", col_name);
+                self.conn.execute(
+                    &format!("ALTER TABLE games ADD COLUMN {} {}", col_name, col_type),
+                    [],
+                )?;
+                tracing::info!("已添加 {} 字段到 games 表", col_name);
+            }
+        }
+
+        Ok(())
     }
 }

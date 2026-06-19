@@ -12,9 +12,9 @@ import {
   NIcon,
   useMessage,
 } from "naive-ui";
-import { DownloadOutline } from "@vicons/ionicons5";
-import { save } from "@tauri-apps/plugin-dialog";
-import { writeTextFile } from "@tauri-apps/plugin-fs";
+import { DownloadOutline, CloudUploadOutline } from "@vicons/ionicons5";
+import { save, open } from "@tauri-apps/plugin-dialog";
+import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
 import * as api from "../lib/tauri";
 import type { Settings } from "../lib/tauri";
 
@@ -31,6 +31,7 @@ const settings = ref<Settings>({
   llm_base_url: "",
   llm_model: "",
   llm_enabled: false,
+  accent_color: "#6366f1",
 });
 
 // LLM 提供商预设
@@ -42,6 +43,18 @@ const providerOptions = [
 const protocolOptions = [
   { label: "OpenAI 格式", value: "openai" },
   { label: "Anthropic 格式", value: "anthropic" },
+];
+
+// 预设主题色
+const presetColors = [
+  { label: "靛蓝", value: "#6366f1" },
+  { label: "蓝色", value: "#3b82f6" },
+  { label: "绿色", value: "#22c55e" },
+  { label: "红色", value: "#f43f5e" },
+  { label: "橙色", value: "#f97316" },
+  { label: "黄色", value: "#eab308" },
+  { label: "粉色", value: "#ec4899" },
+  { label: "青色", value: "#14b8a6" },
 ];
 
 // 切换提供商时自动填充默认值
@@ -64,8 +77,23 @@ watch(() => settings.value.llm_provider, (provider) => {
   }
 });
 
+// 主题色变化时实时预览
+watch(() => settings.value.accent_color, (color) => {
+  if (color && (window as any).__updateAccentColor) {
+    (window as any).__updateAccentColor(color);
+  }
+});
+
+// 主题切换时实时预览
+watch(() => settings.value.theme, (theme) => {
+  if ((window as any).__updateTheme) {
+    (window as any).__updateTheme(theme !== "light");
+  }
+});
+
 const saving = ref(false);
 const exporting = ref(false);
+const importing = ref(false);
 
 async function loadSettings() {
   try {
@@ -116,12 +144,84 @@ async function handleExportData() {
   }
 }
 
+async function handleImportData() {
+  importing.value = true;
+  try {
+    const selected = await open({
+      multiple: false,
+      title: "选择备份文件",
+      filters: [
+        {
+          name: "JSON 文件",
+          extensions: ["json"],
+        },
+      ],
+    });
+
+    if (!selected) {
+      importing.value = false;
+      return;
+    }
+
+    const jsonContent = await readTextFile(selected as string);
+    const result = await api.importGameData(jsonContent);
+
+    message.success(
+      `导入成功！已恢复 ${result.imported_games} 个游戏${result.settings_restored ? "和设置" : ""}`
+    );
+
+    // 刷新游戏列表
+    const { useGamesStore } = await import("../stores/games");
+    const store = useGamesStore();
+    await store.loadGames();
+  } catch (e) {
+    console.error("导入数据失败:", e);
+    message.error("导入失败: " + (e as Error).toString());
+  } finally {
+    importing.value = false;
+  }
+}
+
 onMounted(loadSettings);
 </script>
 
 <template>
   <div class="settings-view">
     <h2 style="margin-bottom: 24px">设置</h2>
+
+    <!-- 外观设置 -->
+    <n-card title="外观设置" style="margin-bottom: 16px">
+      <n-form label-placement="left" label-width="140">
+        <n-form-item label="主题模式">
+          <n-switch
+            :value="settings.theme !== 'light'"
+            @update:value="(val: boolean) => settings.theme = val ? 'dark' : 'light'"
+          >
+            <template #checked>暗色</template>
+            <template #unchecked>亮色</template>
+          </n-switch>
+        </n-form-item>
+        <n-form-item label="主题色">
+          <n-space align="center">
+            <div
+              v-for="color in presetColors"
+              :key="color.value"
+              class="color-swatch"
+              :class="{ active: settings.accent_color === color.value }"
+              :style="{ background: color.value }"
+              :title="color.label"
+              @click="settings.accent_color = color.value"
+            />
+            <n-input
+              v-model:value="settings.accent_color"
+              placeholder="#6366f1"
+              style="width: 120px"
+              size="small"
+            />
+          </n-space>
+        </n-form-item>
+      </n-form>
+    </n-card>
 
     <!-- 基本设置 -->
     <n-card title="基本设置" style="margin-bottom: 16px">
@@ -200,6 +300,17 @@ onMounted(loadSettings);
             导出所有游戏信息和设置为 JSON 文件
           </span>
         </n-form-item>
+        <n-form-item label="导入游戏数据">
+          <n-button :loading="importing" @click="handleImportData">
+            <template #icon>
+              <n-icon :component="CloudUploadOutline" />
+            </template>
+            导入备份
+          </n-button>
+          <span style="margin-left: 12px; font-size: 12px; color: #888">
+            从之前导出的 JSON 文件恢复游戏数据和设置
+          </span>
+        </n-form-item>
       </n-form>
     </n-card>
   </div>
@@ -208,5 +319,23 @@ onMounted(loadSettings);
 <style scoped>
 .settings-view {
   max-width: 800px;
+}
+
+.color-swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: border-color 0.2s, transform 0.2s;
+}
+
+.color-swatch:hover {
+  transform: scale(1.1);
+}
+
+.color-swatch.active {
+  border-color: white;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.3);
 }
 </style>
