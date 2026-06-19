@@ -22,6 +22,7 @@ import {
   LineChart,
   PieChart,
   HeatmapChart,
+  BarChart,
 } from "echarts/charts";
 import {
   TitleComponent,
@@ -50,6 +51,7 @@ use([
   LineChart,
   PieChart,
   HeatmapChart,
+  BarChart,
   TitleComponent,
   TooltipComponent,
   GridComponent,
@@ -220,9 +222,8 @@ const genrePieOption = computed(() => {
     series: [
       {
         type: "pie",
-        radius: ["30%", "60%"],
+        radius: ["40%", "65%"],
         center: ["30%", "50%"],
-        roseType: "area",
         itemStyle: {
           borderRadius: 6,
           borderColor: "#1a1a2e",
@@ -245,6 +246,140 @@ const genrePieOption = computed(() => {
           gameCount: g.game_count,
           itemStyle: { color: colors[i % colors.length] },
         })),
+      },
+    ],
+  };
+});
+
+// 游戏类型 - 按游戏数量饼图
+const genreCountPieOption = computed(() => {
+  const sorted = [...genreStats.value].sort((a, b) => b.game_count - a.game_count);
+  const top = sorted.slice(0, 12);
+  const otherCount = sorted.slice(12).reduce((sum, g) => sum + g.game_count, 0);
+  const data = top.map((g) => ({
+    name: g.genre,
+    value: g.game_count,
+  }));
+  if (otherCount > 0) {
+    data.push({ name: "其他", value: otherCount });
+  }
+
+  const colors = [
+    "#6366f1", "#8b5cf6", "#ec4899", "#f43f5e", "#f97316",
+    "#eab308", "#22c55e", "#14b8a6", "#06b6d4", "#3b82f6",
+    "#a78bfa", "#fb923c", "#6b7280",
+  ];
+
+  return {
+    tooltip: {
+      trigger: "item",
+      formatter: (params: any) => {
+        return `${params.name}<br/>游戏数: ${params.value} 款<br/>占比: ${params.percent}%`;
+      },
+    },
+    legend: {
+      type: "scroll",
+      orient: "vertical",
+      right: "2%",
+      top: "center",
+      bottom: 20,
+      textStyle: { color: "#aaa", fontSize: 11 },
+      itemWidth: 12,
+      itemHeight: 12,
+      itemGap: 12,
+      pageTextStyle: { color: "#aaa" },
+      pageIconColor: "#aaa",
+      pageIconInactiveColor: "#555",
+    },
+    series: [
+      {
+        type: "pie",
+        radius: ["35%", "65%"],
+        center: ["32%", "50%"],
+        avoidLabelOverlap: false,
+        itemStyle: {
+          borderRadius: 6,
+          borderColor: "#1a1a2e",
+          borderWidth: 2,
+        },
+        label: {
+          show: false,
+          position: "center",
+        },
+        emphasis: {
+          label: {
+            show: true,
+            fontSize: 15,
+            fontWeight: "bold",
+            color: "#fff",
+          },
+        },
+        labelLine: { show: false },
+        data: data.map((d, i) => ({
+          ...d,
+          itemStyle: { color: colors[i % colors.length] },
+        })),
+      },
+    ],
+  };
+});
+
+// 游戏类型 - 按游戏数量条形图
+const genreBarOption = computed(() => {
+  const sorted = [...genreStats.value].sort((a, b) => a.game_count - b.game_count);
+  const top = sorted.slice(-15); // top 15 by game count
+
+  const colors = [
+    "#3b82f6", "#06b6d4", "#14b8a6", "#22c55e", "#eab308",
+    "#f97316", "#f43f5e", "#ec4899", "#8b5cf6", "#6366f1",
+    "#a78bfa", "#c084fc", "#e879f9", "#f472b6", "#fb923c",
+  ];
+
+  return {
+    tooltip: {
+      trigger: "axis",
+      axisPointer: { type: "shadow" },
+      formatter: (params: any) => {
+        const d = params[0];
+        const genre = top[d.dataIndex];
+        return `${genre.genre}<br/>游戏数: ${genre.game_count} 款`;
+      },
+    },
+    grid: { left: "3%", right: "8%", bottom: "3%", top: 20, containLabel: true },
+    xAxis: {
+      type: "value",
+      name: "款",
+      axisLabel: { color: "#aaa" },
+      splitLine: { lineStyle: { color: "rgba(255,255,255,0.05)" } },
+    },
+    yAxis: {
+      type: "category",
+      data: top.map((g) => g.genre),
+      axisLabel: {
+        color: "#aaa",
+        fontSize: 12,
+        width: 80,
+        overflow: "truncate",
+      },
+    },
+    series: [
+      {
+        type: "bar",
+        data: top.map((g, i) => ({
+          value: g.game_count,
+          itemStyle: {
+            color: colors[i % colors.length],
+            borderRadius: [0, 4, 4, 0],
+          },
+        })),
+        barWidth: "60%",
+        label: {
+          show: true,
+          position: "right",
+          formatter: "{c} 款",
+          color: "#aaa",
+          fontSize: 11,
+        },
       },
     ],
   };
@@ -730,6 +865,47 @@ onUnmounted(() => {
             </n-gi>
           </n-grid>
         </n-tab-pane>
+
+        <!-- 游戏类型 Tab -->
+        <n-tab-pane name="genres" tab="游戏类型">
+          <n-grid :cols="chartGridCols" :x-gap="16" :y-gap="16" responsive="screen">
+            <n-gi>
+              <n-card title="类型分布（按游戏数·饼图）">
+                <v-chart :option="genreCountPieOption" style="height: 400px" autoresize />
+              </n-card>
+            </n-gi>
+            <n-gi>
+              <n-card title="类型分布（按游戏数·条形图）">
+                <v-chart :option="genreBarOption" style="height: 400px" autoresize />
+              </n-card>
+            </n-gi>
+          </n-grid>
+          <!-- 类型详细列表 -->
+          <n-card title="类型详情" style="margin-top: 16px">
+            <div class="genre-detail-grid">
+              <div
+                v-for="(genre, index) in genreStats"
+                :key="genre.genre"
+                class="genre-detail-item"
+              >
+                <div class="genre-detail-header">
+                  <span
+                    class="genre-dot"
+                    :style="{ background: [
+                      '#6366f1', '#8b5cf6', '#ec4899', '#f43f5e', '#f97316',
+                      '#eab308', '#22c55e', '#14b8a6', '#06b6d4', '#3b82f6',
+                      '#a78bfa', '#fb923c',
+                    ][index % 12] }"
+                  />
+                  <span class="genre-detail-name">{{ genre.genre }}</span>
+                </div>
+                <div class="genre-detail-stats">
+                  <span>{{ genre.game_count }} 款</span>
+                </div>
+              </div>
+            </div>
+          </n-card>
+        </n-tab-pane>
       </n-tabs>
     </n-spin>
   </div>
@@ -857,5 +1033,55 @@ onUnmounted(() => {
   color: rgba(255, 255, 255, 0.9);
   white-space: nowrap;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+
+/* 类型详情网格 */
+.genre-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.genre-detail-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  transition: background 0.2s;
+}
+
+.genre-detail-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.genre-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.genre-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.genre-detail-name {
+  font-size: 13px;
+  color: #ddd;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.genre-detail-stats {
+  font-size: 12px;
+  color: #888;
+  padding-left: 14px;
 }
 </style>

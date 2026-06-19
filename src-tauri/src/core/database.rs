@@ -490,7 +490,7 @@ impl Database {
     /// 获取游戏类型统计
     pub fn get_genre_stats(&self) -> Result<Vec<GenreStats>> {
         let mut stmt = self.conn.prepare(
-            "SELECT genres, play_time_seconds FROM games WHERE play_time_seconds > 0"
+            "SELECT genres, play_time_seconds FROM games"
         )?;
 
         let mut genre_map: std::collections::HashMap<String, (u64, u32)> = std::collections::HashMap::new();
