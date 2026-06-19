@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onActivated, onUnmounted, computed } from "vue";
+import { ref, onMounted, onActivated, onUnmounted, computed, watch } from "vue";
 import {
   NCard,
   NGrid,
@@ -19,7 +19,6 @@ import {
 import { use } from "echarts/core";
 import { CanvasRenderer } from "echarts/renderers";
 import {
-  BarChart,
   LineChart,
   PieChart,
   HeatmapChart,
@@ -42,10 +41,12 @@ import type {
   HourlyStats,
   StatusStats,
 } from "../lib/tauri";
+import { useGamesStore } from "../stores/games";
+
+const gamesStore = useGamesStore();
 
 use([
   CanvasRenderer,
-  BarChart,
   LineChart,
   PieChart,
   HeatmapChart,
@@ -80,6 +81,9 @@ const statusStats = ref<StatusStats>({
   completed: 0,
   abandoned: 0,
 });
+
+// 游戏主色调缓存 (game_id -> hex color)
+const gameColors = ref<Record<string, string>>({});
 
 // 响应式网格列数
 const gridCols = ref(4);
@@ -246,90 +250,109 @@ const genrePieOption = computed(() => {
   };
 });
 
-// 游戏时长排行图（水平柱状图）
-const barOption = computed(() => {
-  const top10 = playStats.value.slice(0, 10).reverse();
-
-  // 智能截断游戏名称：保留前面的有意义部分
-  const truncateName = (name: string, maxLen: number) => {
-    if (name.length <= maxLen) return name;
-    // 尝试在空格处截断
-    const truncated = name.slice(0, maxLen);
-    const lastSpace = truncated.lastIndexOf(" ");
-    if (lastSpace > maxLen * 0.6) {
-      return truncated.slice(0, lastSpace) + "...";
-    }
-    return truncated + "...";
-  };
-
-  return {
-    tooltip: {
-      trigger: "axis",
-      axisPointer: { type: "shadow" },
-      formatter: (params: any) => {
-        const data = params[0];
-        const hours = Number(data.value).toFixed(1);
-        return `${data.name}<br/>时长: ${hours}h`;
-      },
-    },
-    grid: { left: "18%", right: "10%", bottom: "3%", top: "3%", containLabel: true },
-    xAxis: {
-      type: "value",
-      name: "小时",
-      axisLabel: { color: "#aaa" },
-      splitLine: { lineStyle: { color: "rgba(255,255,255,0.05)" } },
-    },
-    yAxis: {
-      type: "category",
-      data: top10.map((s) => truncateName(s.game_name, 18)),
-      axisLabel: {
-        color: "#aaa",
-        width: 140,
-        overflow: "break",
-        fontSize: 12,
-      },
-    },
-    series: [
-      {
-        type: "bar",
-        data: top10.map((s) => ({
-          value: Number((s.total_seconds / 3600).toFixed(1)),
-          name: s.game_name,
-        })),
-        itemStyle: {
-          color: {
-            type: "linear",
-            x: 0, y: 0, x2: 1, y2: 0,
-            colorStops: [
-              { offset: 0, color: "#6366f1" },
-              { offset: 1, color: "#8b5cf6" },
-            ],
-          },
-          borderRadius: [0, 4, 4, 0],
-        },
-        emphasis: {
-          itemStyle: {
-            color: {
-              type: "linear",
-              x: 0, y: 0, x2: 1, y2: 0,
-              colorStops: [
-                { offset: 0, color: "#818cf8" },
-                { offset: 1, color: "#a78bfa" },
-              ],
-            },
-          },
-        },
-        label: {
-          show: true,
-          position: "right",
-          formatter: (params: any) => params.value + "h",
-          color: "#aaa",
-          fontSize: 11,
-        },
-      },
-    ],
-  };
+// 游戏时长排行数据（前 10，正序排列用于展示）
+const top10 = computed(() => {
+  return playStats.value.slice(0, 10).map((s) => ({
+    ...s,
+    hours: Number((s.total_seconds / 3600).toFixed(1)),
+  }));
 });
+
+// bar 宽度百分比（相对最大值）
+function barWidth(hours: number): string {
+  const maxHours = top10.value.length > 0 ? top10.value[0].hours : 1;
+  return Math.max((hours / maxHours) * 100, 2) + "%";
+}
+
+// 获取游戏主色调（带 fallback）
+function getGameColor(gameId: string): string {
+  return gameColors.value[gameId] || "#6366f1";
+}
+
+// 生成 bar 渐变样式
+function getBarGradient(gameId: string): string {
+  const base = getGameColor(gameId);
+  const lighter = lightenColor(base, 30);
+  return `linear-gradient(90deg, ${base}, ${lighter})`;
+}
+
+// 颜色工具：提亮
+function lightenColor(hex: string, percent: number): string {
+  const num = parseInt(hex.replace("#", ""), 16);
+  const r = Math.min(255, ((num >> 16) & 0xff) + Math.round(255 * percent / 100));
+  const g = Math.min(255, ((num >> 8) & 0xff) + Math.round(255 * percent / 100));
+  const b = Math.min(255, (num & 0xff) + Math.round(255 * percent / 100));
+  return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, "0")}`;
+}
+
+// 从封面图片提取主色调
+function extractDominantColor(imgSrc: string): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      const size = 32; // 缩小取样，提高性能
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) { resolve("#6366f1"); return; }
+      ctx.drawImage(img, 0, 0, size, size);
+      const data = ctx.getImageData(0, 0, size, size).data;
+
+      // 统计颜色频率（量化为 32 级）
+      const colorMap = new Map<string, { r: number; g: number; b: number; count: number }>();
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        // 跳过过暗和过亮的像素
+        const brightness = (r + g + b) / 3;
+        if (brightness < 30 || brightness > 230) continue;
+        // 量化
+        const qr = (r >> 5) << 5;
+        const qg = (g >> 5) << 5;
+        const qb = (b >> 5) << 5;
+        const key = `${qr},${qg},${qb}`;
+        const existing = colorMap.get(key);
+        if (existing) {
+          existing.count++;
+        } else {
+          colorMap.set(key, { r: qr, g: qg, b: qb, count: 1 });
+        }
+      }
+
+      // 找最高频颜色
+      let best = { r: 99, g: 102, b: 241, count: 0 }; // fallback: #6366f1
+      for (const val of colorMap.values()) {
+        if (val.count > best.count) best = val;
+      }
+
+      const hex = `#${((best.r << 16) | (best.g << 8) | best.b).toString(16).padStart(6, "0")}`;
+      resolve(hex);
+    };
+    img.onerror = () => resolve("#6366f1");
+    img.src = imgSrc;
+  });
+}
+
+// 加载封面并提取颜色
+async function loadGameColors(stats: PlayStats[]) {
+  const coverCache = gamesStore.coverBase64Cache;
+  const tasks: Promise<void>[] = [];
+
+  for (const s of stats) {
+    if (gameColors.value[s.game_id]) continue; // 已有缓存
+    const cover = coverCache[s.game_id];
+    if (cover) {
+      tasks.push(
+        extractDominantColor(cover).then((color) => {
+          gameColors.value[s.game_id] = color;
+        })
+      );
+    }
+  }
+
+  await Promise.all(tasks);
+}
 
 // 每日游玩时长趋势图
 const lineOption = computed(() => ({
@@ -557,6 +580,8 @@ async function loadStats() {
     ]);
     overview.value = ov;
     playStats.value = ps;
+    // 加载封面颜色（封面可能已缓存在 store 中）
+    loadGameColors(ps);
     dailyStats.value = ds;
     genreStats.value = gs;
     heatmapStats.value = hs;
@@ -574,6 +599,13 @@ onMounted(() => {
   updateGridCols();
   window.addEventListener('resize', updateGridCols);
 });
+
+// 当 store 中的封面缓存更新时，补充提取颜色
+watch(() => gamesStore.coverBase64Cache, () => {
+  if (playStats.value.length > 0) {
+    loadGameColors(playStats.value);
+  }
+}, { deep: true });
 
 // keep-alive 缓存的组件再次激活时刷新数据
 onActivated(() => {
@@ -627,7 +659,38 @@ onUnmounted(() => {
           <n-grid :cols="1" :y-gap="16">
             <n-gi>
               <n-card title="时长排行">
-                <v-chart :option="barOption" style="height: 400px" autoresize />
+                <div class="custom-bar-chart">
+                  <div
+                    v-for="(game, index) in top10"
+                    :key="game.game_id"
+                    class="bar-row"
+                  >
+                    <div class="bar-rank">{{ index + 1 }}</div>
+                    <div class="bar-icon">
+                      <img
+                        v-if="gamesStore.coverBase64Cache[game.game_id]"
+                        :src="gamesStore.coverBase64Cache[game.game_id]"
+                        :alt="game.game_name"
+                        class="bar-icon-img"
+                      />
+                      <div v-else class="bar-icon-fallback">🎮</div>
+                    </div>
+                    <div class="bar-info">
+                      <div class="bar-name" :title="game.game_name">{{ game.game_name }}</div>
+                      <div class="bar-track">
+                        <div
+                          class="bar-fill"
+                          :style="{
+                            width: barWidth(game.hours),
+                            background: getBarGradient(game.game_id),
+                          }"
+                        >
+                          <span class="bar-label">{{ game.hours }}h</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
               </n-card>
             </n-gi>
             <n-gi>
@@ -702,5 +765,97 @@ onUnmounted(() => {
   font-size: 10px;
   color: #aaa;
   white-space: nowrap;
+}
+
+/* 自定义条形图 */
+.custom-bar-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 40px;
+}
+
+.bar-rank {
+  width: 20px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: #666;
+  flex-shrink: 0;
+}
+
+.bar-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  overflow: hidden;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.bar-icon-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.bar-icon-fallback {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+}
+
+.bar-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.bar-name {
+  font-size: 12px;
+  color: #ccc;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.2;
+}
+
+.bar-track {
+  width: 100%;
+  height: 18px;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 8px;
+  min-width: 40px;
+  transition: width 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.bar-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.9);
+  white-space: nowrap;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
 }
 </style>
