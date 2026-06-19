@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, defineAsyncComponent, h, type Component, watch } from "vue";
-import { darkTheme, lightTheme, NConfigProvider, NLayout, NLayoutSider, NLayoutContent, NMenu, NIcon, NMessageProvider, NDialogProvider } from "naive-ui";
+import { darkTheme, lightTheme, NConfigProvider, NLayout, NLayoutSider, NLayoutContent, NMenu, NIcon, NMessageProvider, NDialogProvider, createDiscreteApi } from "naive-ui";
 import type { MenuOption } from "naive-ui";
 import { HomeOutline, StatsChartOutline, SettingsOutline, GameControllerOutline } from "@vicons/ionicons5";
 import HomeView from "./views/HomeView.vue";
 import { useGamesStore } from "./stores/games";
 import * as api from "./lib/tauri";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 
 // 懒加载非首屏视图，减少初始包体积（ECharts ~800KB 只在访问统计页时加载）
 const StatsView = defineAsyncComponent(() => import("./views/StatsView.vue"));
@@ -107,17 +109,42 @@ watch([accentColor, isDark], () => {
   document.documentElement.classList.toggle("light-theme", !isDark.value);
 });
 
-// 初始化
+// 监听窗口关闭事件，弹出自定义确认对话框
+let unlistenClose: (() => void) | null = null;
+
 onMounted(async () => {
   await gamesStore.setupEventListeners();
   await gamesStore.loadGames();
   await loadThemeSettings();
   document.documentElement.style.setProperty("--accent-color", accentColor.value);
+
+  unlistenClose = await listen("close-requested", () => {
+    const { dialog } = createDiscreteApi(["dialog"], {
+      configProviderProps: {
+        theme: isDark.value ? darkTheme : lightTheme,
+        themeOverrides: themeOverrides.value,
+      },
+    });
+    dialog.warning({
+      title: "关闭确认",
+      content: "您想要最小化到系统托盘，还是直接退出程序？",
+      positiveText: "最小化到托盘",
+      negativeText: "直接退出",
+      closable: true,
+      onPositiveClick: () => {
+        getCurrentWindow().hide();
+      },
+      onNegativeClick: () => {
+        api.quitApp();
+      },
+    });
+  });
 });
 
 // 清理事件监听器
 onUnmounted(() => {
   gamesStore.cleanupEventListeners();
+  unlistenClose?.();
 });
 </script>
 

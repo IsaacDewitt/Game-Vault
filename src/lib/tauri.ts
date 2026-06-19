@@ -226,3 +226,7 @@ export interface PlaySessionDetail {
 export async function getPlaySessions(gameId?: string, limit?: number, offset?: number): Promise<PlaySessionDetail[]> {
   return invoke("get_play_sessions", { gameId, limit, offset });
 }
+
+export async function quitApp(): Promise<void> {
+  return invoke("quit_app");
+}

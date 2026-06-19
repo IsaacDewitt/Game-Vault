@@ -8,6 +8,12 @@ use tauri::{Emitter, Manager};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButtonState, MouseButton};
 use tauri::menu::{Menu, MenuItem};
 
+/// 退出应用程序
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 /// 初始化应用
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -132,14 +138,13 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // 拦截窗口关闭事件，最小化到托盘而非退出
+            // 拦截窗口关闭事件，通知前端弹出确认对话框
             if let Some(window) = app.get_webview_window("main") {
                 let window_clone = window.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        // 阻止默认关闭行为，改为隐藏窗口
                         api.prevent_close();
-                        let _ = window_clone.hide();
+                        let _ = window_clone.emit("close-requested", ());
                     }
                 });
             }
@@ -178,6 +183,8 @@ pub fn run() {
             // 设置相关
             commands::settings::get_settings,
             commands::settings::save_settings,
+            // 应用
+            quit_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
