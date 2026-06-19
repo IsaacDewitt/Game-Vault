@@ -48,11 +48,8 @@ const homeContextMenuY = ref(0);
 // 状态筛选选项
 const statusOptions = [
   { label: "全部", value: "" },
-  { label: "未游玩", value: "unplayed" },
-  { label: "游玩中", value: "playing" },
-  { label: "已通关", value: "completed" },
-  { label: "已弃坑", value: "abandoned" },
   { label: "收藏", value: "favorites" },
+  { label: "已通关", value: "completed" },
 ];
 
 // 类型筛选选项（从 store 动态加载）
