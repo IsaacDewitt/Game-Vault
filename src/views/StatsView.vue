@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onActivated, computed } from "vue";
+import { ref, onMounted, onActivated, onUnmounted, computed } from "vue";
 import {
   NCard,
   NGrid,
@@ -80,6 +80,25 @@ const statusStats = ref<StatusStats>({
   completed: 0,
   abandoned: 0,
 });
+
+// 响应式网格列数
+const gridCols = ref(4);
+const chartGridCols = ref(2);
+
+// 监听窗口大小变化
+function updateGridCols() {
+  const width = window.innerWidth;
+  if (width < 900) {
+    gridCols.value = 2;
+    chartGridCols.value = 1;
+  } else if (width < 1200) {
+    gridCols.value = 4;
+    chartGridCols.value = 1;
+  } else {
+    gridCols.value = 4;
+    chartGridCols.value = 2;
+  }
+}
 
 // 概览卡片
 const overviewCards = computed(() => [
@@ -550,17 +569,29 @@ async function loadStats() {
   }
 }
 
-onMounted(loadStats);
+onMounted(() => {
+  loadStats();
+  updateGridCols();
+  window.addEventListener('resize', updateGridCols);
+});
 
 // keep-alive 缓存的组件再次激活时刷新数据
-onActivated(loadStats);
+onActivated(() => {
+  loadStats();
+  updateGridCols();
+});
+
+// 组件卸载时清理事件监听器
+onUnmounted(() => {
+  window.removeEventListener('resize', updateGridCols);
+});
 </script>
 
 <template>
   <div class="stats-view">
     <n-spin :show="loading">
       <!-- 概览卡片 -->
-      <n-grid :cols="4" :x-gap="16" :y-gap="16" style="margin-bottom: 24px">
+      <n-grid :cols="gridCols" :x-gap="16" :y-gap="16" responsive="screen" style="margin-bottom: 24px">
         <n-gi v-for="card in overviewCards" :key="card.label">
           <n-card size="small">
             <n-statistic :label="card.label">
@@ -577,7 +608,7 @@ onActivated(loadStats);
       <n-tabs type="line">
         <!-- 概览 Tab -->
         <n-tab-pane name="overview" tab="概览">
-          <n-grid :cols="2" :x-gap="16" :y-gap="16">
+          <n-grid :cols="chartGridCols" :x-gap="16" :y-gap="16" responsive="screen">
             <n-gi>
               <n-card title="游戏状态分布">
                 <v-chart :option="statusPieOption" style="height: 350px" autoresize />
@@ -643,7 +674,7 @@ onActivated(loadStats);
 
 <style scoped>
 .stats-view {
-  max-width: 1200px;
+  width: 100%;
 }
 
 .chart-wrapper {
