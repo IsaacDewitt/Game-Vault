@@ -152,7 +152,7 @@ onUnmounted(() => {
   <n-message-provider>
     <n-dialog-provider>
     <n-config-provider :theme="isDark ? darkTheme : lightTheme" :theme-overrides="themeOverrides">
-      <n-layout has-sider style="height: 100vh">
+      <n-layout has-sider style="height: 100vh" @contextmenu.prevent>
         <!-- 侧边栏 -->
         <n-layout-sider
           bordered

@@ -11,19 +11,10 @@ pub enum LlmProtocol {
     Anthropic,
 }
 
-/// LLM 提供商
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum LlmProvider {
-    Xiaomi,
-    Deepseek,
-}
-
 /// LLM 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub enabled: bool,
-    pub provider: LlmProvider,
     pub protocol: LlmProtocol,
     pub api_key: String,
     pub base_url: String,
@@ -34,7 +25,6 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: LlmProvider::Xiaomi,
             protocol: LlmProtocol::Openai,
             api_key: String::new(),
             base_url: DEFAULT_LLM_BASE_URL.to_string(),
@@ -112,6 +102,194 @@ fn build_system_prompt() -> String {
 /// 构建 user prompt
 fn build_user_prompt(game_name: &str) -> String {
     format!("请提供游戏《{}》的信息。", game_name)
+}
+
+/// 执行网络搜索（使用 DuckDuckGo Instant Answer API）
+async fn execute_web_search(query: &str) -> Result<String> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("创建搜索 HTTP 客户端失败")?;
+
+    // 优化搜索查询，添加 "game" 关键词提高游戏相关结果
+    let search_query = if !query.to_lowercase().contains("game") {
+        format!("{} game", query)
+    } else {
+        query.to_string()
+    };
+
+    let url = format!(
+        "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
+        urlencoding::encode(&search_query)
+    );
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("发送搜索请求失败")?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("搜索 API 返回错误: {}", resp.status());
+    }
+
+    let json: serde_json::Value = resp.json().await.context("解析搜索结果失败")?;
+
+    // 提取摘要信息
+    let mut results = Vec::new();
+
+    if let Some(abstract_text) = json["AbstractText"].as_str() {
+        if !abstract_text.is_empty() {
+            results.push(format!("摘要: {}", abstract_text));
+        }
+    }
+
+    if let Some(abstract_source) = json["AbstractSource"].as_str() {
+        if !abstract_source.is_empty() {
+            results.push(format!("来源: {}", abstract_source));
+        }
+    }
+
+    // 提取相关话题
+    if let Some(related) = json["RelatedTopics"].as_array() {
+        for (i, topic) in related.iter().take(3).enumerate() {
+            if let Some(text) = topic["Text"].as_str() {
+                if !text.is_empty() {
+                    results.push(format!("相关{}: {}", i + 1, text));
+                }
+            }
+        }
+    }
+
+    if results.is_empty() {
+        Ok(format!("未找到关于 '{}' 的搜索结果", query))
+    } else {
+        Ok(results.join("\n"))
+    }
+}
+
+/// 处理 OpenAI 工具调用循环
+async fn handle_openai_tool_calls(
+    client: &Client,
+    config: &LlmConfig,
+    initial_response: serde_json::Value,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String> {
+    let mut messages = serde_json::json!([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]);
+
+    let mut current_response = initial_response;
+    let max_iterations = 5; // 防止无限循环
+
+    for _ in 0..max_iterations {
+        let message = &current_response["choices"][0]["message"];
+
+        // 检查是否有 tool_calls
+        if let Some(tool_calls) = message["tool_calls"].as_array() {
+            if !tool_calls.is_empty() {
+                // 把助手消息（含 tool_calls）加入 messages
+                messages.as_array_mut().unwrap().push(message.clone());
+
+                // 处理每个工具调用
+                for tool_call in tool_calls {
+                    let call_id = tool_call["id"].as_str().unwrap_or("");
+                    let function_name = tool_call["function"]["name"].as_str().unwrap_or("");
+                    let arguments_str = tool_call["function"]["arguments"].as_str().unwrap_or("{}");
+
+                    let arguments: serde_json::Value =
+                        serde_json::from_str(arguments_str).unwrap_or(serde_json::json!({}));
+
+                    tracing::info!("执行工具调用: {}({})", function_name, arguments);
+
+                    // 执行搜索
+                    let result = if function_name == "web_search" {
+                        let query = arguments["query"].as_str().unwrap_or("");
+                        execute_web_search(query).await.unwrap_or_else(|e| {
+                            format!("搜索失败: {}", e)
+                        })
+                    } else {
+                        format!("未知工具: {}", function_name)
+                    };
+
+                    tracing::info!("工具结果: {}", result);
+
+                    // 添加工具结果到 messages
+                    messages.as_array_mut().unwrap().push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": result
+                    }));
+                }
+
+                // 重新发送请求（保持相同的工具定义）
+                let body = serde_json::json!({
+                    "model": config.model,
+                    "messages": messages,
+                    "max_completion_tokens": 1024,
+                    "temperature": 0.3,
+                    "stream": false,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "description": "搜索网络获取实时信息",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {
+                                            "type": "string",
+                                            "description": "搜索关键词"
+                                        }
+                                    },
+                                    "required": ["query"]
+                                }
+                            }
+                        }
+                    ]
+                });
+
+                let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+
+                let resp = client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", config.api_key))
+                    .json(&body)
+                    .send()
+                    .await
+                    .context("发送后续 LLM 请求失败")?;
+
+                let status = resp.status();
+                if !status.is_success() {
+                    let err_text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("LLM API 返回错误 {}: {}", status, err_text);
+                }
+
+                current_response = resp.json().await.context("解析后续 LLM 响应失败")?;
+                continue;
+            }
+        }
+
+        // 没有 tool_calls，返回 content
+        if let Some(content) = message["content"].as_str() {
+            if !content.is_empty() {
+                return Ok(content.to_string());
+            }
+        }
+
+        // 备选：reasoning_content
+        if let Some(content) = message["reasoning_content"].as_str() {
+            if !content.is_empty() {
+                return Ok(content.to_string());
+            }
+        }
+    }
+
+    anyhow::bail!("工具调用循环超过最大次数")
 }
 
 /// 从 LLM 响应文本中提取 JSON
@@ -195,7 +373,7 @@ pub async fn fetch_game_meta(config: &LlmConfig, game_name: &str) -> Result<LlmG
     }
 
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(120))  // 工具调用循环可能需要更长时间
         .build()
         .context("创建 HTTP 客户端失败")?;
 
@@ -225,15 +403,12 @@ pub async fn fetch_game_meta(config: &LlmConfig, game_name: &str) -> Result<LlmG
 
     let mut req = client.post(&url).header("Content-Type", "application/json");
 
-    // 认证头：Xiaomi 用 api-key，DeepSeek/OpenAI 用 Authorization: Bearer，Anthropic 用 x-api-key
-    req = match (&config.protocol, &config.provider) {
-        (LlmProtocol::Openai, LlmProvider::Xiaomi) => {
-            req.header("api-key", &config.api_key)
-        }
-        (LlmProtocol::Openai, _) => {
+    // 认证头：统一按协议区分
+    req = match config.protocol {
+        LlmProtocol::Openai => {
             req.header("Authorization", format!("Bearer {}", config.api_key))
         }
-        (LlmProtocol::Anthropic, _) => {
+        LlmProtocol::Anthropic => {
             req.header("x-api-key", &config.api_key)
                 .header("anthropic-version", "2023-06-01")
         }
@@ -256,7 +431,30 @@ pub async fn fetch_game_meta(config: &LlmConfig, game_name: &str) -> Result<LlmG
     tracing::info!("LLM 原始响应: {}", resp_json);
 
     // 根据协议提取文本内容
-    let text = extract_response_text(&config.protocol, &resp_json)?;
+    let text = match config.protocol {
+        LlmProtocol::Openai => {
+            // OpenAI 协议：处理工具调用循环
+            let message = &resp_json["choices"][0]["message"];
+
+            // 检查是否有 tool_calls
+            if let Some(tool_calls) = message["tool_calls"].as_array() {
+                if !tool_calls.is_empty() {
+                    // 有工具调用，进入处理循环
+                    handle_openai_tool_calls(&client, config, resp_json, &system_prompt, &user_prompt).await?
+                } else {
+                    // 没有工具调用，直接提取 content
+                    extract_response_text(&config.protocol, &resp_json)?
+                }
+            } else {
+                // 没有 tool_calls 字段，直接提取 content
+                extract_response_text(&config.protocol, &resp_json)?
+            }
+        }
+        LlmProtocol::Anthropic => {
+            // Anthropic 协议：服务端已处理工具调用，直接提取文本
+            extract_response_text(&config.protocol, &resp_json)?
+        }
+    };
 
     tracing::info!("LLM 响应文本: {}", text);
 
@@ -269,7 +467,7 @@ fn build_openai_request(
     system_prompt: &str,
     user_prompt: &str,
 ) -> serde_json::Value {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": config.model,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -280,9 +478,27 @@ fn build_openai_request(
         "stream": false
     });
 
-    // 注：Xiaomi MiMo 的自定义 web_search 工具会导致模型以文本形式输出工具调用
-    // 而非真正执行搜索，故不在 OpenAI 协议下使用工具。模型自身知识足以覆盖常见游戏。
-    // DeepSeek 同理，使用模型自身知识即可。
+    // OpenAI 协议工具定义（web_search）
+    // 注：工具能否真正执行取决于模型服务端支持，模型可能以文本形式输出工具调用而非执行
+    body["tools"] = serde_json::json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "搜索网络获取实时信息",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "搜索关键词"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }
+    ]);
 
     body
 }

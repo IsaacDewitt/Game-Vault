@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 // LLM 默认配置常量（统一来源，避免多处硬编码不一致）
-pub const DEFAULT_LLM_PROVIDER: &str = "xiaomi";
 pub const DEFAULT_LLM_PROTOCOL: &str = "openai";
 pub const DEFAULT_LLM_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
 pub const DEFAULT_LLM_MODEL: &str = "mimo-v2.5-pro";
@@ -12,9 +11,6 @@ pub struct Settings {
     pub theme: String,
     pub language: String,
     pub steamgriddb_api_key: String,
-    /// LLM 提供商：xiaomi / deepseek
-    #[serde(default)]
-    pub llm_provider: String,
     /// LLM 协议：openai / anthropic
     #[serde(default)]
     pub llm_protocol: String,
@@ -45,7 +41,6 @@ impl Default for Settings {
             theme: "dark".to_string(),
             language: "zh-CN".to_string(),
             steamgriddb_api_key: String::new(),
-            llm_provider: DEFAULT_LLM_PROVIDER.to_string(),
             llm_protocol: DEFAULT_LLM_PROTOCOL.to_string(),
             llm_api_key: String::new(),
             llm_base_url: DEFAULT_LLM_BASE_URL.to_string(),
@@ -67,7 +62,6 @@ impl Settings {
             theme: get("theme", "dark"),
             language: get("language", "zh-CN"),
             steamgriddb_api_key: get("steamgriddb_api_key", ""),
-            llm_provider: get("llm_provider", DEFAULT_LLM_PROVIDER),
             llm_protocol: get("llm_protocol", DEFAULT_LLM_PROTOCOL),
             llm_api_key: get("llm_api_key", ""),
             llm_base_url: get("llm_base_url", DEFAULT_LLM_BASE_URL),
@@ -82,7 +76,6 @@ impl Settings {
         db.set_setting("theme", &self.theme)?;
         db.set_setting("language", &self.language)?;
         db.set_setting("steamgriddb_api_key", &self.steamgriddb_api_key)?;
-        db.set_setting("llm_provider", &self.llm_provider)?;
         db.set_setting("llm_protocol", &self.llm_protocol)?;
         db.set_setting("llm_api_key", &self.llm_api_key)?;
         db.set_setting("llm_base_url", &self.llm_base_url)?;

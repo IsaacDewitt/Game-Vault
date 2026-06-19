@@ -178,8 +178,9 @@ async function handleChangeCover() {
     :width="400"
     placement="right"
     @update:show="(val) => !val && emit('close')"
+    @contextmenu.prevent
   >
-    <n-drawer-content :native-scrollbar="false">
+    <n-drawer-content :native-scrollbar="false" @contextmenu.prevent>
       <template #header>
         <div class="detail-header">
           <span>{{ game.name }}</span>

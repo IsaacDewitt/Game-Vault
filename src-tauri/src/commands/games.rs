@@ -2,7 +2,7 @@ use tauri::{State, Emitter};
 use std::sync::{Arc, Mutex};
 use crate::core::{Database, PlayTimeTracker, GameLauncher};
 use crate::core::cover_fetcher::CoverFetcher;
-use crate::core::llm_fetcher::{self, LlmConfig, LlmProtocol, LlmProvider};
+use crate::core::llm_fetcher::{self, LlmConfig, LlmProtocol};
 use crate::models::*;
 use crate::models::settings::Settings;
 use crate::utils;
@@ -360,10 +360,6 @@ pub async fn fetch_game_info_llm(
             return Err("未配置 LLM API Key，请在设置中填写".to_string());
         }
 
-        let provider = match settings.llm_provider.as_str() {
-            "deepseek" => LlmProvider::Deepseek,
-            _ => LlmProvider::Xiaomi,
-        };
         let protocol = match settings.llm_protocol.as_str() {
             "anthropic" => LlmProtocol::Anthropic,
             _ => LlmProtocol::Openai,
@@ -371,7 +367,6 @@ pub async fn fetch_game_info_llm(
 
         let config = LlmConfig {
             enabled: true,
-            provider,
             protocol,
             api_key: settings.llm_api_key,
             base_url: settings.llm_base_url,

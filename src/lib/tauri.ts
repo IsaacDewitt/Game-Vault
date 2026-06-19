@@ -83,7 +83,6 @@ export interface Settings {
   theme: string;
   language: string;
   steamgriddb_api_key: string;
-  llm_provider: string;
   llm_protocol: string;
   llm_api_key: string;
   llm_base_url: string;

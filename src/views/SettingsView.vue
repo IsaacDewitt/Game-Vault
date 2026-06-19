@@ -25,7 +25,6 @@ const settings = ref<Settings>({
   theme: "dark",
   language: "zh-CN",
   steamgriddb_api_key: "",
-  llm_provider: "",
   llm_protocol: "",
   llm_api_key: "",
   llm_base_url: "",
@@ -33,12 +32,6 @@ const settings = ref<Settings>({
   llm_enabled: false,
   accent_color: "#6366f1",
 });
-
-// LLM 提供商预设
-const providerOptions = [
-  { label: "小米 MiMo", value: "xiaomi" },
-  { label: "DeepSeek", value: "deepseek" },
-];
 
 const protocolOptions = [
   { label: "OpenAI 格式", value: "openai" },
@@ -56,26 +49,6 @@ const presetColors = [
   { label: "粉色", value: "#ec4899" },
   { label: "青色", value: "#14b8a6" },
 ];
-
-// 切换提供商时自动填充默认值
-watch(() => settings.value.llm_provider, (provider) => {
-  if (provider === "xiaomi") {
-    if (!settings.value.llm_base_url || settings.value.llm_base_url === "https://api.deepseek.com/v1") {
-      settings.value.llm_base_url = "https://api.xiaomimimo.com/v1";
-    }
-    if (!settings.value.llm_model || settings.value.llm_model === "deepseek-chat") {
-      settings.value.llm_model = "mimo-v2.5-pro";
-    }
-    settings.value.llm_protocol = "openai";
-  } else if (provider === "deepseek") {
-    if (!settings.value.llm_base_url || settings.value.llm_base_url === "https://api.xiaomimimo.com/v1") {
-      settings.value.llm_base_url = "https://api.deepseek.com/v1";
-    }
-    if (!settings.value.llm_model || settings.value.llm_model === "mimo-v2.5-pro") {
-      settings.value.llm_model = "deepseek-chat";
-    }
-  }
-});
 
 // 主题色变化时实时预览
 watch(() => settings.value.accent_color, (color) => {
@@ -241,13 +214,6 @@ onMounted(loadSettings);
         <n-switch v-model:value="settings.llm_enabled" />
       </template>
       <n-form label-placement="left" label-width="140">
-        <n-form-item label="提供商">
-          <n-select
-            v-model:value="settings.llm_provider"
-            :options="providerOptions"
-            style="width: 200px"
-          />
-        </n-form-item>
         <n-form-item label="协议格式">
           <n-select
             v-model:value="settings.llm_protocol"
