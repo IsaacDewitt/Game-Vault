@@ -44,6 +44,9 @@ urlencoding = "2"
 # Base64 编码（封面图 data URL）
 base64 = "0.22"
 
+# ZIP 压缩（存档备份）
+zip = "0.6"
+
 # 错误处理
 anyhow = "1"
 

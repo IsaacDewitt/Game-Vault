@@ -1,4 +1,5 @@
 use tauri::{State, Emitter};
+use tauri_plugin_opener::OpenerExt;
 use std::sync::{Arc, Mutex};
 use crate::core::{Database, PlayTimeTracker, GameLauncher};
 use crate::core::cover_fetcher::CoverFetcher;
@@ -136,9 +137,47 @@ pub fn add_game_manual(
         .unwrap_or(std::path::Path::new("."))
         .to_string_lossy()
         .to_string());
+    // 从 exe 文件读取版本号
+    game.exe_version = utils::path::read_exe_version(&exe_path);
 
     db.upsert_game(&game).map_err(|e| e.to_string())?;
     Ok(game)
+}
+
+/// 启动时批量刷新所有游戏的 exe 版本号
+/// 仅对有 exe_path 且版本号为空或 exe 文件已变更的游戏进行更新
+#[tauri::command]
+pub fn refresh_exe_versions(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<u32, String> {
+    let db_guard = lock_or_recover(&db);
+    let filter = GameFilter::default();
+    let games = db_guard.get_games(&filter).map_err(|e| e.to_string())?;
+
+    let mut updated = 0u32;
+    for game in games {
+        let exe_path = match game.exe_path {
+            Some(ref p) => p.clone(),
+            None => continue,
+        };
+
+        // 读取当前 exe 的版本号
+        let new_version = utils::path::read_exe_version(&exe_path);
+
+        // 仅当版本号有变化时才更新数据库
+        if new_version != game.exe_version {
+            let mut updated_game = game.clone();
+            updated_game.exe_version = new_version;
+            updated_game.updated_at = Some(chrono::Utc::now().to_rfc3339());
+            if let Err(e) = db_guard.update_game(&updated_game) {
+                tracing::warn!("更新游戏版本号失败 {}: {}", updated_game.name, e);
+            } else {
+                updated += 1;
+            }
+        }
+    }
+
+    Ok(updated)
 }
 
 /// 设置游戏封面（手动选择本地图片）
@@ -425,6 +464,9 @@ pub async fn fetch_game_info_llm(
     if let Some(v) = meta.hltb_completionist {
         updated.hltb_completionist = Some(v);
     }
+    if !meta.save_paths.is_empty() {
+        updated.save_paths = meta.save_paths;
+    }
 
     db_guard.update_game(&updated).map_err(|e| e.to_string())?;
     Ok(updated)
@@ -619,4 +661,264 @@ pub fn read_covers_batch_as_base64(paths: Vec<String>) -> Result<std::collection
     }
 
     Ok(result)
+}
+
+/// 打开存档路径（在文件管理器中）
+#[tauri::command]
+pub async fn open_save_path(path: String, app_handle: tauri::AppHandle) -> Result<(), String> {
+    let expanded = utils::path::expand_env_vars(&path);
+    let path = std::path::PathBuf::from(&expanded);
+
+    if !path.exists() {
+        return Err(format!("路径不存在: {}", expanded));
+    }
+
+    // 如果是文件，打开其父目录；如果是目录，直接打开
+    let target = if path.is_file() {
+        path.parent().unwrap_or(&path).to_path_buf()
+    } else {
+        path
+    };
+
+    app_handle.opener().open_path(
+        target.to_string_lossy(),
+        None::<&str>,
+    ).map_err(|e| format!("打开路径失败: {}", e))?;
+
+    Ok(())
+}
+
+/// 更新游戏存档路径列表
+#[tauri::command]
+pub fn update_save_paths(
+    db: State<'_, Arc<Mutex<Database>>>,
+    game_id: String,
+    save_paths: Vec<String>,
+) -> Result<(), String> {
+    let db_guard = lock_or_recover(&db);
+    let mut game = db_guard.get_game_by_id(&game_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "游戏不存在".to_string())?;
+
+    game.save_paths = save_paths;
+    game.updated_at = Some(chrono::Utc::now().to_rfc3339());
+    db_guard.update_game(&game).map_err(|e| e.to_string())
+}
+
+/// 将目录或文件添加到 ZIP 归档中
+fn add_path_to_zip(
+    zip: &mut zip::ZipWriter<std::io::BufWriter<std::fs::File>>,
+    base_path: &std::path::Path,
+    current_path: &std::path::Path,
+    zip_prefix: &str,
+) -> Result<(), String> {
+    use zip::write::FileOptions;
+
+    if current_path.is_file() {
+        let relative = current_path.strip_prefix(base_path)
+            .unwrap_or(current_path);
+        let zip_path = if zip_prefix.is_empty() {
+            relative.to_string_lossy().to_string()
+        } else {
+            format!("{}/{}", zip_prefix, relative.to_string_lossy())
+        };
+
+        let options = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file(&zip_path, options)
+            .map_err(|e| format!("创建 ZIP 文件条目失败: {}", e))?;
+        let mut file = std::fs::File::open(current_path)
+            .map_err(|e| format!("读取文件失败 {}: {}", current_path.display(), e))?;
+        std::io::copy(&mut file, zip)
+            .map_err(|e| format!("写入 ZIP 失败: {}", e))?;
+    } else if current_path.is_dir() {
+        for entry in std::fs::read_dir(current_path)
+            .map_err(|e| format!("读取目录失败 {}: {}", current_path.display(), e))?
+        {
+            let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+            add_path_to_zip(zip, base_path, &entry.path(), zip_prefix)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// 导出存档备份为 ZIP 文件
+#[tauri::command]
+pub async fn export_saves_backup(
+    db: State<'_, Arc<Mutex<Database>>>,
+    export_path: String,
+) -> Result<serde_json::Value, String> {
+    let games = {
+        let db_guard = lock_or_recover(&db);
+        let filter = GameFilter::default();
+        db_guard.get_games(&filter).map_err(|e| e.to_string())?
+    };
+
+    let file = std::fs::File::create(&export_path)
+        .map_err(|e| format!("创建 ZIP 文件失败: {}", e))?;
+    let buf_writer = std::io::BufWriter::new(file);
+    let mut zip = zip::ZipWriter::new(buf_writer);
+
+    let mut manifest: Vec<serde_json::Value> = Vec::new();
+    let mut exported_count = 0u32;
+    let mut errors: Vec<String> = Vec::new();
+
+    for game in &games {
+        if game.save_paths.is_empty() {
+            continue;
+        }
+
+        for (idx, save_path) in game.save_paths.iter().enumerate() {
+            let expanded = utils::path::expand_env_vars(save_path);
+            let path = std::path::PathBuf::from(&expanded);
+
+            if !path.exists() {
+                errors.push(format!("{}: 路径不存在 - {}", game.name, expanded));
+                continue;
+            }
+
+            // ZIP 内的目录名：游戏名_序号（避免特殊字符）
+            let safe_name = game.name.chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect::<String>();
+            let zip_prefix = if game.save_paths.len() > 1 {
+                format!("{}_{}", safe_name, idx + 1)
+            } else {
+                safe_name.clone()
+            };
+
+            match add_path_to_zip(&mut zip, &path, &path, &zip_prefix) {
+                Ok(_) => {
+                    manifest.push(serde_json::json!({
+                        "game_id": game.id,
+                        "game_name": game.name,
+                        "original_path": save_path,
+                        "zip_prefix": zip_prefix,
+                    }));
+                    exported_count += 1;
+                }
+                Err(e) => {
+                    errors.push(format!("{}: {}", game.name, e));
+                }
+            }
+        }
+    }
+
+    // 写入 manifest.json
+    use std::io::Write;
+    use zip::write::FileOptions;
+    let options = FileOptions::default();
+    zip.start_file("manifest.json", options)
+        .map_err(|e| format!("创建 manifest 失败: {}", e))?;
+    let manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| format!("序列化 manifest 失败: {}", e))?;
+    zip.write_all(manifest_json.as_bytes())
+        .map_err(|e| format!("写入 manifest 失败: {}", e))?;
+
+    zip.finish().map_err(|e| format!("完成 ZIP 文件失败: {}", e))?;
+
+    Ok(serde_json::json!({
+        "exported": exported_count,
+        "errors": errors,
+    }))
+}
+
+/// 从 ZIP 备份文件导入存档
+#[tauri::command]
+pub async fn import_saves_backup(
+    _db: State<'_, Arc<Mutex<Database>>>,
+    zip_path: String,
+) -> Result<serde_json::Value, String> {
+    let file = std::fs::File::open(&zip_path)
+        .map_err(|e| format!("打开 ZIP 文件失败: {}", e))?;
+    let buf_reader = std::io::BufReader::new(file);
+    let mut archive = zip::ZipArchive::new(buf_reader)
+        .map_err(|e| format!("读取 ZIP 文件失败: {}", e))?;
+
+    // 读取 manifest.json
+    let manifest: Vec<serde_json::Value> = {
+        let mut manifest_file = archive.by_name("manifest.json")
+            .map_err(|_| "ZIP 文件中缺少 manifest.json".to_string())?;
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut manifest_file, &mut content)
+            .map_err(|e| format!("读取 manifest.json 失败: {}", e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("解析 manifest.json 失败: {}", e))?
+    };
+
+    let mut restored_count = 0u32;
+    let mut errors: Vec<String> = Vec::new();
+
+    for entry in &manifest {
+        let game_id = entry["game_id"].as_str().unwrap_or("");
+        let original_path = entry["original_path"].as_str().unwrap_or("");
+        let zip_prefix = entry["zip_prefix"].as_str().unwrap_or("");
+
+        if original_path.is_empty() || zip_prefix.is_empty() {
+            continue;
+        }
+
+        let expanded = utils::path::expand_env_vars(original_path);
+        let target_path = std::path::PathBuf::from(&expanded);
+
+        // 创建目标目录
+        if let Some(parent) = target_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                errors.push(format!("创建目录失败 {}: {}", parent.display(), e));
+                continue;
+            }
+        }
+
+        // 从 ZIP 中提取文件到目标路径
+        // 需要重新打开 archive（因为 by_name 会移动所有权）
+        let file = std::fs::File::open(&zip_path)
+            .map_err(|e| format!("重新打开 ZIP 失败: {}", e))?;
+        let buf_reader = std::io::BufReader::new(file);
+        let mut archive2 = zip::ZipArchive::new(buf_reader)
+            .map_err(|e| format!("重新读取 ZIP 失败: {}", e))?;
+
+        // 获取 ZIP 中该前缀下的所有文件
+        let file_names: Vec<String> = archive2.file_names()
+            .filter(|name| name.starts_with(zip_prefix))
+            .map(|s| s.to_string())
+            .collect();
+
+        for file_name in file_names {
+            let mut zip_file = archive2.by_name(&file_name)
+                .map_err(|e| format!("读取 ZIP 条目失败 {}: {}", file_name, e))?;
+
+            // 计算目标文件路径
+            let relative = file_name.strip_prefix(&format!("{}/", zip_prefix))
+                .unwrap_or(&file_name);
+            let dest = if relative.is_empty() {
+                // zip_prefix 本身就是一个文件
+                target_path.clone()
+            } else {
+                target_path.join(relative)
+            };
+
+            if zip_file.is_dir() {
+                std::fs::create_dir_all(&dest)
+                    .map_err(|e| format!("创建目录失败: {}", e))?;
+            } else {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("创建目录失败: {}", e))?;
+                }
+                let mut dest_file = std::fs::File::create(&dest)
+                    .map_err(|e| format!("创建文件失败 {}: {}", dest.display(), e))?;
+                std::io::copy(&mut zip_file, &mut dest_file)
+                    .map_err(|e| format!("写入文件失败 {}: {}", dest.display(), e))?;
+            }
+        }
+
+        restored_count += 1;
+        tracing::info!("已恢复存档: {} -> {}", game_id, expanded);
+    }
+
+    Ok(serde_json::json!({
+        "restored": restored_count,
+        "errors": errors,
+    }))
 }

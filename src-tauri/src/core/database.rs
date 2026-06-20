@@ -75,6 +75,12 @@ impl Database {
         // 迁移：为旧数据库添加 HLTB 字段
         self.migrate_add_hltb_columns()?;
 
+        // 迁移：为旧数据库添加 save_paths 字段
+        self.migrate_add_save_paths_column()?;
+
+        // 迁移：为旧数据库添加 exe_version 字段
+        self.migrate_add_exe_version_column()?;
+
         // 创建 status 索引（在列存在之后）
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_games_status ON games(status);"
@@ -123,7 +129,13 @@ impl Database {
 
     /// 从数据库行构建 Game 对象
     fn row_to_game(row: &rusqlite::Row) -> rusqlite::Result<Game> {
-        let genres_str: String = row.get(11)?;
+        // 列顺序必须与 GAME_COLUMNS 完全一致：
+        // 0:id 1:name 2:install_path 3:exe_path 4:exe_name 5:exe_version
+        // 6:cover_local 7:cover_url 8:description 9:developer 10:publisher
+        // 11:release_date 12:genres 13:play_time_seconds 14:last_played
+        // 15:play_count 16:is_favorite 17:status 18:added_at 19:updated_at
+        // 20:hltb_main_story 21:hltb_main_extra 22:hltb_completionist 23:save_paths
+        let genres_str: String = row.get(12)?;
         let genres: Vec<String> = serde_json::from_str(&genres_str).unwrap_or_default();
 
         Ok(Game {
@@ -132,32 +144,40 @@ impl Database {
             install_path: row.get(2)?,
             exe_path: row.get(3)?,
             exe_name: row.get(4)?,
-            cover_local: row.get(5)?,
-            cover_url: row.get(6)?,
-            description: row.get(7)?,
-            developer: row.get(8)?,
-            publisher: row.get(9)?,
-            release_date: row.get(10)?,
+            exe_version: row.get(5)?,
+            cover_local: row.get(6)?,
+            cover_url: row.get(7)?,
+            description: row.get(8)?,
+            developer: row.get(9)?,
+            publisher: row.get(10)?,
+            release_date: row.get(11)?,
             genres,
-            play_time_seconds: row.get::<_, i64>(12).unwrap_or(0).max(0) as u64,
-            last_played: row.get(13)?,
-            play_count: row.get::<_, i64>(14).unwrap_or(0).max(0) as u32,
-            is_favorite: row.get::<_, i64>(15).unwrap_or(0) != 0,
-            status: row.get(16).unwrap_or_else(|_| "unplayed".to_string()),
-            added_at: row.get(17)?,
-            updated_at: row.get(18)?,
-            hltb_main_story: row.get::<_, Option<i64>>(19)?.map(|v| v.max(0) as u32),
-            hltb_main_extra: row.get::<_, Option<i64>>(20)?.map(|v| v.max(0) as u32),
-            hltb_completionist: row.get::<_, Option<i64>>(21)?.map(|v| v.max(0) as u32),
+            play_time_seconds: row.get::<_, i64>(13).unwrap_or(0).max(0) as u64,
+            last_played: row.get(14)?,
+            play_count: row.get::<_, i64>(15).unwrap_or(0).max(0) as u32,
+            is_favorite: row.get::<_, i64>(16).unwrap_or(0) != 0,
+            status: row.get(17).unwrap_or_else(|_| "unplayed".to_string()),
+            added_at: row.get(18)?,
+            updated_at: row.get(19)?,
+            hltb_main_story: row.get::<_, Option<i64>>(20)?.map(|v| v.max(0) as u32),
+            hltb_main_extra: row.get::<_, Option<i64>>(21)?.map(|v| v.max(0) as u32),
+            hltb_completionist: row.get::<_, Option<i64>>(22)?.map(|v| v.max(0) as u32),
+            save_paths: {
+                let paths_str: Option<String> = row.get(23)?;
+                paths_str
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default()
+            },
         })
     }
 
     const GAME_COLUMNS: &'static str = "
-        id, name, install_path, exe_path, exe_name,
+        id, name, install_path, exe_path, exe_name, exe_version,
         cover_local, cover_url, description, developer, publisher, release_date,
         genres, play_time_seconds, last_played, play_count,
         is_favorite, status, added_at, updated_at,
-        hltb_main_story, hltb_main_extra, hltb_completionist
+        hltb_main_story, hltb_main_extra, hltb_completionist,
+        save_paths
     ";
 
     // ==================== 游戏 CRUD ====================
@@ -166,19 +186,21 @@ impl Database {
     pub fn upsert_game(&self, game: &Game) -> Result<()> {
         self.conn.execute(
             "INSERT INTO games (
-                id, name, install_path, exe_path, exe_name,
+                id, name, install_path, exe_path, exe_name, exe_version,
                 cover_local, cover_url, description, developer, publisher, release_date,
                 genres, play_time_seconds, last_played, play_count,
                 is_favorite, status, added_at, updated_at,
-                hltb_main_story, hltb_main_extra, hltb_completionist
+                hltb_main_story, hltb_main_extra, hltb_completionist,
+                save_paths
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 install_path = excluded.install_path,
                 exe_path = excluded.exe_path,
                 exe_name = excluded.exe_name,
+                exe_version = excluded.exe_version,
                 cover_local = COALESCE(excluded.cover_local, games.cover_local),
                 cover_url = COALESCE(excluded.cover_url, games.cover_url),
                 description = COALESCE(excluded.description, games.description),
@@ -193,7 +215,8 @@ impl Database {
                 updated_at = excluded.updated_at,
                 hltb_main_story = COALESCE(excluded.hltb_main_story, games.hltb_main_story),
                 hltb_main_extra = COALESCE(excluded.hltb_main_extra, games.hltb_main_extra),
-                hltb_completionist = COALESCE(excluded.hltb_completionist, games.hltb_completionist)
+                hltb_completionist = COALESCE(excluded.hltb_completionist, games.hltb_completionist),
+                save_paths = excluded.save_paths
             ",
             params![
                 game.id,
@@ -201,6 +224,7 @@ impl Database {
                 game.install_path,
                 game.exe_path,
                 game.exe_name,
+                game.exe_version,
                 game.cover_local,
                 game.cover_url,
                 game.description,
@@ -218,6 +242,7 @@ impl Database {
                 game.hltb_main_story.map(|v| v as i64),
                 game.hltb_main_extra.map(|v| v as i64),
                 game.hltb_completionist.map(|v| v as i64),
+                serde_json::to_string(&game.save_paths)?,
             ],
         )?;
         Ok(())
@@ -235,12 +260,7 @@ impl Database {
     /// 获取所有游戏
     pub fn get_games(&self, filter: &GameFilter) -> Result<Vec<Game>> {
         let mut sql = String::from(
-            "SELECT id, name, install_path, exe_path, exe_name,
-                    cover_local, cover_url, description, developer, publisher, release_date,
-                    genres, play_time_seconds, last_played, play_count,
-                    is_favorite, status, added_at, updated_at,
-                    hltb_main_story, hltb_main_extra, hltb_completionist
-             FROM games WHERE 1=1"
+            &format!("SELECT {} FROM games WHERE 1=1", Self::GAME_COLUMNS)
         );
 
         let mut bind_values: Vec<String> = Vec::new();
@@ -357,16 +377,19 @@ impl Database {
         self.conn.execute(
             "UPDATE games SET
                 name = ?1, install_path = ?2, exe_path = ?3, exe_name = ?4,
-                cover_local = ?5, cover_url = ?6, description = ?7,
-                developer = ?8, publisher = ?9, release_date = ?10,
-                genres = ?11, is_favorite = ?12, status = ?13, updated_at = ?14,
-                hltb_main_story = ?15, hltb_main_extra = ?16, hltb_completionist = ?17
-             WHERE id = ?18",
+                exe_version = ?5,
+                cover_local = ?6, cover_url = ?7, description = ?8,
+                developer = ?9, publisher = ?10, release_date = ?11,
+                genres = ?12, is_favorite = ?13, status = ?14, updated_at = ?15,
+                hltb_main_story = ?16, hltb_main_extra = ?17, hltb_completionist = ?18,
+                save_paths = ?19
+             WHERE id = ?20",
             params![
                 game.name,
                 game.install_path,
                 game.exe_path,
                 game.exe_name,
+                game.exe_version,
                 game.cover_local,
                 game.cover_url,
                 game.description,
@@ -380,6 +403,7 @@ impl Database {
                 game.hltb_main_story.map(|v| v as i64),
                 game.hltb_main_extra.map(|v| v as i64),
                 game.hltb_completionist.map(|v| v as i64),
+                serde_json::to_string(&game.save_paths)?,
                 game.id,
             ],
         )?;
@@ -747,6 +771,72 @@ impl Database {
                 )?;
                 tracing::info!("已添加 {} 字段到 games 表", col_name);
             }
+        }
+
+        Ok(())
+    }
+
+    /// 迁移：添加 save_paths 字段到旧数据库
+    fn migrate_add_save_paths_column(&self) -> Result<()> {
+        let has_column: bool = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(games)")?;
+            let columns = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?)
+            })?;
+
+            let mut found = false;
+            for col in columns {
+                match col {
+                    Ok(name) if name == "save_paths" => {
+                        found = true;
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+            found
+        };
+
+        if !has_column {
+            tracing::info!("save_paths 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE games ADD COLUMN save_paths TEXT DEFAULT '[]'",
+                [],
+            )?;
+            tracing::info!("已添加 save_paths 字段到 games 表");
+        }
+
+        Ok(())
+    }
+
+    /// 迁移：添加 exe_version 字段到旧数据库
+    fn migrate_add_exe_version_column(&self) -> Result<()> {
+        let has_column: bool = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(games)")?;
+            let columns = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?)
+            })?;
+
+            let mut found = false;
+            for col in columns {
+                match col {
+                    Ok(name) if name == "exe_version" => {
+                        found = true;
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+            found
+        };
+
+        if !has_column {
+            tracing::info!("exe_version 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE games ADD COLUMN exe_version TEXT",
+                [],
+            )?;
+            tracing::info!("已添加 exe_version 字段到 games 表");
         }
 
         Ok(())

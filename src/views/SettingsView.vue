@@ -50,29 +50,57 @@ const presetColors = [
   { label: "青色", value: "#14b8a6" },
 ];
 
-// 主题色变化时实时预览
+// 加载中标记，避免初始化时触发自动保存
+const loading = ref(true);
+
+// 主题色变化时实时预览并自动保存
 watch(() => settings.value.accent_color, (color) => {
   if (color && (window as any).__updateAccentColor) {
     (window as any).__updateAccentColor(color);
   }
+  if (!loading.value && color) {
+    autoSaveThemeSettings();
+  }
 });
 
-// 主题切换时实时预览
+// 主题切换时实时预览并自动保存
 watch(() => settings.value.theme, (theme) => {
   if ((window as any).__updateTheme) {
     (window as any).__updateTheme(theme !== "light");
   }
+  if (!loading.value) {
+    autoSaveThemeSettings();
+  }
 });
+
+// 防抖自动保存外观设置
+let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
+function autoSaveThemeSettings() {
+  if (autoSaveTimer) clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(async () => {
+    try {
+      await api.saveSettings(settings.value);
+    } catch (e) {
+      console.error("自动保存外观设置失败:", e);
+    }
+  }, 300);
+}
 
 const saving = ref(false);
 const exporting = ref(false);
 const importing = ref(false);
+const exportingSaves = ref(false);
+const importingSaves = ref(false);
 
 async function loadSettings() {
+  loading.value = true;
   try {
     settings.value = await api.getSettings();
   } catch (e) {
     console.error("加载设置失败:", e);
+  } finally {
+    // 等待 DOM 更新后再解除加载标记，避免 watch 误触发保存
+    setTimeout(() => { loading.value = false; }, 0);
   }
 }
 
@@ -156,6 +184,77 @@ async function handleImportData() {
 }
 
 onMounted(loadSettings);
+
+async function handleExportSaves() {
+  exportingSaves.value = true;
+  try {
+    const filePath = await save({
+      defaultPath: "gamevault-saves-backup.zip",
+      filters: [
+        {
+          name: "ZIP 文件",
+          extensions: ["zip"],
+        },
+      ],
+    });
+
+    if (!filePath) {
+      exportingSaves.value = false;
+      return;
+    }
+
+    const result = await api.exportSavesBackup(filePath);
+
+    if (result.errors.length > 0) {
+      message.warning(
+        `存档导出完成，成功 ${result.exported} 个，失败 ${result.errors.length} 个`
+      );
+    } else {
+      message.success(`存档导出成功，共 ${result.exported} 个游戏存档`);
+    }
+  } catch (e) {
+    console.error("导出存档失败:", e);
+    message.error("导出存档失败: " + (e as Error).toString());
+  } finally {
+    exportingSaves.value = false;
+  }
+}
+
+async function handleImportSaves() {
+  importingSaves.value = true;
+  try {
+    const selected = await open({
+      multiple: false,
+      title: "选择存档备份文件",
+      filters: [
+        {
+          name: "ZIP 文件",
+          extensions: ["zip"],
+        },
+      ],
+    });
+
+    if (!selected) {
+      importingSaves.value = false;
+      return;
+    }
+
+    const result = await api.importSavesBackup(selected as string);
+
+    if (result.errors.length > 0) {
+      message.warning(
+        `存档恢复完成，成功 ${result.restored} 个，失败 ${result.errors.length} 个`
+      );
+    } else {
+      message.success(`存档恢复成功，共 ${result.restored} 个游戏存档`);
+    }
+  } catch (e) {
+    console.error("导入存档失败:", e);
+    message.error("导入存档失败: " + (e as Error).toString());
+  } finally {
+    importingSaves.value = false;
+  }
+}
 </script>
 
 <template>
@@ -275,6 +374,28 @@ onMounted(loadSettings);
           </n-button>
           <span style="margin-left: 12px; font-size: 12px; color: #888">
             从之前导出的 JSON 文件恢复游戏数据和设置
+          </span>
+        </n-form-item>
+        <n-form-item label="导出存档文件">
+          <n-button :loading="exportingSaves" @click="handleExportSaves">
+            <template #icon>
+              <n-icon :component="DownloadOutline" />
+            </template>
+            导出存档
+          </n-button>
+          <span style="margin-left: 12px; font-size: 12px; color: #888">
+            将所有游戏存档文件导出为 ZIP 压缩包
+          </span>
+        </n-form-item>
+        <n-form-item label="导入存档文件">
+          <n-button :loading="importingSaves" @click="handleImportSaves">
+            <template #icon>
+              <n-icon :component="CloudUploadOutline" />
+            </template>
+            导入存档
+          </n-button>
+          <span style="margin-left: 12px; font-size: 12px; color: #888">
+            从 ZIP 备份文件恢复游戏存档到对应位置
           </span>
         </n-form-item>
       </n-form>

@@ -11,6 +11,7 @@ import {
   NGi,
   NTooltip,
   NProgress,
+  NInput,
   useMessage,
 } from "naive-ui";
 import {
@@ -23,9 +24,15 @@ import {
   CheckmarkCircleOutline,
   TrophyOutline,
   TimeOutline,
+  FolderOpenOutline,
+  CreateOutline,
+  AddOutline,
+  CloseOutline,
+  CheckmarkOutline,
 } from "@vicons/ionicons5";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Game } from "../lib/tauri";
+import * as api from "../lib/tauri";
 import { formatPlayTime, formatDate } from "../lib/format";
 import { useGamesStore } from "../stores/games";
 import { useCoverImage } from "../lib/useCoverImage";
@@ -46,6 +53,10 @@ const emit = defineEmits<{
 const store = useGamesStore();
 const message = useMessage();
 const fetchingLlm = ref(false);
+
+// 存档路径编辑状态
+const editingSavePaths = ref(false);
+const editPaths = ref<string[]>([]);
 
 // HLTB 数据计算
 const hasHltb = computed(() =>
@@ -168,6 +179,56 @@ async function handleChangeCover() {
     }
   } catch (e) {
     console.error("更换封面失败:", e);
+  }
+}
+
+// 存档路径相关方法
+async function handleOpenSavePath(path: string) {
+  try {
+    await api.openSavePath(path);
+  } catch (e) {
+    message.error("打开路径失败: " + (e as Error).toString());
+  }
+}
+
+function startEditSavePaths() {
+  editPaths.value = [...(props.game.save_paths || [])];
+  editingSavePaths.value = true;
+}
+
+function cancelEditSavePaths() {
+  editingSavePaths.value = false;
+  editPaths.value = [];
+}
+
+function addSavePath() {
+  editPaths.value.push("");
+}
+
+function removeSavePath(index: number) {
+  editPaths.value.splice(index, 1);
+}
+
+async function saveSavePaths() {
+  // 过滤空路径
+  const paths = editPaths.value.filter((p) => p.trim() !== "");
+  try {
+    await api.updateSavePaths(props.game.id, paths);
+    // 更新本地游戏数据
+    const updated = await api.getGameDetail(props.game.id);
+    if (updated) {
+      const idx = store.games.findIndex((g) => g.id === props.game.id);
+      if (idx !== -1) {
+        store.games[idx] = updated;
+      }
+      if (store.selectedGame?.id === props.game.id) {
+        store.selectedGame = updated;
+      }
+    }
+    editingSavePaths.value = false;
+    message.success("存档路径已更新");
+  } catch (e) {
+    message.error("保存失败: " + (e as Error).toString());
   }
 }
 </script>
@@ -382,9 +443,101 @@ async function handleChangeCover() {
           <span class="info-label">可执行文件</span>
           <span class="info-value path">{{ game.exe_path }}</span>
         </div>
-        <div class="info-row" v-if="game.install_path">
-          <span class="info-label">安装路径</span>
-          <span class="info-value path">{{ game.install_path }}</span>
+        <div class="info-row" v-if="game.exe_version">
+          <span class="info-label">游戏版本</span>
+          <span class="info-value">{{ game.exe_version }}</span>
+        </div>
+      </div>
+
+      <!-- 存档路径 -->
+      <div class="save-paths-section">
+        <div class="section-title">
+          <n-icon :component="FolderOpenOutline" size="14" />
+          存档路径
+          <n-button
+            v-if="!editingSavePaths"
+            size="tiny"
+            quaternary
+            @click="startEditSavePaths"
+            style="margin-left: auto"
+          >
+            <template #icon>
+              <n-icon :component="CreateOutline" />
+            </template>
+            编辑
+          </n-button>
+        </div>
+
+        <!-- 查看模式 -->
+        <div v-if="!editingSavePaths">
+          <div v-if="game.save_paths && game.save_paths.length > 0">
+            <div
+              v-for="(path, index) in game.save_paths"
+              :key="index"
+              class="save-path-item"
+            >
+              <span class="save-path-text" :title="path">{{ path }}</span>
+              <n-tooltip trigger="hover">
+                <template #trigger>
+                  <n-button
+                    size="tiny"
+                    quaternary
+                    @click="handleOpenSavePath(path)"
+                  >
+                    <template #icon>
+                      <n-icon :component="FolderOpenOutline" />
+                    </template>
+                  </n-button>
+                </template>
+                打开文件夹
+              </n-tooltip>
+            </div>
+          </div>
+          <div v-else class="save-path-empty">
+            暂无存档路径信息
+          </div>
+        </div>
+
+        <!-- 编辑模式 -->
+        <div v-else>
+          <div
+            v-for="(_, index) in editPaths"
+            :key="index"
+            class="save-path-edit-item"
+          >
+            <n-input
+              v-model:value="editPaths[index]"
+              placeholder="输入存档路径，支持 %APPDATA% 等环境变量"
+              size="small"
+            />
+            <n-button
+              size="tiny"
+              quaternary
+              type="error"
+              @click="removeSavePath(index)"
+            >
+              <template #icon>
+                <n-icon :component="CloseOutline" />
+              </template>
+            </n-button>
+          </div>
+          <n-space style="margin-top: 8px">
+            <n-button size="small" quaternary @click="addSavePath">
+              <template #icon>
+                <n-icon :component="AddOutline" />
+              </template>
+              添加路径
+            </n-button>
+            <n-button size="small" type="primary" @click="saveSavePaths">
+              <template #icon>
+                <n-icon :component="CheckmarkOutline" />
+              </template>
+              保存
+            </n-button>
+            <n-button size="small" quaternary @click="cancelEditSavePaths">
+              取消
+            </n-button>
+          </n-space>
         </div>
       </div>
 
@@ -567,5 +720,40 @@ async function handleChangeCover() {
   font-size: 11px;
   color: #888;
   margin-top: 6px;
+}
+
+.save-paths-section {
+  margin-bottom: 16px;
+}
+
+.save-path-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.save-path-text {
+  flex: 1;
+  font-size: 11px;
+  color: #aaa;
+  word-break: break-all;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.save-path-empty {
+  font-size: 12px;
+  color: #666;
+  padding: 8px 0;
+}
+
+.save-path-edit-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 6px;
 }
 </style>

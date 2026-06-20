@@ -106,6 +106,18 @@ export const useGamesStore = defineStore("games", () => {
     } finally {
       loading.value = false;
     }
+    // 后台刷新 exe 版本号（不阻塞 UI）
+    api.refreshExeVersions().then(async (updated) => {
+      if (updated > 0) {
+        // 有版本号变化，静默刷新游戏列表
+        try {
+          games.value = await api.getGames({
+            sort_by: "last_played",
+            sort_order: "desc",
+          });
+        } catch (_) {}
+      }
+    }).catch(() => {});
   }
 
   async function loadAllGenres() {

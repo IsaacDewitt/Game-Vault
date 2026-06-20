@@ -8,6 +8,8 @@ export interface Game {
   install_path: string | null;
   exe_path: string | null;
   exe_name: string | null;
+  /** 从 exe 文件读取的版本号 */
+  exe_version: string | null;
   cover_local: string | null;
   cover_url: string | null;
   description: string | null;
@@ -29,6 +31,8 @@ export interface Game {
   hltb_main_extra: number | null;
   /** HLTB 完美通关时长（分钟） */
   hltb_completionist: number | null;
+  /** 游戏存档路径列表 */
+  save_paths: string[];
 }
 
 export interface GameFilter {
@@ -115,6 +119,11 @@ export async function deleteGame(gameId: string): Promise<void> {
 
 export async function addGameManual(name: string, exePath: string): Promise<Game> {
   return invoke("add_game_manual", { name, exePath });
+}
+
+/** 启动时批量刷新所有游戏的 exe 版本号，返回更新数量 */
+export async function refreshExeVersions(): Promise<number> {
+  return invoke("refresh_exe_versions");
 }
 
 export async function setGameCover(gameId: string, coverPath: string): Promise<void> {
@@ -211,6 +220,32 @@ export async function importGameData(jsonData: string): Promise<{ imported_games
 
 export async function getAllGenres(): Promise<string[]> {
   return invoke("get_all_genres");
+}
+
+export async function openSavePath(path: string): Promise<void> {
+  return invoke("open_save_path", { path });
+}
+
+export async function updateSavePaths(gameId: string, savePaths: string[]): Promise<void> {
+  return invoke("update_save_paths", { gameId, savePaths });
+}
+
+export interface SavesBackupResult {
+  exported: number;
+  errors: string[];
+}
+
+export async function exportSavesBackup(exportPath: string): Promise<SavesBackupResult> {
+  return invoke("export_saves_backup", { exportPath });
+}
+
+export interface SavesRestoreResult {
+  restored: number;
+  errors: string[];
+}
+
+export async function importSavesBackup(zipPath: string): Promise<SavesRestoreResult> {
+  return invoke("import_saves_backup", { zipPath });
 }
 
 export interface PlaySessionDetail {

@@ -159,6 +159,7 @@ pub fn run() {
             commands::games::toggle_favorite,
             commands::games::delete_game,
             commands::games::add_game_manual,
+            commands::games::refresh_exe_versions,
             commands::games::set_game_cover,
             commands::games::remove_game_cover,
             commands::games::get_all_covers,
@@ -171,6 +172,10 @@ pub fn run() {
             commands::games::set_game_status,
             commands::games::import_game_data,
             commands::games::get_all_genres,
+            commands::games::open_save_path,
+            commands::games::update_save_paths,
+            commands::games::export_saves_backup,
+            commands::games::import_saves_backup,
             // 统计相关
             commands::stats::get_play_stats,
             commands::stats::get_daily_stats,

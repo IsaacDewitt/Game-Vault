@@ -8,6 +8,8 @@ pub struct Game {
     pub install_path: Option<String>,
     pub exe_path: Option<String>,
     pub exe_name: Option<String>,
+    /// 从 exe 文件读取的版本号
+    pub exe_version: Option<String>,
     pub cover_local: Option<String>,
     /// 实际存储的是本地封面缓存文件路径（如 covers/{uuid}.jpg），而非远程 URL
     pub cover_url: Option<String>,
@@ -30,6 +32,9 @@ pub struct Game {
     pub hltb_main_extra: Option<u32>,
     /// HLTB 完美通关时长（分钟）
     pub hltb_completionist: Option<u32>,
+    /// 游戏存档路径列表
+    #[serde(default)]
+    pub save_paths: Vec<String>,
 }
 
 impl Game {
@@ -41,6 +46,7 @@ impl Game {
             install_path: None,
             exe_path: None,
             exe_name: None,
+            exe_version: None,
             cover_local: None,
             cover_url: None,
             description: None,
@@ -58,6 +64,7 @@ impl Game {
             hltb_main_story: None,
             hltb_main_extra: None,
             hltb_completionist: None,
+            save_paths: Vec::new(),
         }
     }
 

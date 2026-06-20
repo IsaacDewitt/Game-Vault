@@ -59,6 +59,9 @@ pub struct LlmGameMeta {
     /// HLTB 完美通关时长（分钟）
     #[serde(default)]
     pub hltb_completionist: Option<u32>,
+    /// 游戏存档路径列表
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
+    pub save_paths: Vec<String>,
 }
 
 /// 反序列化：null / [] / ["a","b"] 都能正确处理
@@ -86,7 +89,8 @@ fn build_system_prompt() -> String {
        \"genres\": [\"类型1\", \"类型2\"],\n\
        \"hltb_main_story\": 主线通关时长（分钟，整数，无法确定填 null）,\n\
        \"hltb_main_extra\": 主线+支线时长（分钟，整数，无法确定填 null）,\n\
-       \"hltb_completionist\": 完美通关时长（分钟，整数，无法确定填 null）\n\
+       \"hltb_completionist\": 完美通关时长（分钟，整数，无法确定填 null）,\n\
+       \"save_paths\": [\"存档路径1\", \"存档路径2\"]\n\
      }\n\
      \n\
      注意事项：\n\
@@ -95,6 +99,8 @@ fn build_system_prompt() -> String {
      - 某项信息确实无法确定时，填 null\n\
      - genres 不确定时填空数组 []\n\
      - hltb 时长请根据 HowLongToBeat 数据或你的知识估算，单位为分钟。如《塞尔达传说：旷野之息》主线约50小时则填 3000\n\
+     - save_paths 为该游戏存档文件或存档文件夹的常见路径。支持 %%APPDATA%%、%%USERPROFILE%%、%%LOCALAPPDATA%% 等 Windows 环境变量\n\
+     - 如果无法确定存档路径，save_paths 填空数组 []\n\
      - 不要用 markdown 代码块包裹，直接返回 JSON"
         .to_string()
 }
