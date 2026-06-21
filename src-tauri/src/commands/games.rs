@@ -182,14 +182,32 @@ pub fn refresh_exe_versions(
 }
 
 /// 设置游戏封面（手动选择本地图片）
+/// 将用户选择的图片复制到 covers 目录，再将内部路径存入数据库
 #[tauri::command]
 pub fn set_game_cover(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
     cover_path: String,
 ) -> Result<(), String> {
+    let src = std::path::Path::new(&cover_path);
+    if !src.exists() {
+        return Err("选择的图片文件不存在".to_string());
+    }
+
+    // 取源文件扩展名，默认 jpg
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg");
+    let covers_dir = utils::path::get_covers_dir();
+    utils::path::ensure_dir_exists(&covers_dir).map_err(|e| e.to_string())?;
+    let dest = covers_dir.join(format!("{}.{}", game_id, ext));
+
+    std::fs::copy(src, &dest).map_err(|e| format!("复制封面文件失败: {}", e))?;
+
     let db = lock_or_recover(&db);
-    db.update_game_cover(&game_id, &cover_path).map_err(|e| e.to_string())
+    db.update_game_cover(&game_id, &dest.to_string_lossy())
+        .map_err(|e| e.to_string())
 }
 
 /// 删除游戏封面（清除 cover_url 和 cover_local，同时删除本地文件）
