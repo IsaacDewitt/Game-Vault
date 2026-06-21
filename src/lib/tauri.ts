@@ -214,6 +214,10 @@ export async function renameGame(gameId: string, newName: string): Promise<void>
   return invoke("rename_game", { gameId, newName });
 }
 
+export async function updateExePath(gameId: string, newExePath: string): Promise<Game> {
+  return invoke("update_exe_path", { gameId, newExePath });
+}
+
 export async function importGameData(jsonData: string): Promise<{ imported_games: number; settings_restored: boolean }> {
   return invoke("import_game_data", { jsonData });
 }

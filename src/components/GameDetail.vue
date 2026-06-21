@@ -182,6 +182,27 @@ async function handleChangeCover() {
   }
 }
 
+async function handleChangeExePath() {
+  try {
+    const selected = await open({
+      multiple: false,
+      filters: [
+        {
+          name: "可执行文件",
+          extensions: ["exe"],
+        },
+      ],
+      title: "选择游戏可执行文件",
+    });
+    if (selected) {
+      await store.updateExePath(props.game.id, selected as string);
+      message.success("可执行文件路径已更新，版本号已刷新");
+    }
+  } catch (e) {
+    message.error("更新可执行文件路径失败: " + (e as Error).toString());
+  }
+}
+
 // 存档路径相关方法
 async function handleOpenSavePath(path: string) {
   try {
@@ -439,9 +460,10 @@ async function saveSavePaths() {
           <span class="info-label">发行日期</span>
           <span class="info-value">{{ game.release_date }}</span>
         </div>
-        <div class="info-row" v-if="game.exe_path">
+        <div class="info-row clickable" v-if="game.exe_path" @click="handleChangeExePath">
           <span class="info-label">可执行文件</span>
           <span class="info-value path">{{ game.exe_path }}</span>
+          <n-icon :component="CreateOutline" size="14" class="edit-icon" />
         </div>
         <div class="info-row" v-if="game.exe_version">
           <span class="info-label">游戏版本</span>
@@ -650,6 +672,30 @@ async function saveSavePaths() {
 .info-value.path {
   font-size: 11px;
   word-break: break-all;
+}
+
+.info-row.clickable {
+  cursor: pointer;
+  align-items: center;
+  gap: 8px;
+  transition: background-color 0.2s;
+  border-radius: 4px;
+  padding: 8px 4px;
+}
+
+.info-row.clickable:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.info-row.clickable .edit-icon {
+  opacity: 0;
+  transition: opacity 0.2s;
+  flex-shrink: 0;
+  color: #888;
+}
+
+.info-row.clickable:hover .edit-icon {
+  opacity: 1;
 }
 
 .description {

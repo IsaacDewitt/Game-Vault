@@ -288,6 +288,23 @@ export const useGamesStore = defineStore("games", () => {
     }
   }
 
+  async function updateExePath(gameId: string, newExePath: string) {
+    try {
+      const updated = await api.updateExePath(gameId, newExePath);
+      const idx = games.value.findIndex((g) => g.id === gameId);
+      if (idx !== -1) {
+        games.value[idx] = updated;
+      }
+      if (selectedGame.value?.id === gameId) {
+        selectedGame.value = updated;
+      }
+      return updated;
+    } catch (e) {
+      console.error("更新可执行文件路径失败:", e);
+      throw e;
+    }
+  }
+
   async function setGameStatus(gameId: string, status: string) {
     try {
       await api.setGameStatus(gameId, status);
@@ -338,6 +355,7 @@ export const useGamesStore = defineStore("games", () => {
     toggleFav,
     removeGame,
     renameGame,
+    updateExePath,
     setGameStatus,
     selectGame,
     clearSelection,

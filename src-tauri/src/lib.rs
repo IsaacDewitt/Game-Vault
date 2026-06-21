@@ -168,6 +168,7 @@ pub fn run() {
             commands::games::read_cover_as_base64,
             commands::games::read_covers_batch_as_base64,
             commands::games::rename_game,
+            commands::games::update_exe_path,
             commands::games::export_game_data,
             commands::games::set_game_status,
             commands::games::import_game_data,

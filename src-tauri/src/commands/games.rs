@@ -515,6 +515,36 @@ pub fn rename_game(
     db.update_game(&game).map_err(|e| e.to_string())
 }
 
+/// 更新游戏可执行文件路径（同时刷新 exe_name、install_path、exe_version）
+#[tauri::command]
+pub fn update_exe_path(
+    db: State<'_, Arc<Mutex<Database>>>,
+    game_id: String,
+    new_exe_path: String,
+) -> Result<Game, String> {
+    let db = lock_or_recover(&db);
+    let mut game = db.get_game_by_id(&game_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "游戏不存在".to_string())?;
+
+    game.exe_path = Some(new_exe_path.clone());
+    game.exe_name = Some(std::path::Path::new(&new_exe_path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string());
+    game.install_path = Some(std::path::Path::new(&new_exe_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_string_lossy()
+        .to_string());
+    game.exe_version = utils::path::read_exe_version(&new_exe_path);
+    game.updated_at = Some(chrono::Utc::now().to_rfc3339());
+
+    db.update_game(&game).map_err(|e| e.to_string())?;
+    Ok(game)
+}
+
 /// 设置游戏状态
 #[tauri::command]
 pub fn set_game_status(
