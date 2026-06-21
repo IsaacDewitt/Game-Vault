@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use reqwest::Client;
 use crate::models::*;
+use crate::models::CoverOption;
 use crate::utils::constants::*;
 
 /// 封面图获取器（异步版本）
@@ -203,6 +204,108 @@ impl CoverFetcher {
         }
 
         Ok(None)
+    }
+
+    /// 获取游戏的所有可选封面（异步）
+    /// 先用游戏名搜索，如果没有结果再用文件夹名搜索
+    pub async fn fetch_cover_options(&self, game_name: &str, install_path: Option<&str>) -> Result<Vec<CoverOption>> {
+        // 用游戏名搜索
+        let mut grids = self.search_grids_for_game(game_name).await?;
+
+        // 如果没结果，用文件夹名搜索
+        if grids.is_empty() {
+            if let Some(path) = install_path {
+                let folder_name = std::path::Path::new(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string());
+                if let Some(ref folder) = folder_name {
+                    if *folder != game_name {
+                        tracing::info!("尝试用文件夹名搜索封面选项: {}", folder);
+                        grids = self.search_grids_for_game(folder).await?;
+                    }
+                }
+            }
+        }
+
+        Ok(grids)
+    }
+
+    /// 搜索 SteamGridDB 获取游戏的所有 grids（内部方法）
+    async fn search_grids_for_game(&self, game_name: &str) -> Result<Vec<CoverOption>> {
+        let encoded_name = urlencoding::encode(game_name);
+        let search_url = format!(
+            "https://www.steamgriddb.com/api/v2/search/autocomplete/{}",
+            encoded_name
+        );
+
+        let response = self.client
+            .get(&search_url)
+            .header("Authorization", format!("Bearer {}", self.steamgriddb_api_key))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+                anyhow::bail!("SteamGridDB API Key 无效，请在设置中检查");
+            }
+            return Ok(Vec::new());
+        }
+
+        let data: serde_json::Value = response.json().await?;
+        let games = match data["data"].as_array() {
+            Some(arr) => arr,
+            None => return Ok(Vec::new()),
+        };
+
+        let first_game = match games.first() {
+            Some(g) => g,
+            None => return Ok(Vec::new()),
+        };
+
+        let game_id = first_game["id"].as_i64().unwrap_or(0);
+        let grids_url = format!(
+            "https://www.steamgriddb.com/api/v2/grids/game/{}",
+            game_id
+        );
+
+        let grids_response = self.client
+            .get(&grids_url)
+            .header("Authorization", format!("Bearer {}", self.steamgriddb_api_key))
+            .send()
+            .await?;
+
+        if !grids_response.status().is_success() {
+            return Ok(Vec::new());
+        }
+
+        let grids_data: serde_json::Value = grids_response.json().await?;
+        let grids = match grids_data["data"].as_array() {
+            Some(arr) => arr,
+            None => return Ok(Vec::new()),
+        };
+
+        let options: Vec<CoverOption> = grids.iter().filter_map(|grid| {
+            let thumb_url = grid["thumb"].as_str().unwrap_or_default();
+            let url = grid["url"].as_str().unwrap_or_default();
+            if thumb_url.is_empty() || url.is_empty() {
+                return None;
+            }
+            Some(CoverOption {
+                thumb_url: thumb_url.to_string(),
+                url: url.to_string(),
+                width: grid["width"].as_u64().unwrap_or(0) as u32,
+                height: grid["height"].as_u64().unwrap_or(0) as u32,
+                style: grid["style"].as_str().unwrap_or("unknown").to_string(),
+            })
+        }).collect();
+
+        Ok(options)
+    }
+
+    /// 从 URL 下载图片到指定路径（供外部调用）
+    pub async fn download_from_url(&self, url: &str, save_path: &Path) -> Result<()> {
+        self.download_image(url, save_path).await
     }
 
     /// 下载图片（异步）

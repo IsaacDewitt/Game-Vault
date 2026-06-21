@@ -236,6 +236,20 @@ export const useGamesStore = defineStore("games", () => {
     }
   }
 
+  async function fetchCoverOptions(gameId: string): Promise<api.CoverOption[]> {
+    return api.fetchCoverOptions(gameId);
+  }
+
+  async function setCoverFromUrl(gameId: string, url: string) {
+    try {
+      await api.setGameCoverFromUrl(gameId, url);
+      await loadGames();
+    } catch (e) {
+      console.error("从 URL 设置封面失败:", e);
+      throw e;
+    }
+  }
+
   async function launch(gameId: string) {
     try {
       await api.launchGame(gameId);
@@ -355,6 +369,8 @@ export const useGamesStore = defineStore("games", () => {
     fetchCovers,
     refreshCover,
     setCover,
+    fetchCoverOptions,
+    setCoverFromUrl,
     launch,
     toggleFav,
     removeGame,

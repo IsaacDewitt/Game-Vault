@@ -12,6 +12,7 @@ import {
   NTooltip,
   NProgress,
   NInput,
+  NDropdown,
   useMessage,
 } from "naive-ui";
 import {
@@ -30,6 +31,7 @@ import {
   CloseOutline,
   CheckmarkOutline,
 } from "@vicons/ionicons5";
+import CoverPickerModal from "./CoverPickerModal.vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Game } from "../lib/tauri";
 import * as api from "../lib/tauri";
@@ -53,6 +55,9 @@ const emit = defineEmits<{
 const store = useGamesStore();
 const message = useMessage();
 const fetchingLlm = ref(false);
+
+// 封面选择器状态
+const showCoverPicker = ref(false);
 
 // 存档路径编辑状态
 const editingSavePaths = ref(false);
@@ -182,6 +187,20 @@ async function handleChangeCover() {
   }
 }
 
+// 封面来源下拉菜单
+const coverDropdownOptions = [
+  { label: "从本地选择", key: "local" },
+  { label: "从 SteamGridDB 选择", key: "steamgriddb" },
+];
+
+function handleCoverDropdown(key: string) {
+  if (key === "local") {
+    handleChangeCover();
+  } else if (key === "steamgriddb") {
+    showCoverPicker.value = true;
+  }
+}
+
 async function handleChangeExePath() {
   try {
     const selected = await open({
@@ -295,21 +314,18 @@ async function saveSavePaths() {
       </div>
       <!-- 更换封面按钮 -->
       <div class="change-cover-section">
-        <n-tooltip trigger="hover">
-          <template #trigger>
-            <n-button
-              size="small"
-              quaternary
-              @click="handleChangeCover"
-            >
-              <template #icon>
-                <n-icon :component="ImageOutline" />
-              </template>
-              更换封面
-            </n-button>
-          </template>
-          选择本地图片作为封面
-        </n-tooltip>
+        <n-dropdown
+          :options="coverDropdownOptions"
+          trigger="click"
+          @select="handleCoverDropdown"
+        >
+          <n-button size="small" quaternary>
+            <template #icon>
+              <n-icon :component="ImageOutline" />
+            </template>
+            更换封面
+          </n-button>
+        </n-dropdown>
       </div>
 
       <!-- 操作按钮 -->
@@ -565,6 +581,15 @@ async function saveSavePaths() {
 
     </n-drawer-content>
   </n-drawer>
+
+  <!-- 封面选择器弹窗 -->
+  <CoverPickerModal
+    :show="showCoverPicker"
+    :game-id="game.id"
+    :game-name="game.name"
+    @close="showCoverPicker = false"
+    @cover-changed="emit('close')"
+  />
 </template>
 
 <style scoped>

@@ -395,6 +395,68 @@ pub async fn fetch_missing_covers(
     }))
 }
 
+/// 获取游戏的所有可选封面（从 SteamGridDB）
+#[tauri::command]
+pub async fn fetch_cover_options(
+    db: State<'_, Arc<Mutex<Database>>>,
+    game_id: String,
+) -> Result<Vec<CoverOption>, String> {
+    let (game_name, install_path, api_key) = {
+        let db_guard = lock_or_recover(&db);
+        let game = db_guard.get_game_by_id(&game_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "游戏不存在".to_string())?;
+        let api_key = db_guard.get_setting("steamgriddb_api_key")
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        (game.name, game.install_path, api_key)
+    };
+
+    if api_key.is_empty() {
+        return Err("未配置 SteamGridDB API Key，请在设置中填写".to_string());
+    }
+
+    let cache_dir = utils::path::get_app_data_dir().join("covers");
+    let fetcher = CoverFetcher::new(cache_dir, api_key);
+
+    fetcher.fetch_cover_options(&game_name, install_path.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 从 URL 下载封面图片并设置为游戏封面
+#[tauri::command]
+pub async fn set_game_cover_from_url(
+    db: State<'_, Arc<Mutex<Database>>>,
+    game_id: String,
+    url: String,
+) -> Result<(), String> {
+    let api_key = {
+        let db_guard = lock_or_recover(&db);
+        // 验证游戏存在
+        let _game = db_guard.get_game_by_id(&game_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "游戏不存在".to_string())?;
+        db_guard.get_setting("steamgriddb_api_key")
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default()
+    };
+
+    let covers_dir = utils::path::get_covers_dir();
+    utils::path::ensure_dir_exists(&covers_dir).map_err(|e| e.to_string())?;
+    let save_path = covers_dir.join(format!("{}.jpg", game_id));
+
+    let fetcher = CoverFetcher::new(covers_dir.clone(), api_key);
+    fetcher.download_from_url(&url, &save_path)
+        .await
+        .map_err(|e| format!("下载封面失败: {}", e))?;
+
+    let cover_path = save_path.to_string_lossy().to_string();
+    let db_guard = lock_or_recover(&db);
+    db_guard.update_game_cover(&game_id, &cover_path)
+        .map_err(|e| e.to_string())
+}
+
 /// 从 LLM 获取游戏元数据
 #[tauri::command]
 pub async fn fetch_game_info_llm(

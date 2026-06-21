@@ -156,6 +156,22 @@ export async function readCoversBatchAsBase64(paths: string[]): Promise<Record<s
   return invoke("read_covers_batch_as_base64", { paths });
 }
 
+export interface CoverOption {
+  thumb_url: string;
+  url: string;
+  width: number;
+  height: number;
+  style: string;
+}
+
+export async function fetchCoverOptions(gameId: string): Promise<CoverOption[]> {
+  return invoke("fetch_cover_options", { gameId });
+}
+
+export async function setGameCoverFromUrl(gameId: string, url: string): Promise<void> {
+  return invoke("set_game_cover_from_url", { gameId, url });
+}
+
 
 export async function getPlayStats(limit?: number): Promise<PlayStats[]> {
   return invoke("get_play_stats", { limit });

@@ -80,6 +80,21 @@ impl Game {
     }
 }
 
+/// SteamGridDB 封面选项（用于封面选择器）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverOption {
+    /// 缩略图 URL（在选择器中展示）
+    pub thumb_url: String,
+    /// 原图 URL（用户选中后下载）
+    pub url: String,
+    /// 图片宽度
+    pub width: u32,
+    /// 图片高度
+    pub height: u32,
+    /// 风格: "official" | "community" | "animated"
+    pub style: String,
+}
+
 /// 游戏筛选条件
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
