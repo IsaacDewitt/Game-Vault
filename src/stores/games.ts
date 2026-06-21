@@ -19,6 +19,8 @@ export const useGamesStore = defineStore("games", () => {
   const coversLoading = ref(false);
   // 封面获取进度
   const coverFetchProgress = ref<{ current: number; total: number; game_name: string } | null>(null);
+  // 游戏信息获取进度
+  const gameInfoFetchProgress = ref<{ current: number; total: number; game_name: string } | null>(null);
   // 筛选状态
   const statusFilter = ref("");
   const genreFilter = ref("");
@@ -27,6 +29,7 @@ export const useGamesStore = defineStore("games", () => {
   // 监听后端游戏停止事件，清理 activeGames
   let unlistenGameStopped: (() => void) | null = null;
   let unlistenCoverProgress: (() => void) | null = null;
+  let unlistenGameInfoProgress: (() => void) | null = null;
 
   async function setupEventListeners() {
     if (unlistenGameStopped) return;
@@ -47,6 +50,14 @@ export const useGamesStore = defineStore("games", () => {
         coverFetchProgress.value = event.payload;
       }
     );
+
+    // 监听游戏信息获取进度事件
+    unlistenGameInfoProgress = await listen<{ current: number; total: number; game_name: string }>(
+      "game-info-fetch-progress",
+      (event) => {
+        gameInfoFetchProgress.value = event.payload;
+      }
+    );
   }
 
   // 清理事件监听器（应用退出时调用）
@@ -58,6 +69,10 @@ export const useGamesStore = defineStore("games", () => {
     if (unlistenCoverProgress) {
       unlistenCoverProgress();
       unlistenCoverProgress = null;
+    }
+    if (unlistenGameInfoProgress) {
+      unlistenGameInfoProgress();
+      unlistenGameInfoProgress = null;
     }
   }
 
@@ -205,6 +220,25 @@ export const useGamesStore = defineStore("games", () => {
     } catch (e) {
       coverFetchProgress.value = null;
       console.error("获取封面失败:", e);
+      throw e;
+    }
+  }
+
+  async function fetchGameInfo() {
+    try {
+      gameInfoFetchProgress.value = null;
+      const result = await api.fetchMissingGameInfo();
+      gameInfoFetchProgress.value = null;
+      if (result.fetched > 0) {
+        await loadGames();
+      }
+      if (result.errors.length > 0) {
+        console.warn("游戏信息获取:", result.errors);
+      }
+      return result;
+    } catch (e) {
+      gameInfoFetchProgress.value = null;
+      console.error("获取游戏信息失败:", e);
       throw e;
     }
   }
@@ -357,6 +391,7 @@ export const useGamesStore = defineStore("games", () => {
     coverBase64Cache,
     coversLoading,
     coverFetchProgress,
+    gameInfoFetchProgress,
     statusFilter,
     genreFilter,
     allGenres,
@@ -367,6 +402,7 @@ export const useGamesStore = defineStore("games", () => {
     addGameManual,
     fetchGameInfoLlm,
     fetchCovers,
+    fetchGameInfo,
     refreshCover,
     setCover,
     fetchCoverOptions,

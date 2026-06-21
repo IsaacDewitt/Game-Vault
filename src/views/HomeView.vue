@@ -13,7 +13,7 @@ import {
   useMessage,
   useDialog,
 } from "naive-ui";
-import { SearchOutline, CloudDownloadOutline, AddOutline } from "@vicons/ionicons5";
+import { SearchOutline, CloudDownloadOutline, AddOutline, DocumentTextOutline } from "@vicons/ionicons5";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ref, computed } from "vue";
 import { useDebounceFn } from "@vueuse/core";
@@ -40,6 +40,8 @@ const renamingGameId = ref("");
 const renameInput = ref("");
 // 封面获取 loading 状态
 const refreshingCovers = ref(false);
+// 游戏信息获取 loading 状态
+const refreshingInfo = ref(false);
 
 // 主页右键菜单状态
 const showHomeContextMenu = ref(false);
@@ -85,6 +87,11 @@ const homeContextMenuItems = computed<ContextMenuItem[]>(() => [
     label: "刷新封面",
     icon: "🖼️",
     action: () => handleRefreshCovers(),
+  },
+  {
+    label: "刷新游戏信息",
+    icon: "📝",
+    action: () => handleRefreshAllInfo(),
   },
   { label: "", icon: "", action: () => {}, divider: true },
   {
@@ -211,6 +218,31 @@ async function handleRefreshCovers() {
     message.error("获取封面失败");
   } finally {
     refreshingCovers.value = false;
+  }
+}
+
+async function handleRefreshAllInfo() {
+  refreshingInfo.value = true;
+  try {
+    const result = await store.fetchGameInfo();
+
+    if (result.fetched > 0) {
+      message.success(`已获取 ${result.fetched} 个游戏的信息`);
+    } else if (result.total > 0) {
+      message.warning(
+        `${result.total} 个游戏缺少信息，但获取失败。请检查 LLM 配置`
+      );
+      result.errors.forEach((e: string) => console.warn("游戏信息获取:", e));
+    } else if (result.errors.length === 0) {
+      message.info("所有游戏信息已是最新");
+    } else {
+      message.error(result.errors[0]);
+      result.errors.slice(1).forEach((e: string) => console.warn("游戏信息获取:", e));
+    }
+  } catch (e) {
+    message.error("获取游戏信息失败，请检查 LLM 配置");
+  } finally {
+    refreshingInfo.value = false;
   }
 }
 
@@ -375,6 +407,12 @@ function handleDeleteGame(gameId: string) {
             </template>
             刷新封面
           </n-button>
+          <n-button @click="handleRefreshAllInfo" :loading="refreshingInfo">
+            <template #icon>
+              <n-icon :component="DocumentTextOutline" />
+            </template>
+            刷新游戏信息
+          </n-button>
           <n-button type="primary" @click="handleAddGame">
             <template #icon>
               <n-icon :component="AddOutline" />
@@ -396,6 +434,20 @@ function handleDeleteGame(gameId: string) {
       <span class="progress-text">
         正在获取封面 ({{ store.coverFetchProgress.current }}/{{ store.coverFetchProgress.total }}):
         {{ store.coverFetchProgress.game_name }}
+      </span>
+    </div>
+
+    <!-- 游戏信息获取进度条 -->
+    <div v-if="store.gameInfoFetchProgress" class="cover-progress">
+      <n-progress
+        type="line"
+        :percentage="store.gameInfoFetchProgress.total > 0 ? Math.round((store.gameInfoFetchProgress.current / store.gameInfoFetchProgress.total) * 100) : 0"
+        :show-indicator="true"
+        processing
+      />
+      <span class="progress-text">
+        正在获取游戏信息 ({{ store.gameInfoFetchProgress.current }}/{{ store.gameInfoFetchProgress.total }}):
+        {{ store.gameInfoFetchProgress.game_name }}
       </span>
     </div>
 

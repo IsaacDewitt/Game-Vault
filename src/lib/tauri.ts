@@ -144,6 +144,11 @@ export async function fetchMissingCovers(): Promise<CoverFetchResult> {
   return invoke("fetch_missing_covers");
 }
 
+/** 批量获取缺失游戏信息的游戏 */
+export async function fetchMissingGameInfo(): Promise<CoverFetchResult> {
+  return invoke("fetch_missing_game_info");
+}
+
 export async function getAllCovers(): Promise<Record<string, string>> {
   return invoke("get_all_covers");
 }

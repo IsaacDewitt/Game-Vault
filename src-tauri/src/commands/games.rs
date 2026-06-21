@@ -1076,3 +1076,162 @@ pub async fn import_saves_backup(
         "errors": errors,
     }))
 }
+
+/// 批量刷新缺失游戏信息的游戏
+#[tauri::command]
+pub async fn fetch_missing_game_info(
+    db: State<'_, Arc<Mutex<Database>>>,
+    app_handle: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    // 阶段1：收集需要获取信息的游戏
+    let (missing_games, settings) = {
+        let db_guard = lock_or_recover(&db);
+        let filter = GameFilter::default();
+        let games = db_guard.get_games(&filter).map_err(|e| e.to_string())?;
+
+        // 使用统一的设置加载方法
+        let settings = Settings::load_from_db(&db_guard).map_err(|e| e.to_string())?;
+
+        // 检查 LLM 配置
+        if !settings.llm_enabled {
+            return Err("未启用 LLM 获取游戏信息，请在设置中配置".to_string());
+        }
+        if settings.llm_api_key.is_empty() {
+            return Err("未配置 LLM API Key，请在设置中填写".to_string());
+        }
+
+        // 判断游戏信息是否"完全缺失"：所有可获取的元数据字段都为空
+        let missing_games: Vec<Game> = games.into_iter().filter(|g| {
+            g.description.is_none()
+                && g.developer.is_none()
+                && g.publisher.is_none()
+                && g.release_date.is_none()
+                && g.genres.is_empty()
+                && g.hltb_main_story.is_none()
+                && g.hltb_main_extra.is_none()
+                && g.hltb_completionist.is_none()
+        }).collect();
+
+        (missing_games, settings)
+        // db_guard 在此释放
+    };
+
+    if missing_games.is_empty() {
+        return Ok(serde_json::json!({
+            "fetched": 0,
+            "total": 0,
+            "errors": [],
+        }));
+    }
+
+    let total = missing_games.len() as u32;
+
+    // 构建 LLM 配置
+    let protocol = match settings.llm_protocol.as_str() {
+        "anthropic" => LlmProtocol::Anthropic,
+        _ => LlmProtocol::Openai,
+    };
+    let config = LlmConfig {
+        enabled: true,
+        protocol,
+        api_key: settings.llm_api_key,
+        base_url: settings.llm_base_url,
+        model: settings.llm_model,
+    };
+
+    // 阶段2：逐个获取游戏信息（串行，避免 API 限流）
+    let mut fetched_count: u32 = 0;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (index, game) in missing_games.iter().enumerate() {
+        // 发送进度事件
+        let _ = app_handle.emit("game-info-fetch-progress", serde_json::json!({
+            "current": index + 1,
+            "total": total,
+            "game_name": game.name,
+        }));
+
+        // 调用 LLM 获取游戏信息
+        match llm_fetcher::fetch_game_meta(&config, &game.name).await {
+            Ok(meta) => {
+                // 将获取的信息更新到游戏数据（只更新非空字段，保留用户已有的数据）
+                let update_result = {
+                    let db_guard = lock_or_recover(&db);
+
+                    let mut updated = game.clone();
+                    if let Some(name) = meta.name {
+                        let trimmed = name.trim().to_string();
+                        if !trimmed.is_empty() && trimmed != updated.name {
+                            tracing::info!("LLM 纠正游戏名称: '{}' -> '{}'", updated.name, trimmed);
+                            updated.name = trimmed;
+                        }
+                    }
+                    if let Some(desc) = meta.description {
+                        if !desc.is_empty() {
+                            updated.description = Some(desc);
+                        }
+                    }
+                    if let Some(dev) = meta.developer {
+                        if !dev.is_empty() {
+                            updated.developer = Some(dev);
+                        }
+                    }
+                    if let Some(pub_) = meta.publisher {
+                        if !pub_.is_empty() {
+                            updated.publisher = Some(pub_);
+                        }
+                    }
+                    if let Some(date) = meta.release_date {
+                        if !date.is_empty() {
+                            updated.release_date = Some(date);
+                        }
+                    }
+                    if !meta.genres.is_empty() {
+                        updated.genres = meta.genres;
+                    }
+                    if let Some(v) = meta.hltb_main_story {
+                        updated.hltb_main_story = Some(v);
+                    }
+                    if let Some(v) = meta.hltb_main_extra {
+                        updated.hltb_main_extra = Some(v);
+                    }
+                    if let Some(v) = meta.hltb_completionist {
+                        updated.hltb_completionist = Some(v);
+                    }
+                    if !meta.save_paths.is_empty() {
+                        updated.save_paths = meta.save_paths;
+                    }
+
+                    db_guard.update_game(&updated)
+                };
+
+                match update_result {
+                    Ok(_) => {
+                        fetched_count += 1;
+                        tracing::info!("获取到游戏信息: {}", game.name);
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: 更新信息失败 - {}", game.name, e));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("获取游戏信息失败 {}: {}", game.name, e);
+                errors.push(format!("{}: {}", game.name, e));
+            }
+        }
+    }
+
+    // 阶段3：发送完成事件（进度归零）
+    let _ = app_handle.emit("game-info-fetch-progress", serde_json::json!({
+        "current": 0,
+        "total": 0,
+        "game_name": "",
+    }));
+
+    Ok(serde_json::json!({
+        "fetched": fetched_count,
+        "total": total,
+        "errors": errors,
+    }))
+}

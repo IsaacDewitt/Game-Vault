@@ -177,6 +177,7 @@ pub fn run() {
             commands::games::remove_game_cover,
             commands::games::get_all_covers,
             commands::games::fetch_missing_covers,
+            commands::games::fetch_missing_game_info,
             commands::games::fetch_cover_options,
             commands::games::set_game_cover_from_url,
             commands::games::fetch_game_info_llm,
