@@ -6,6 +6,22 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "0.4.1",
+    date: "2026-06-21",
+    changes: [
+      "提取颜色函数和数据库辅助函数，消除重复代码",
+      "CoverFetcher 和 Settings 加载改为 Result 错误传播，消除 expect/unwrap panic",
+      "ZIP 存档导入增加路径穿越防护（绝对路径检查、canonicalize 校验）",
+      "修复 HLTB 值为 0 时误判为无数据的 bug",
+      "封面组件新增渲染失败检测，损坏的 base64 数据自动回退到占位符",
+      "App.vue 改用 provide/inject 替代 window 全局属性",
+      "StatsView watch 优化为 shallow，避免深层遍历封面缓存",
+      "SettingsView API Key 输入改为密码类型，新增定时器清理",
+      "games store 增量更新 exe_version，避免竞态覆盖",
+      "formatDate 增加无效日期和未来时间的健壮性处理",
+    ],
+  },
+  {
     version: "0.4.0",
     date: "2026-06-21",
     changes: [
