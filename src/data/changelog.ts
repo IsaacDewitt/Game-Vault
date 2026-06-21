@@ -6,6 +6,16 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "0.4.0",
+    date: "2026-06-21",
+    changes: [
+      "新增 SteamGridDB 封面选择器，支持从多张可选封面中挑选",
+      "新增批量刷新游戏信息功能",
+      "添加自定义标题栏与关于对话框",
+      "游戏详情页显示最近三次游玩记录",
+    ],
+  },
+  {
     version: "0.3.0",
     date: "2026-06-21",
     changes: [
