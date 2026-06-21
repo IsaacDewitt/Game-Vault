@@ -346,7 +346,7 @@ pub async fn fetch_missing_covers(
 
     // 第二阶段：进行网络请求（不持有数据库锁）
     let cache_dir = utils::path::get_app_data_dir().join("covers");
-    let fetcher = CoverFetcher::new(cache_dir, api_key);
+    let fetcher = CoverFetcher::new(cache_dir, api_key).map_err(|e| e.to_string())?;
 
     let mut fetched_count = 0u32;
     let mut errors: Vec<String> = Vec::new();
@@ -417,7 +417,7 @@ pub async fn fetch_cover_options(
     }
 
     let cache_dir = utils::path::get_app_data_dir().join("covers");
-    let fetcher = CoverFetcher::new(cache_dir, api_key);
+    let fetcher = CoverFetcher::new(cache_dir, api_key).map_err(|e| e.to_string())?;
 
     fetcher.fetch_cover_options(&game_name, install_path.as_deref())
         .await
@@ -446,7 +446,7 @@ pub async fn set_game_cover_from_url(
     utils::path::ensure_dir_exists(&covers_dir).map_err(|e| e.to_string())?;
     let save_path = covers_dir.join(format!("{}.jpg", game_id));
 
-    let fetcher = CoverFetcher::new(covers_dir.clone(), api_key);
+    let fetcher = CoverFetcher::new(covers_dir.clone(), api_key).map_err(|e| e.to_string())?;
     fetcher.download_from_url(&url, &save_path)
         .await
         .map_err(|e| format!("下载封面失败: {}", e))?;
@@ -995,7 +995,7 @@ pub async fn import_saves_backup(
         // 收集该前缀下的所有 ZIP 条目及其目标路径
         let prefix_with_slash = format!("{}/", zip_prefix);
         let file_names: Vec<String> = archive.file_names()
-            .filter(|name| name.starts_with(zip_prefix))
+            .filter(|name| *name == zip_prefix || name.starts_with(&prefix_with_slash))
             .map(|s| s.to_string())
             .collect();
 
@@ -1004,11 +1004,20 @@ pub async fn import_saves_backup(
                 .unwrap_or(&file_name);
 
             // 安全检查：防止 ZIP 路径穿越攻击（如 prefix/../../etc/important_file）
-            let has_parent_traversal = std::path::Path::new(relative)
+            let relative_path = std::path::Path::new(relative);
+            let has_parent_traversal = relative_path
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir));
             if has_parent_traversal {
                 tracing::warn!("跳过包含路径遍历的 ZIP 条目: {}", file_name);
+                continue;
+            }
+            // 安全检查：拒绝绝对路径的 ZIP 条目
+            let has_absolute = relative_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Prefix(_)));
+            if has_absolute {
+                tracing::warn!("跳过包含绝对路径的 ZIP 条目: {}", file_name);
                 continue;
             }
 
@@ -1017,6 +1026,15 @@ pub async fn import_saves_backup(
             } else {
                 target_path.join(relative)
             };
+            // 最终安全检查：确保解压目标在预期目录下
+            if let Ok(canonical_dest) = dest.canonicalize() {
+                if let Ok(canonical_target) = target_path.canonicalize() {
+                    if !canonical_dest.starts_with(&canonical_target) {
+                        tracing::warn!("跳过目标路径超出预期目录的 ZIP 条目: {}", file_name);
+                        continue;
+                    }
+                }
+            }
             extract_plan.push((file_name, dest));
         }
     }

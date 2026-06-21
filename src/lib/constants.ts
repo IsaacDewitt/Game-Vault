@@ -44,3 +44,14 @@ export const TIME_MS = {
   DAY: 86_400_000,
   WEEK: 604_800_000,
 } as const;
+
+// ==================== 游戏状态 ====================
+
+/** 游戏状态枚举值 */
+export const GAME_STATUS = {
+  UNPLAYED: "unplayed",
+  PLAYING: "playing",
+  COMPLETED: "completed",
+  ABANDONED: "abandoned",
+  FAVORITES: "favorites",
+} as const;

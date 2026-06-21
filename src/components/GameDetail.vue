@@ -83,7 +83,7 @@ watch(
 
 // HLTB 数据计算
 const hasHltb = computed(() =>
-  props.game.hltb_main_story || props.game.hltb_main_extra || props.game.hltb_completionist
+  props.game.hltb_main_story != null || props.game.hltb_main_extra != null || props.game.hltb_completionist != null
 );
 
 // 实际游玩时长（分钟）
@@ -111,7 +111,7 @@ function formatMinutes(minutes: number): string {
   return `${hours}小时${mins}分钟`;
 }
 
-const { coverImage, imgFailed, handleImageError } = useCoverImage(toRef(props, "game"));
+const { coverImage, showPlaceholder, handleImageError } = useCoverImage(toRef(props, "game"));
 
 // 标签颜色映射
 const genreColorMap: Record<string, string> = {
@@ -309,7 +309,7 @@ async function saveSavePaths() {
       <!-- 封面图 -->
       <div class="cover-section">
         <img
-          v-if="coverImage && !imgFailed"
+          v-if="!showPlaceholder && coverImage"
           :src="coverImage"
           :alt="game.name"
           class="cover-img"

@@ -198,7 +198,9 @@ async fn handle_openai_tool_calls(
         if let Some(tool_calls) = message["tool_calls"].as_array() {
             if !tool_calls.is_empty() {
                 // 把助手消息（含 tool_calls）加入 messages
-                messages.as_array_mut().unwrap().push(message.clone());
+                if let Some(arr) = messages.as_array_mut() {
+                    arr.push(message.clone());
+                }
 
                 // 处理每个工具调用
                 for tool_call in tool_calls {
@@ -224,11 +226,13 @@ async fn handle_openai_tool_calls(
                     tracing::debug!("工具结果: {}", result);
 
                     // 添加工具结果到 messages
-                    messages.as_array_mut().unwrap().push(serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": result
-                    }));
+                    if let Some(arr) = messages.as_array_mut() {
+                        arr.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": result
+                        }));
+                    }
                 }
 
                 // 重新发送请求（保持相同的工具定义）

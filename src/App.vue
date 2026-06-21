@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, defineAsyncComponent, h, type Component, watch } from "vue";
+import { ref, computed, onMounted, onUnmounted, defineAsyncComponent, h, type Component, watch, provide } from "vue";
 import { darkTheme, lightTheme, NConfigProvider, NLayout, NLayoutSider, NLayoutContent, NMenu, NIcon, NMessageProvider, NDialogProvider, createDiscreteApi } from "naive-ui";
 import type { MenuOption } from "naive-ui";
 import { HomeOutline, StatsChartOutline, SettingsOutline, GameControllerOutline, EllipsisVertical, SquareOutline, CopyOutline, RemoveOutline, CloseOutline } from "@vicons/ionicons5";
@@ -11,6 +11,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { DEFAULT_ACCENT_COLOR } from "./lib/constants";
+import { lightenColor, darkenColor } from "./lib/color";
 
 // 懒加载非首屏视图，减少初始包体积（ECharts ~800KB 只在访问统计页时加载）
 const StatsView = defineAsyncComponent(() => import("./views/StatsView.vue"));
@@ -46,23 +47,6 @@ const themeOverrides = computed(() => ({
   }
 }));
 
-// 颜色工具函数
-function lightenColor(hex: string, percent: number): string {
-  const num = parseInt(hex.replace("#", ""), 16);
-  const r = Math.min(255, ((num >> 16) & 0xff) + Math.round(255 * percent / 100));
-  const g = Math.min(255, ((num >> 8) & 0xff) + Math.round(255 * percent / 100));
-  const b = Math.min(255, (num & 0xff) + Math.round(255 * percent / 100));
-  return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, "0")}`;
-}
-
-function darkenColor(hex: string, percent: number): string {
-  const num = parseInt(hex.replace("#", ""), 16);
-  const r = Math.max(0, ((num >> 16) & 0xff) - Math.round(255 * percent / 100));
-  const g = Math.max(0, ((num >> 8) & 0xff) - Math.round(255 * percent / 100));
-  const b = Math.max(0, (num & 0xff) - Math.round(255 * percent / 100));
-  return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, "0")}`;
-}
-
 // 从设置加载主题
 async function loadThemeSettings() {
   try {
@@ -84,9 +68,9 @@ function updateTheme(dark: boolean) {
   document.documentElement.classList.toggle("light-theme", !dark);
 }
 
-// 提供给子组件
-(window as any).__updateAccentColor = updateAccentColor;
-(window as any).__updateTheme = updateTheme;
+// 通过 provide/inject 提供给子组件（替代全局 window 属性）
+provide("updateAccentColor", updateAccentColor);
+provide("updateTheme", updateTheme);
 
 const menuOptions: MenuOption[] = [
   {
@@ -157,13 +141,15 @@ onMounted(async () => {
   const win = getCurrentWindow();
   isMaximized.value = await win.isMaximized();
 
+  // 缓存 discrete API 实例，避免每次事件都创建新的 DOM 挂载点
+  const { dialog } = createDiscreteApi(["dialog"], {
+    configProviderProps: {
+      theme: isDark.value ? darkTheme : lightTheme,
+      themeOverrides: themeOverrides.value,
+    },
+  });
+
   unlistenClose = await listen("close-requested", () => {
-    const { dialog } = createDiscreteApi(["dialog"], {
-      configProviderProps: {
-        theme: isDark.value ? darkTheme : lightTheme,
-        themeOverrides: themeOverrides.value,
-      },
-    });
     dialog.warning({
       title: "关闭确认",
       content: "您想要最小化到系统托盘，还是直接退出程序？",

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from "vue";
+import { ref, onMounted, onUnmounted, watch, inject } from "vue";
 import {
   NCard,
   NForm,
@@ -54,10 +54,14 @@ const presetColors = [
 // 加载中标记，避免初始化时触发自动保存
 const loading = ref(true);
 
+// 通过 inject 获取父组件提供的主题更新函数
+const updateAccentColor = inject<(color: string) => void>("updateAccentColor");
+const updateTheme = inject<(dark: boolean) => void>("updateTheme");
+
 // 主题色变化时实时预览并自动保存
 watch(() => settings.value.accent_color, (color) => {
-  if (color && (window as any).__updateAccentColor) {
-    (window as any).__updateAccentColor(color);
+  if (color && updateAccentColor) {
+    updateAccentColor(color);
   }
   if (!loading.value && color) {
     autoSaveThemeSettings();
@@ -66,8 +70,8 @@ watch(() => settings.value.accent_color, (color) => {
 
 // 主题切换时实时预览并自动保存
 watch(() => settings.value.theme, (theme) => {
-  if ((window as any).__updateTheme) {
-    (window as any).__updateTheme(theme !== "light");
+  if (updateTheme) {
+    updateTheme(theme !== "light");
   }
   if (!loading.value) {
     autoSaveThemeSettings();
@@ -186,6 +190,14 @@ async function handleImportData() {
 
 onMounted(loadSettings);
 
+// 组件卸载时清理定时器
+onUnmounted(() => {
+  if (autoSaveTimer) {
+    clearTimeout(autoSaveTimer);
+    autoSaveTimer = null;
+  }
+});
+
 async function handleExportSaves() {
   exportingSaves.value = true;
   try {
@@ -302,6 +314,8 @@ async function handleImportSaves() {
         <n-form-item label="SteamGridDB API Key">
           <n-input
             v-model:value="settings.steamgriddb_api_key"
+            type="password"
+            show-password-on="click"
             placeholder="可选，用于自动获取封面图"
           />
         </n-form-item>
@@ -339,6 +353,8 @@ async function handleImportSaves() {
         <n-form-item label="API Key">
           <n-input
             v-model:value="settings.llm_api_key"
+            type="password"
+            show-password-on="click"
             placeholder="输入 API Key"
           />
         </n-form-item>

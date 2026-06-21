@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use reqwest::Client;
 use crate::models::*;
@@ -14,20 +14,20 @@ pub struct CoverFetcher {
 }
 
 impl CoverFetcher {
-    pub fn new(cache_dir: PathBuf, steamgriddb_api_key: String) -> Self {
+    pub fn new(cache_dir: PathBuf, steamgriddb_api_key: String) -> Result<Self> {
         // 确保缓存目录存在
         std::fs::create_dir_all(&cache_dir).ok();
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(COVER_FETCH_TIMEOUT_SECS))
             .build()
-            .expect("无法创建 HTTP 客户端");
+            .context("无法创建 HTTP 客户端")?;
 
-        Self {
+        Ok(Self {
             cache_dir,
             steamgriddb_api_key,
             client,
-        }
+        })
     }
 
     /// 获取游戏封面（异步）

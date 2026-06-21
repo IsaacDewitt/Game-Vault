@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onActivated, onUnmounted, computed, watch } from "vue";
+import { lightenColor } from "../lib/color";
 import {
   NCard,
   NGrid,
@@ -435,15 +436,6 @@ function getBarGradient(gameId: string): string {
   return `linear-gradient(90deg, ${base}, ${lighter})`;
 }
 
-// 颜色工具：提亮
-function lightenColor(hex: string, percent: number): string {
-  const num = parseInt(hex.replace("#", ""), 16);
-  const r = Math.min(255, ((num >> 16) & 0xff) + Math.round(255 * percent / 100));
-  const g = Math.min(255, ((num >> 8) & 0xff) + Math.round(255 * percent / 100));
-  const b = Math.min(255, (num & 0xff) + Math.round(255 * percent / 100));
-  return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, "0")}`;
-}
-
 // 从封面图片提取主色调
 function extractDominantColor(imgSrc: string): Promise<string> {
   return new Promise((resolve) => {
@@ -777,7 +769,7 @@ async function loadStats() {
     overview.value = ov;
     playStats.value = ps;
     // 加载封面颜色（封面可能已缓存在 store 中）
-    loadGameColors(ps);
+    loadGameColors(ps).catch(() => {});
     dailyStats.value = ds;
     genreStats.value = gs;
     heatmapStats.value = hs;
@@ -796,12 +788,12 @@ onMounted(() => {
   window.addEventListener('resize', updateGridCols);
 });
 
-// 当 store 中的封面缓存更新时，补充提取颜色
-watch(() => gamesStore.coverBase64Cache, () => {
-  if (playStats.value.length > 0) {
-    loadGameColors(playStats.value);
+// 当 store 中的封面缓存更新时，补充提取颜色（使用 shallow watch 避免深层遍历）
+watch(() => Object.keys(gamesStore.coverBase64Cache).length, (newLen, oldLen) => {
+  if (newLen > (oldLen ?? 0) && playStats.value.length > 0) {
+    loadGameColors(playStats.value).catch(() => {});
   }
-}, { deep: true });
+});
 
 // keep-alive 缓存的组件再次激活时刷新数据
 onActivated(() => {

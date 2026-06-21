@@ -1,4 +1,4 @@
-import { computed, type Ref } from "vue";
+import { computed, ref, type Ref } from "vue";
 import type { Game } from "./tauri";
 import { useGamesStore } from "../stores/games";
 
@@ -9,8 +9,13 @@ import { useGamesStore } from "../stores/games";
 export function useCoverImage(game: Ref<Game>) {
   const store = useGamesStore();
 
+  // 标记图片渲染是否失败（base64 数据存在但无法渲染）
+  const renderFailed = ref(false);
+
   // 直接从 store 的 base64 缓存中获取封面
   const coverImage = computed(() => {
+    // 当 game.id 变化时重置渲染失败状态
+    renderFailed.value = false;
     return store.coverBase64Cache[game.value.id] || null;
   });
 
@@ -21,13 +26,19 @@ export function useCoverImage(game: Ref<Game>) {
   });
 
   function handleImageError() {
-    // 图片加载失败时的处理（base64 data URL 通常不会加载失败）
     console.warn("[CoverImage] 图片渲染失败:", game.value.name);
+    renderFailed.value = true;
   }
+
+  // 最终是否应该显示占位符（无封面 或 加载失败 或 渲染失败）
+  const showPlaceholder = computed(() => {
+    return !coverImage.value || imgFailed.value || renderFailed.value;
+  });
 
   return {
     coverImage,
     imgFailed,
+    showPlaceholder,
     handleImageError,
   };
 }

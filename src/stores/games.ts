@@ -126,14 +126,21 @@ export const useGamesStore = defineStore("games", () => {
       loadGamesLock = false;
     }
     // 后台刷新 exe 版本号（不阻塞 UI）
+    // 注意：不重新获取整个列表，避免覆盖用户在两次请求之间的操作
     api.refreshExeVersions().then(async (updated) => {
       if (updated > 0) {
-        // 有版本号变化，静默刷新游戏列表
+        // 仅更新有变化的游戏的 exe_version 字段，而非替换整个列表
         try {
-          games.value = await api.getGames({
+          const freshGames = await api.getGames({
             sort_by: "last_played",
             sort_order: "desc",
           });
+          for (const fresh of freshGames) {
+            const existing = games.value.find((g) => g.id === fresh.id);
+            if (existing && existing.exe_version !== fresh.exe_version) {
+              existing.exe_version = fresh.exe_version;
+            }
+          }
         } catch (_) {}
       }
     }).catch(() => {});

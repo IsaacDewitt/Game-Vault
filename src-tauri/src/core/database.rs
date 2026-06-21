@@ -93,27 +93,7 @@ impl Database {
 
     /// 迁移：添加 status 字段到旧数据库
     fn migrate_add_status_column(&self) -> Result<()> {
-        // 检查 status 列是否存在
-        let has_column: bool = {
-            let mut stmt = self.conn.prepare("PRAGMA table_info(games)")?;
-            let columns = stmt.query_map([], |row| {
-                Ok(row.get::<_, String>(1)?)
-            })?;
-
-            let mut found = false;
-            for col in columns {
-                match col {
-                    Ok(name) if name == "status" => {
-                        found = true;
-                        break;
-                    }
-                    _ => continue,
-                }
-            }
-            found
-        };
-
-        if !has_column {
+        if !self.has_column("games", "status")? {
             tracing::info!("status 字段不存在，正在添加...");
             self.conn.execute(
                 "ALTER TABLE games ADD COLUMN status TEXT DEFAULT 'unplayed'"
@@ -128,6 +108,23 @@ impl Database {
     }
 
     // ==================== 辅助函数 ====================
+
+    /// 检查表中是否存在指定列
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({})", table))?;
+        let columns = stmt.query_map([], |row| {
+            Ok(row.get::<_, String>(1)?)
+        })?;
+
+        for col in columns {
+            if let Ok(name) = col {
+                if name == column {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
 
     /// 从数据库行构建 Game 对象
     fn row_to_game(row: &rusqlite::Row) -> rusqlite::Result<Game> {
@@ -253,17 +250,15 @@ impl Database {
     /// 更新游戏封面 URL
     pub fn update_game_cover_url(&self, game_id: &str, cover_url: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE games SET cover_url = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![cover_url, game_id],
+            "UPDATE games SET cover_url = ?1, updated_at = ?2 WHERE id = ?3",
+            params![cover_url, chrono::Utc::now().to_rfc3339(), game_id],
         )?;
         Ok(())
     }
 
     /// 获取所有游戏
     pub fn get_games(&self, filter: &GameFilter) -> Result<Vec<Game>> {
-        let mut sql = String::from(
-            &format!("SELECT {} FROM games WHERE 1=1", Self::GAME_COLUMNS)
-        );
+        let mut sql = format!("SELECT {} FROM games WHERE 1=1", Self::GAME_COLUMNS);
 
         let mut bind_values: Vec<String> = Vec::new();
 
@@ -441,16 +436,23 @@ impl Database {
     /// 记录游戏会话（使用事务保证原子性）
     pub fn add_play_session(&self, game_id: &str, start_time: &str, duration_seconds: u64) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // 从 start_time + duration_seconds 计算真实的结束时间
+        let end_time = chrono::DateTime::parse_from_rfc3339(start_time)
+            .ok()
+            .map(|start| (start + chrono::Duration::seconds(duration_seconds as i64)).to_rfc3339())
+            .unwrap_or_else(|| now.clone());
 
         tx.execute(
             "INSERT INTO play_sessions (game_id, start_time, end_time, duration_seconds) VALUES (?1, ?2, ?3, ?4)",
-            params![game_id, start_time, chrono::Utc::now().to_rfc3339(), duration_seconds as i64],
+            params![game_id, start_time, end_time, duration_seconds as i64],
         )?;
 
         // 更新游戏总时长和启动次数
         tx.execute(
             "UPDATE games SET play_time_seconds = play_time_seconds + ?1, play_count = play_count + 1, last_played = ?2, updated_at = ?2 WHERE id = ?3",
-            params![duration_seconds as i64, chrono::Utc::now().to_rfc3339(), game_id],
+            params![duration_seconds as i64, now, game_id],
         )?;
 
         tx.commit()?;
@@ -746,26 +748,7 @@ impl Database {
         ];
 
         for (col_name, col_type) in &columns_to_add {
-            let has_column: bool = {
-                let mut stmt = self.conn.prepare("PRAGMA table_info(games)")?;
-                let columns = stmt.query_map([], |row| {
-                    Ok(row.get::<_, String>(1)?)
-                })?;
-
-                let mut found = false;
-                for col in columns {
-                    match col {
-                        Ok(name) if name == *col_name => {
-                            found = true;
-                            break;
-                        }
-                        _ => continue,
-                    }
-                }
-                found
-            };
-
-            if !has_column {
+            if !self.has_column("games", col_name)? {
                 tracing::info!("{} 字段不存在，正在添加...", col_name);
                 self.conn.execute(
                     &format!("ALTER TABLE games ADD COLUMN {} {}", col_name, col_type),
@@ -780,26 +763,7 @@ impl Database {
 
     /// 迁移：添加 save_paths 字段到旧数据库
     fn migrate_add_save_paths_column(&self) -> Result<()> {
-        let has_column: bool = {
-            let mut stmt = self.conn.prepare("PRAGMA table_info(games)")?;
-            let columns = stmt.query_map([], |row| {
-                Ok(row.get::<_, String>(1)?)
-            })?;
-
-            let mut found = false;
-            for col in columns {
-                match col {
-                    Ok(name) if name == "save_paths" => {
-                        found = true;
-                        break;
-                    }
-                    _ => continue,
-                }
-            }
-            found
-        };
-
-        if !has_column {
+        if !self.has_column("games", "save_paths")? {
             tracing::info!("save_paths 字段不存在，正在添加...");
             self.conn.execute(
                 "ALTER TABLE games ADD COLUMN save_paths TEXT DEFAULT '[]'",
@@ -813,26 +777,7 @@ impl Database {
 
     /// 迁移：添加 exe_version 字段到旧数据库
     fn migrate_add_exe_version_column(&self) -> Result<()> {
-        let has_column: bool = {
-            let mut stmt = self.conn.prepare("PRAGMA table_info(games)")?;
-            let columns = stmt.query_map([], |row| {
-                Ok(row.get::<_, String>(1)?)
-            })?;
-
-            let mut found = false;
-            for col in columns {
-                match col {
-                    Ok(name) if name == "exe_version" => {
-                        found = true;
-                        break;
-                    }
-                    _ => continue,
-                }
-            }
-            found
-        };
-
-        if !has_column {
+        if !self.has_column("games", "exe_version")? {
             tracing::info!("exe_version 字段不存在，正在添加...");
             self.conn.execute(
                 "ALTER TABLE games ADD COLUMN exe_version TEXT",

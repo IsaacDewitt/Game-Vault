@@ -351,7 +351,7 @@ function handleDeleteGame(gameId: string) {
               loading="lazy"
             />
             <div v-else class="recent-cover-placeholder">{{ game.name.charAt(0) }}</div>
-            <button class="recent-launch" @click.stop="store.launch(game.id)" title="启动">▶</button>
+            <button class="recent-launch" @click.stop="store.launch(game.id).catch(() => {})" title="启动">▶</button>
           </div>
           <div class="recent-info">
             <div class="recent-name">{{ game.name }}</div>
@@ -478,7 +478,7 @@ function handleDeleteGame(gameId: string) {
           :game="game"
           :is-active="store.activeGames.includes(game.id)"
           @click="store.selectGame(game)"
-          @launch="store.launch(game.id)"
+          @launch="store.launch(game.id).catch(() => {})"
           @favorite="store.toggleFav(game.id)"
           @delete="handleDeleteGame(game.id)"
           @rename="handleRenameGame(game.id)"
@@ -495,7 +495,7 @@ function handleDeleteGame(gameId: string) {
       :game="store.selectedGame"
       :is-active="store.activeGames.includes(store.selectedGame.id)"
       @close="store.clearSelection()"
-      @launch="store.launch(store.selectedGame!.id)"
+      @launch="store.launch(store.selectedGame!.id).catch(() => {})"
       @favorite="store.toggleFav(store.selectedGame!.id)"
       @delete="handleDeleteGame(store.selectedGame!.id)"
       @set-status="handleSetGameStatus(store.selectedGame!.id, $event)"

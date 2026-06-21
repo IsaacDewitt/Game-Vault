@@ -1,15 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// 游戏会话记录
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlaySession {
-    pub id: i64,
-    pub game_id: String,
-    pub start_time: String,
-    pub end_time: Option<String>,
-    pub duration_seconds: u64,
-}
-
 /// 游戏会话详情（联表查询，含游戏名）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaySessionDetail {
