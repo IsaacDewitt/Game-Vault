@@ -2,11 +2,13 @@
 import { ref, computed, onMounted, onUnmounted, defineAsyncComponent, h, type Component, watch } from "vue";
 import { darkTheme, lightTheme, NConfigProvider, NLayout, NLayoutSider, NLayoutContent, NMenu, NIcon, NMessageProvider, NDialogProvider, createDiscreteApi } from "naive-ui";
 import type { MenuOption } from "naive-ui";
-import { HomeOutline, StatsChartOutline, SettingsOutline, GameControllerOutline } from "@vicons/ionicons5";
+import { HomeOutline, StatsChartOutline, SettingsOutline, GameControllerOutline, EllipsisVertical, SquareOutline, CopyOutline, RemoveOutline, CloseOutline } from "@vicons/ionicons5";
 import HomeView from "./views/HomeView.vue";
+import AboutModal from "./components/AboutModal.vue";
 import { useGamesStore } from "./stores/games";
 import * as api from "./lib/tauri";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { DEFAULT_ACCENT_COLOR } from "./lib/constants";
 
@@ -21,6 +23,9 @@ const collapsed = ref(false);
 // 主题状态
 const accentColor = ref(DEFAULT_ACCENT_COLOR);
 const isDark = ref(true);
+const isMaximized = ref(false);
+const appVersion = ref("0.0.0");
+const showAbout = ref(false);
 
 // 视图组件映射，配合 keep-alive 和 component :is 使用
 const viewComponents: Record<string, Component> = {
@@ -76,6 +81,7 @@ function updateAccentColor(color: string) {
 
 function updateTheme(dark: boolean) {
   isDark.value = dark;
+  document.documentElement.classList.toggle("light-theme", !dark);
 }
 
 // 提供给子组件
@@ -104,6 +110,27 @@ function handleMenuUpdate(key: string) {
   activeView.value = key;
 }
 
+// 标题栏拖拽
+async function handleTitleBarDrag(e: MouseEvent) {
+  // 只响应左键
+  if (e.button !== 0) return;
+  await getCurrentWindow().startDragging();
+}
+
+// 窗口控制
+async function handleMinimize() {
+  await getCurrentWindow().minimize();
+}
+
+async function handleToggleMaximize() {
+  await getCurrentWindow().toggleMaximize();
+  isMaximized.value = await getCurrentWindow().isMaximized();
+}
+
+async function handleClose() {
+  await getCurrentWindow().close();
+}
+
 // 监听主题变化，更新 CSS 变量
 watch([accentColor, isDark], () => {
   document.documentElement.style.setProperty("--accent-color", accentColor.value);
@@ -118,6 +145,17 @@ onMounted(async () => {
   await gamesStore.loadGames();
   await loadThemeSettings();
   document.documentElement.style.setProperty("--accent-color", accentColor.value);
+
+  // 获取应用版本号
+  try {
+    appVersion.value = await getVersion();
+  } catch (e) {
+    console.error("获取版本号失败:", e);
+  }
+
+  // 监听最大化状态变化
+  const win = getCurrentWindow();
+  isMaximized.value = await win.isMaximized();
 
   unlistenClose = await listen("close-requested", () => {
     const { dialog } = createDiscreteApi(["dialog"], {
@@ -153,45 +191,77 @@ onUnmounted(() => {
   <n-message-provider>
     <n-dialog-provider>
     <n-config-provider :theme="isDark ? darkTheme : lightTheme" :theme-overrides="themeOverrides">
-      <n-layout has-sider style="height: 100vh" @contextmenu.prevent>
-        <!-- 侧边栏 -->
-        <n-layout-sider
-          bordered
-          :collapsed="collapsed"
-          :collapsed-width="64"
-          :width="200"
-          collapse-mode="width"
-          show-trigger
-          @collapse="collapsed = true"
-          @expand="collapsed = false"
-          :native-scrollbar="false"
-          style="height: 100vh"
-        >
-          <div class="logo" :class="{ collapsed }">
-            <n-icon size="28" :color="accentColor">
+      <div class="app-container">
+        <!-- 自定义标题栏 -->
+        <div class="title-bar" @mousedown="handleTitleBarDrag">
+          <div class="title-bar-left">
+            <n-icon size="16" :color="accentColor">
               <GameControllerOutline />
             </n-icon>
-            <span v-if="!collapsed" class="logo-text" :style="{ color: accentColor }">Game Vault</span>
+            <span class="title-bar-text">Game Vault</span>
           </div>
-          <n-menu
+          <div class="title-bar-controls">
+            <button class="about-btn" @mousedown.stop @click="showAbout = true" title="关于">
+              <n-icon size="16"><EllipsisVertical /></n-icon>
+            </button>
+            <button class="title-btn" @mousedown.stop @click="handleMinimize" title="最小化">
+              <n-icon size="16"><RemoveOutline /></n-icon>
+            </button>
+            <button class="title-btn" @mousedown.stop @click="handleToggleMaximize" title="最大化">
+              <n-icon size="14">
+                <CopyOutline v-if="isMaximized" />
+                <SquareOutline v-else />
+              </n-icon>
+            </button>
+            <button class="title-btn title-btn-close" @mousedown.stop @click="handleClose" title="关闭">
+              <n-icon size="16"><CloseOutline /></n-icon>
+            </button>
+          </div>
+        </div>
+
+        <!-- 主布局 -->
+        <n-layout has-sider style="flex: 1; overflow: hidden" @contextmenu.prevent>
+          <!-- 侧边栏 -->
+          <n-layout-sider
+            bordered
             :collapsed="collapsed"
             :collapsed-width="64"
-            :collapsed-icon-size="22"
-            :options="menuOptions"
-            :value="activeView"
-            @update:value="handleMenuUpdate"
-          />
-        </n-layout-sider>
+            :width="200"
+            collapse-mode="width"
+            show-trigger
+            @collapse="collapsed = true"
+            @expand="collapsed = false"
+            :native-scrollbar="false"
+          >
+            <div class="logo" :class="{ collapsed }">
+              <n-icon size="28" :color="accentColor">
+                <GameControllerOutline />
+              </n-icon>
+              <span v-if="!collapsed" class="logo-text" :style="{ color: accentColor }">Game Vault</span>
+            </div>
+            <n-menu
+              :collapsed="collapsed"
+              :collapsed-width="64"
+              :collapsed-icon-size="22"
+              :options="menuOptions"
+              :value="activeView"
+              @update:value="handleMenuUpdate"
+            />
+          </n-layout-sider>
 
-        <!-- 主内容区 -->
-        <n-layout-content :native-scrollbar="false" class="main-layout-content" style="height: 100vh">
-          <div class="main-content">
-            <keep-alive>
-              <component :is="currentComponent" />
-            </keep-alive>
-          </div>
-        </n-layout-content>
-      </n-layout>
+          <!-- 主内容区 -->
+          <n-layout-content :native-scrollbar="false" class="main-layout-content">
+            <div class="main-content">
+              <keep-alive>
+                <component :is="currentComponent" />
+              </keep-alive>
+            </div>
+          </n-layout-content>
+        </n-layout>
+      </div>
+
+      <!-- 关于对话框 -->
+      <AboutModal :show="showAbout" :version="appVersion" @close="showAbout = false" />
     </n-config-provider>
     </n-dialog-provider>
   </n-message-provider>
@@ -223,7 +293,7 @@ body {
 
 .main-content {
   padding: 24px;
-  min-height: 100vh;
+  min-height: 100%;
   background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
   transition: background 0.3s;
 }
@@ -248,6 +318,119 @@ body {
 
 .light-theme .main-content {
   background: linear-gradient(135deg, #f5f5f5 0%, #e8e8e8 100%) !important;
+}
+
+.app-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.title-bar {
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px 0 12px;
+  background: #16213e;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+  user-select: none;
+  cursor: default;
+}
+
+.light-theme .title-bar {
+  background: #f0f0f0;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.title-bar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.title-bar-text {
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.light-theme .title-bar-text {
+  color: rgba(0, 0, 0, 0.7);
+}
+
+.title-bar-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.about-btn {
+  width: 32px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background 0.15s, color 0.15s;
+}
+
+.about-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.light-theme .about-btn {
+  color: rgba(0, 0, 0, 0.6);
+}
+
+.light-theme .about-btn:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: rgba(0, 0, 0, 0.9);
+}
+
+.title-btn {
+  width: 36px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.7);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background 0.15s, color 0.15s;
+}
+
+.title-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.light-theme .title-btn {
+  color: rgba(0, 0, 0, 0.7);
+}
+
+.light-theme .title-btn:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: #000;
+}
+
+.title-btn-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+.light-theme .title-btn-close:hover {
+  background: #e81123;
+  color: #fff;
 }
 
 .logo {
