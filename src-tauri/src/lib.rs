@@ -8,9 +8,14 @@ use tauri::{Emitter, Manager};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButtonState, MouseButton};
 use tauri::menu::{Menu, MenuItem};
 
-/// 退出应用程序
+/// 退出应用程序（优雅关闭后台线程）
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
+    // 通知后台监控线程退出
+    {
+        let running = app.state::<Arc<AtomicBool>>();
+        running.store(false, Ordering::Relaxed);
+    }
     app.exit(0);
 }
 
@@ -54,12 +59,15 @@ pub fn run() {
             let running = Arc::new(AtomicBool::new(true));
             let running_clone = running.clone();
 
+            // 预先克隆 Arc 引用，避免线程内每 10 秒查找一次 state
+            let tracker_arc: Arc<Mutex<core::PlayTimeTracker>> = app.state::<Arc<Mutex<core::PlayTimeTracker>>>().inner().clone();
+            let db_arc: Arc<Mutex<core::Database>> = app.state::<Arc<Mutex<core::Database>>>().inner().clone();
+
             std::thread::spawn(move || {
                 while running_clone.load(Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    std::thread::sleep(std::time::Duration::from_secs(utils::constants::PROCESS_POLL_INTERVAL_SECS));
 
-                    let tracker_arc = app_handle.state::<Arc<Mutex<core::PlayTimeTracker>>>().inner().clone();
-                    let db_arc = app_handle.state::<Arc<Mutex<core::Database>>>().inner().clone();
+                    // 使用预克隆的 Arc 引用，不再每轮查找 state
 
                     // 阶段 1：检查活跃会话，收集已结束的会话数据，然后释放 Tracker 锁
                     let (finished, active) = {
@@ -117,6 +125,11 @@ pub fn run() {
                             }
                         }
                         "quit" => {
+                            // 通知后台监控线程退出
+                            {
+                                let running = app.state::<Arc<AtomicBool>>();
+                                running.store(false, Ordering::Relaxed);
+                            }
                             app.exit(0);
                         }
                         _ => {}

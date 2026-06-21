@@ -17,6 +17,7 @@ import { save, open } from "@tauri-apps/plugin-dialog";
 import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
 import * as api from "../lib/tauri";
 import type { Settings } from "../lib/tauri";
+import { DEFAULT_ACCENT_COLOR, DEBOUNCE_MS } from "../lib/constants";
 
 const message = useMessage();
 
@@ -30,7 +31,7 @@ const settings = ref<Settings>({
   llm_base_url: "",
   llm_model: "",
   llm_enabled: false,
-  accent_color: "#6366f1",
+  accent_color: DEFAULT_ACCENT_COLOR,
 });
 
 const protocolOptions = [
@@ -83,7 +84,7 @@ function autoSaveThemeSettings() {
     } catch (e) {
       console.error("自动保存外观设置失败:", e);
     }
-  }, 300);
+  }, DEBOUNCE_MS);
 }
 
 const saving = ref(false);
@@ -286,7 +287,7 @@ async function handleImportSaves() {
             />
             <n-input
               v-model:value="settings.accent_color"
-              placeholder="#6366f1"
+              :placeholder="DEFAULT_ACCENT_COLOR"
               style="width: 120px"
               size="small"
             />

@@ -127,24 +127,28 @@ impl PlayTimeTracker {
     }
 
     /// 持久化已结束的会话到数据库（在 Tracker 锁释放后调用）
+    /// 一次性获取锁并批量插入，避免逐条获取/释放锁的开销
     pub fn persist_finished_sessions(
         db: &Arc<Mutex<Database>>,
         sessions: &[FinishedSession],
     ) {
+        if sessions.is_empty() {
+            return;
+        }
+        let db = db.lock().unwrap_or_else(|e| e.into_inner());
         for session in sessions {
-            let db = db.lock().unwrap_or_else(|e| e.into_inner());
-                match db.add_play_session(
-                    &session.game_id,
-                    &session.start_time,
-                    session.duration_seconds,
-                ) {
-                    Ok(_) => {
-                        tracing::info!("已保存游戏会话: {}", session.game_id);
-                    }
-                    Err(e) => {
-                        tracing::error!("保存游戏会话失败: {}", e);
-                    }
+            match db.add_play_session(
+                &session.game_id,
+                &session.start_time,
+                session.duration_seconds,
+            ) {
+                Ok(_) => {
+                    tracing::info!("已保存游戏会话: {}", session.game_id);
                 }
+                Err(e) => {
+                    tracing::error!("保存游戏会话失败: {}", e);
+                }
+            }
         }
     }
 }

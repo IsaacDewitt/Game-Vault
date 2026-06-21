@@ -92,7 +92,10 @@ export const useGamesStore = defineStore("games", () => {
   });
 
   // 方法
+  let loadGamesLock = false;
   async function loadGames() {
+    if (loadGamesLock) return;
+    loadGamesLock = true;
     loading.value = true;
     try {
       games.value = await api.getGames({
@@ -105,6 +108,7 @@ export const useGamesStore = defineStore("games", () => {
       console.error("加载游戏列表失败:", e);
     } finally {
       loading.value = false;
+      loadGamesLock = false;
     }
     // 后台刷新 exe 版本号（不阻塞 UI）
     api.refreshExeVersions().then(async (updated) => {
@@ -167,7 +171,7 @@ export const useGamesStore = defineStore("games", () => {
     try {
       await api.addGameManual(name, exePath);
       await loadGames();
-      fetchCovers();
+      fetchCovers().catch(() => {});
     } catch (e) {
       console.error("添加游戏失败:", e);
       throw e;

@@ -7,6 +7,7 @@ use crate::core::llm_fetcher::{self, LlmConfig, LlmProtocol};
 use crate::models::*;
 use crate::models::settings::Settings;
 use crate::utils;
+use crate::utils::constants::COVER_MIN_FILE_SIZE;
 use super::lock_or_recover;
 
 /// 获取游戏列表
@@ -244,7 +245,7 @@ pub fn get_all_covers(
             let path = std::path::Path::new(path_str);
             if path.exists() {
                 if let Ok(metadata) = std::fs::metadata(path) {
-                    if metadata.len() >= 100 {
+                    if metadata.len() >= COVER_MIN_FILE_SIZE {
                         covers.insert(game.id.clone(), path_str.clone());
                     }
                 }
@@ -280,7 +281,7 @@ pub async fn fetch_missing_covers(
                         return true;
                     }
                     if let Ok(metadata) = std::fs::metadata(path) {
-                        if metadata.len() < 100 {
+                        if metadata.len() < COVER_MIN_FILE_SIZE {
                             return true;
                         }
                     }
@@ -292,7 +293,7 @@ pub async fn fetch_missing_covers(
                         return true;
                     }
                     if let Ok(metadata) = std::fs::metadata(path) {
-                        if metadata.len() < 100 {
+                        if metadata.len() < COVER_MIN_FILE_SIZE {
                             return true;
                         }
                     }
@@ -472,6 +473,17 @@ pub async fn fetch_game_info_llm(
     Ok(updated)
 }
 
+/// 根据文件扩展名检测图片 MIME 类型
+fn detect_image_mime(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        _ => "image/jpeg", // 默认 jpeg（包括 .jpg）
+    }
+}
+
 /// 读取本地图片文件并返回 base64 data URL（绕过 asset protocol）
 /// 仅允许读取 covers 目录下的文件，防止路径遍历攻击
 #[tauri::command]
@@ -493,7 +505,8 @@ pub fn read_cover_as_base64(path: String) -> Result<String, String> {
 
     let bytes = std::fs::read(&canonical_file).map_err(|e| format!("读取文件失败: {}", e))?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(format!("data:image/jpeg;base64,{}", b64))
+    let mime = detect_image_mime(&canonical_file);
+    Ok(format!("data:{};base64,{}", mime, b64))
 }
 
 /// 重命名游戏
@@ -686,7 +699,8 @@ pub fn read_covers_batch_as_base64(paths: Vec<String>) -> Result<std::collection
 
         if let Ok(bytes) = std::fs::read(&canonical_file) {
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            result.insert(path, format!("data:image/jpeg;base64,{}", b64));
+            let mime = detect_image_mime(&canonical_file);
+            result.insert(path, format!("data:{};base64,{}", mime, b64));
         }
     }
 
@@ -854,10 +868,9 @@ pub async fn export_saves_backup(
     }))
 }
 
-/// 从 ZIP 备份文件导入存档
+/// 从 ZIP 备份文件导入存档（不需要数据库锁，仅做文件 I/O）
 #[tauri::command]
 pub async fn import_saves_backup(
-    _db: State<'_, Arc<Mutex<Database>>>,
     zip_path: String,
 ) -> Result<serde_json::Value, String> {
     let file = std::fs::File::open(&zip_path)
@@ -877,11 +890,10 @@ pub async fn import_saves_backup(
             .map_err(|e| format!("解析 manifest.json 失败: {}", e))?
     };
 
-    let mut restored_count = 0u32;
-    let mut errors: Vec<String> = Vec::new();
-
+    // 预处理：构建每个 manifest 条目对应的目标路径映射
+    // 一次性收集所有需要解压的 ZIP 条目 -> 目标路径的映射
+    let mut extract_plan: Vec<(String, std::path::PathBuf)> = Vec::new();
     for entry in &manifest {
-        let game_id = entry["game_id"].as_str().unwrap_or("");
         let original_path = entry["original_path"].as_str().unwrap_or("");
         let zip_prefix = entry["zip_prefix"].as_str().unwrap_or("");
 
@@ -895,56 +907,88 @@ pub async fn import_saves_backup(
         // 创建目标目录
         if let Some(parent) = target_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                errors.push(format!("创建目录失败 {}: {}", parent.display(), e));
+                tracing::warn!("创建目录失败 {}: {}", parent.display(), e);
                 continue;
             }
         }
 
-        // 从 ZIP 中提取文件到目标路径
-        // 需要重新打开 archive（因为 by_name 会移动所有权）
-        let file = std::fs::File::open(&zip_path)
-            .map_err(|e| format!("重新打开 ZIP 失败: {}", e))?;
-        let buf_reader = std::io::BufReader::new(file);
-        let mut archive2 = zip::ZipArchive::new(buf_reader)
-            .map_err(|e| format!("重新读取 ZIP 失败: {}", e))?;
-
-        // 获取 ZIP 中该前缀下的所有文件
-        let file_names: Vec<String> = archive2.file_names()
+        // 收集该前缀下的所有 ZIP 条目及其目标路径
+        let prefix_with_slash = format!("{}/", zip_prefix);
+        let file_names: Vec<String> = archive.file_names()
             .filter(|name| name.starts_with(zip_prefix))
             .map(|s| s.to_string())
             .collect();
 
         for file_name in file_names {
-            let mut zip_file = archive2.by_name(&file_name)
-                .map_err(|e| format!("读取 ZIP 条目失败 {}: {}", file_name, e))?;
-
-            // 计算目标文件路径
-            let relative = file_name.strip_prefix(&format!("{}/", zip_prefix))
+            let relative = file_name.strip_prefix(&prefix_with_slash)
                 .unwrap_or(&file_name);
+
+            // 安全检查：防止 ZIP 路径穿越攻击（如 prefix/../../etc/important_file）
+            let has_parent_traversal = std::path::Path::new(relative)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+            if has_parent_traversal {
+                tracing::warn!("跳过包含路径遍历的 ZIP 条目: {}", file_name);
+                continue;
+            }
+
             let dest = if relative.is_empty() {
-                // zip_prefix 本身就是一个文件
                 target_path.clone()
             } else {
                 target_path.join(relative)
             };
+            extract_plan.push((file_name, dest));
+        }
+    }
 
-            if zip_file.is_dir() {
-                std::fs::create_dir_all(&dest)
-                    .map_err(|e| format!("创建目录失败: {}", e))?;
-            } else {
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("创建目录失败: {}", e))?;
+    // 一次性遍历计划，逐个从 archive 中提取（archive 只打开一次）
+    let mut errors: Vec<String> = Vec::new();
+
+    for (file_name, dest) in extract_plan {
+        let mut zip_file = match archive.by_name(&file_name) {
+            Ok(f) => f,
+            Err(e) => {
+                errors.push(format!("读取 ZIP 条目失败 {}: {}", file_name, e));
+                continue;
+            }
+        };
+
+        if zip_file.is_dir() {
+            if let Err(e) = std::fs::create_dir_all(&dest) {
+                errors.push(format!("创建目录失败: {}", e));
+            }
+        } else {
+            if let Some(parent) = dest.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    errors.push(format!("创建目录失败: {}", e));
+                    continue;
                 }
-                let mut dest_file = std::fs::File::create(&dest)
-                    .map_err(|e| format!("创建文件失败 {}: {}", dest.display(), e))?;
-                std::io::copy(&mut zip_file, &mut dest_file)
-                    .map_err(|e| format!("写入文件失败 {}: {}", dest.display(), e))?;
+            }
+            let mut dest_file = match std::fs::File::create(&dest) {
+                Ok(f) => f,
+                Err(e) => {
+                    errors.push(format!("创建文件失败 {}: {}", dest.display(), e));
+                    continue;
+                }
+            };
+            if let Err(e) = std::io::copy(&mut zip_file, &mut dest_file) {
+                errors.push(format!("写入文件失败 {}: {}", dest.display(), e));
             }
         }
+    }
 
-        restored_count += 1;
-        tracing::info!("已恢复存档: {} -> {}", game_id, expanded);
+    // 恢复计数 = manifest 中有效条目数
+    let restored_count = manifest.iter().filter(|e| {
+        !e["original_path"].as_str().unwrap_or("").is_empty()
+        && !e["zip_prefix"].as_str().unwrap_or("").is_empty()
+    }).count() as u32;
+
+    for entry in &manifest {
+        let game_id = entry["game_id"].as_str().unwrap_or("");
+        let original_path = entry["original_path"].as_str().unwrap_or("");
+        if !original_path.is_empty() {
+            tracing::info!("已恢复存档: {} -> {}", game_id, utils::path::expand_env_vars(original_path));
+        }
     }
 
     Ok(serde_json::json!({

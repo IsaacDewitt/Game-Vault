@@ -8,6 +8,7 @@ import { useGamesStore } from "./stores/games";
 import * as api from "./lib/tauri";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import { DEFAULT_ACCENT_COLOR } from "./lib/constants";
 
 // 懒加载非首屏视图，减少初始包体积（ECharts ~800KB 只在访问统计页时加载）
 const StatsView = defineAsyncComponent(() => import("./views/StatsView.vue"));
@@ -18,7 +19,7 @@ const activeView = ref("home");
 const collapsed = ref(false);
 
 // 主题状态
-const accentColor = ref("#6366f1");
+const accentColor = ref(DEFAULT_ACCENT_COLOR);
 const isDark = ref(true);
 
 // 视图组件映射，配合 keep-alive 和 component :is 使用
@@ -61,7 +62,7 @@ function darkenColor(hex: string, percent: number): string {
 async function loadThemeSettings() {
   try {
     const settings = await api.getSettings();
-    accentColor.value = settings.accent_color || "#6366f1";
+    accentColor.value = settings.accent_color || DEFAULT_ACCENT_COLOR;
     isDark.value = settings.theme !== "light";
   } catch (e) {
     console.error("加载主题设置失败:", e);

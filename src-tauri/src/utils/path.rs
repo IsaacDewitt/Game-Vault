@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use super::constants::EXE_VERSION_READ_LIMIT;
 
 /// 获取应用数据目录
 pub fn get_app_data_dir() -> PathBuf {
@@ -65,8 +66,13 @@ pub fn expand_env_vars(path: &str) -> String {
 
 /// 从 Windows PE 文件中读取 FileVersion 版本号
 /// 返回值如 "1.2.3.4" 或 None（非 PE 文件或无版本信息）
+/// 只读取前 1MB，避免将整个 EXE（可能数百 MB）加载到内存
 pub fn read_exe_version(path: &str) -> Option<String> {
-    let data = std::fs::read(path).ok()?;
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut data = Vec::with_capacity(EXE_VERSION_READ_LIMIT as usize);
+    let mut limited = file.take(EXE_VERSION_READ_LIMIT);
+    limited.read_to_end(&mut data).ok()?;
 
     if data.len() < 64 || &data[0..2] != b"MZ" {
         return None;

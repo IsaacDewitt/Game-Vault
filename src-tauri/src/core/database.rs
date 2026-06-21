@@ -12,6 +12,8 @@ impl Database {
     /// 创建新的数据库连接
     pub fn new(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)?;
+        // 启用外键约束，确保 ON DELETE CASCADE 等规则生效
+        conn.execute("PRAGMA foreign_keys = ON", [])?;
         let db = Self { conn };
         db.init_tables()?;
         Ok(db)

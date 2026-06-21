@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use reqwest::Client;
 use crate::models::*;
+use crate::utils::constants::*;
 
 /// 封面图获取器（异步版本）
 pub struct CoverFetcher {
@@ -17,7 +18,7 @@ impl CoverFetcher {
         std::fs::create_dir_all(&cache_dir).ok();
 
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(COVER_FETCH_TIMEOUT_SECS))
             .build()
             .expect("无法创建 HTTP 客户端");
 
@@ -35,7 +36,7 @@ impl CoverFetcher {
         if cache_path.exists() {
             // 检查文件大小，如果小于 100 字节，认为是无效的缓存文件
             if let Ok(metadata) = std::fs::metadata(&cache_path) {
-                if metadata.len() >= 100 {
+                if metadata.len() >= COVER_MIN_FILE_SIZE {
                     return Ok(Some(cache_path.to_string_lossy().to_string()));
                 }
                 // 文件太小，可能是损坏的，删除它继续获取
@@ -215,7 +216,7 @@ impl CoverFetcher {
         let bytes = response.bytes().await?;
 
         // 检查下载的内容是否有效（至少 100 字节）
-        if bytes.len() < 100 {
+        if (bytes.len() as u64) < COVER_MIN_FILE_SIZE {
             anyhow::bail!("下载失败: 响应内容太小({} bytes)", bytes.len());
         }
 
@@ -225,7 +226,7 @@ impl CoverFetcher {
 
         // 验证临时文件大小
         let metadata = std::fs::metadata(&temp_path)?;
-        if metadata.len() < 100 {
+        if metadata.len() < COVER_MIN_FILE_SIZE {
             let _ = std::fs::remove_file(&temp_path);
             anyhow::bail!("下载失败: 写入后文件太小({} bytes)", metadata.len());
         }

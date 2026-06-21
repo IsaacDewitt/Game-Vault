@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use reqwest::Client;
 use crate::models::settings::{DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL};
+use crate::utils::constants::*;
 
 /// LLM 协议类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -113,7 +114,7 @@ fn build_user_prompt(game_name: &str) -> String {
 /// 执行网络搜索（使用 DuckDuckGo Instant Answer API）
 async fn execute_web_search(query: &str) -> Result<String> {
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(WEB_SEARCH_TIMEOUT_SECS))
         .build()
         .context("创建搜索 HTTP 客户端失败")?;
 
@@ -188,7 +189,7 @@ async fn handle_openai_tool_calls(
     ]);
 
     let mut current_response = initial_response;
-    let max_iterations = 5; // 防止无限循环
+    let max_iterations = LLM_MAX_TOOL_ITERATIONS;
 
     for _ in 0..max_iterations {
         let message = &current_response["choices"][0]["message"];
@@ -208,7 +209,7 @@ async fn handle_openai_tool_calls(
                     let arguments: serde_json::Value =
                         serde_json::from_str(arguments_str).unwrap_or(serde_json::json!({}));
 
-                    tracing::info!("执行工具调用: {}({})", function_name, arguments);
+                    tracing::debug!("执行工具调用: {}({})", function_name, arguments);
 
                     // 执行搜索
                     let result = if function_name == "web_search" {
@@ -220,7 +221,7 @@ async fn handle_openai_tool_calls(
                         format!("未知工具: {}", function_name)
                     };
 
-                    tracing::info!("工具结果: {}", result);
+                    tracing::debug!("工具结果: {}", result);
 
                     // 添加工具结果到 messages
                     messages.as_array_mut().unwrap().push(serde_json::json!({
@@ -234,7 +235,7 @@ async fn handle_openai_tool_calls(
                 let body = serde_json::json!({
                     "model": config.model,
                     "messages": messages,
-                    "max_completion_tokens": 1024,
+                    "max_completion_tokens": LLM_MAX_TOKENS,
                     "temperature": 0.3,
                     "stream": false,
                     "tools": [
@@ -338,8 +339,8 @@ fn extract_json(text: &str) -> Result<LlmGameMeta> {
     }
 
     tracing::error!("所有 JSON 提取策略均失败，原始文本:\n{}", text);
-    // 截取前 500 字符附在错误信息中，方便前端直接查看
-    let preview = if text.len() > 500 { &text[..500] } else { text };
+    // 截取前 500 个字符（而非字节）附在错误信息中，避免多字节 UTF-8 截断 panic
+    let preview: String = text.chars().take(500).collect();
     anyhow::bail!("无法解析 LLM 返回的游戏信息。原始响应:\n{}", preview)
 }
 
@@ -379,7 +380,7 @@ pub async fn fetch_game_meta(config: &LlmConfig, game_name: &str) -> Result<LlmG
     }
 
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(120))  // 工具调用循环可能需要更长时间
+        .timeout(std::time::Duration::from_secs(LLM_REQUEST_TIMEOUT_SECS))
         .build()
         .context("创建 HTTP 客户端失败")?;
 
@@ -392,7 +393,7 @@ pub async fn fetch_game_meta(config: &LlmConfig, game_name: &str) -> Result<LlmG
         LlmProtocol::Anthropic => build_anthropic_request(config, &system_prompt, &user_prompt),
     };
 
-    tracing::info!("LLM 请求 URL: {}, 体: {}", config.base_url, body);
+    tracing::debug!("LLM 请求 URL: {}, 体: {}", config.base_url, body);
 
     // 构建 URL 和 headers
     let url = match config.protocol {
@@ -434,7 +435,7 @@ pub async fn fetch_game_meta(config: &LlmConfig, game_name: &str) -> Result<LlmG
 
     let resp_json: serde_json::Value = resp.json().await.context("解析 LLM 响应失败")?;
 
-    tracing::info!("LLM 原始响应: {}", resp_json);
+    tracing::debug!("LLM 原始响应: {}", resp_json);
 
     // 根据协议提取文本内容
     let text = match config.protocol {
@@ -462,7 +463,7 @@ pub async fn fetch_game_meta(config: &LlmConfig, game_name: &str) -> Result<LlmG
         }
     };
 
-    tracing::info!("LLM 响应文本: {}", text);
+    tracing::debug!("LLM 响应文本: {}", text);
 
     extract_json(&text)
 }
@@ -479,7 +480,7 @@ fn build_openai_request(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        "max_completion_tokens": 1024,
+        "max_completion_tokens": LLM_MAX_TOKENS,
         "temperature": 0.3,
         "stream": false
     });
@@ -517,7 +518,7 @@ fn build_anthropic_request(
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": config.model,
-        "max_tokens": 1024,
+        "max_tokens": LLM_MAX_TOKENS,
         "system": system_prompt,
         "messages": [
             {"role": "user", "content": user_prompt}

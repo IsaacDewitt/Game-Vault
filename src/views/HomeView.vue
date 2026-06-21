@@ -19,6 +19,7 @@ import { ref, computed } from "vue";
 import { useDebounceFn } from "@vueuse/core";
 import { useGamesStore } from "../stores/games";
 import * as api from "../lib/tauri";
+import { DEBOUNCE_MS } from "../lib/constants";
 import GameCard from "../components/GameCard.vue";
 import GameDetail from "../components/GameDetail.vue";
 import ContextMenu from "../components/ContextMenu.vue";
@@ -179,7 +180,7 @@ function handleCancelRename() {
 // 搜索去抖动（300ms）
 const handleSearch = useDebounceFn((value: string) => {
   store.searchQuery = value;
-}, 300);
+}, DEBOUNCE_MS);
 
 async function handleRefreshCovers() {
   refreshingCovers.value = true;
@@ -388,7 +389,7 @@ function handleDeleteGame(gameId: string) {
     <div v-if="store.coverFetchProgress" class="cover-progress">
       <n-progress
         type="line"
-        :percentage="Math.round((store.coverFetchProgress.current / store.coverFetchProgress.total) * 100)"
+        :percentage="store.coverFetchProgress.total > 0 ? Math.round((store.coverFetchProgress.current / store.coverFetchProgress.total) * 100) : 0"
         :show-indicator="true"
         processing
       />
@@ -408,8 +409,8 @@ function handleDeleteGame(gameId: string) {
 
       <!-- 空状态 -->
       <div v-else-if="store.filteredGames.length === 0" class="empty">
-        <n-empty description="还没有游戏，点击上方按钮添加">
-          <template #extra>
+        <n-empty :description="store.games.length > 0 ? '没有符合筛选条件的游戏' : '还没有游戏，点击上方按钮添加'">
+          <template #extra v-if="store.games.length === 0">
             <n-button type="primary" @click="handleAddGame">
               添加游戏
             </n-button>

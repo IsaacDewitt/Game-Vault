@@ -49,6 +49,7 @@ import type {
 } from "../lib/tauri";
 import { useGamesStore } from "../stores/games";
 import { formatPlayTime, formatDate } from "../lib/format";
+import { DEFAULT_ACCENT_COLOR, DEFAULT_ACCENT_RGB, COLOR_DARK_BG, COVER_SAMPLE_SIZE, COVER_BRIGHTNESS_MIN, COVER_BRIGHTNESS_MAX } from "../lib/constants";
 
 const gamesStore = useGamesStore();
 
@@ -188,7 +189,7 @@ const statusPieOption = computed(() => {
         avoidLabelOverlap: false,
         itemStyle: {
           borderRadius: 6,
-          borderColor: "#1a1a2e",
+          borderColor: COLOR_DARK_BG,
           borderWidth: 2,
         },
         label: {
@@ -249,7 +250,7 @@ const genrePieOption = computed(() => {
         center: ["30%", "50%"],
         itemStyle: {
           borderRadius: 6,
-          borderColor: "#1a1a2e",
+          borderColor: COLOR_DARK_BG,
           borderWidth: 2,
         },
         label: {
@@ -322,7 +323,7 @@ const genreCountPieOption = computed(() => {
         avoidLabelOverlap: false,
         itemStyle: {
           borderRadius: 6,
-          borderColor: "#1a1a2e",
+          borderColor: COLOR_DARK_BG,
           borderWidth: 2,
         },
         label: {
@@ -424,7 +425,7 @@ function barWidth(hours: number): string {
 
 // 获取游戏主色调（带 fallback）
 function getGameColor(gameId: string): string {
-  return gameColors.value[gameId] || "#6366f1";
+  return gameColors.value[gameId] || DEFAULT_ACCENT_COLOR;
 }
 
 // 生成 bar 渐变样式
@@ -450,13 +451,12 @@ function extractDominantColor(imgSrc: string): Promise<string> {
     img.crossOrigin = "anonymous";
     img.onload = () => {
       const canvas = document.createElement("canvas");
-      const size = 32; // 缩小取样，提高性能
-      canvas.width = size;
-      canvas.height = size;
+      canvas.width = COVER_SAMPLE_SIZE;
+      canvas.height = COVER_SAMPLE_SIZE;
       const ctx = canvas.getContext("2d");
-      if (!ctx) { resolve("#6366f1"); return; }
-      ctx.drawImage(img, 0, 0, size, size);
-      const data = ctx.getImageData(0, 0, size, size).data;
+      if (!ctx) { resolve(DEFAULT_ACCENT_COLOR); return; }
+      ctx.drawImage(img, 0, 0, COVER_SAMPLE_SIZE, COVER_SAMPLE_SIZE);
+      const data = ctx.getImageData(0, 0, COVER_SAMPLE_SIZE, COVER_SAMPLE_SIZE).data;
 
       // 统计颜色频率（量化为 32 级）
       const colorMap = new Map<string, { r: number; g: number; b: number; count: number }>();
@@ -464,7 +464,7 @@ function extractDominantColor(imgSrc: string): Promise<string> {
         const r = data[i], g = data[i + 1], b = data[i + 2];
         // 跳过过暗和过亮的像素
         const brightness = (r + g + b) / 3;
-        if (brightness < 30 || brightness > 230) continue;
+        if (brightness < COVER_BRIGHTNESS_MIN || brightness > COVER_BRIGHTNESS_MAX) continue;
         // 量化
         const qr = (r >> 5) << 5;
         const qg = (g >> 5) << 5;
@@ -479,7 +479,7 @@ function extractDominantColor(imgSrc: string): Promise<string> {
       }
 
       // 找最高频颜色
-      let best = { r: 99, g: 102, b: 241, count: 0 }; // fallback: #6366f1
+      let best = { ...DEFAULT_ACCENT_RGB, count: 0 };
       for (const val of colorMap.values()) {
         if (val.count > best.count) best = val;
       }
@@ -487,7 +487,7 @@ function extractDominantColor(imgSrc: string): Promise<string> {
       const hex = `#${((best.r << 16) | (best.g << 8) | best.b).toString(16).padStart(6, "0")}`;
       resolve(hex);
     };
-    img.onerror = () => resolve("#6366f1");
+    img.onerror = () => resolve(DEFAULT_ACCENT_COLOR);
     img.src = imgSrc;
   });
 }
@@ -558,8 +558,8 @@ const lineOption = computed(() => ({
           ],
         },
       },
-      lineStyle: { color: "#6366f1", width: 2 },
-      itemStyle: { color: "#6366f1" },
+      lineStyle: { color: DEFAULT_ACCENT_COLOR, width: 2 },
+      itemStyle: { color: DEFAULT_ACCENT_COLOR },
     },
   ],
 }));
@@ -598,7 +598,7 @@ const heatmapOption = computed(() => {
       max: maxSeconds,
       show: false,
       inRange: {
-        color: ["#1a1a2e", "#2d1b69", "#4c1d95", "#6d28d9", "#8b5cf6"],
+        color: [COLOR_DARK_BG, "#2d1b69", "#4c1d95", "#6d28d9", "#8b5cf6"],
       },
     },
     calendar: {
@@ -610,7 +610,7 @@ const heatmapOption = computed(() => {
       range: getHeatmapRange(),
       itemStyle: {
         borderWidth: 2,
-        borderColor: "#1a1a2e",
+        borderColor: COLOR_DARK_BG,
       },
       splitLine: { show: false },
       yearLabel: { show: false },
@@ -692,7 +692,7 @@ const hourlyHeatmapOption = computed(() => {
       max: maxSeconds,
       show: false,
       inRange: {
-        color: ["#1a1a2e", "#2d1b69", "#4c1d95", "#6d28d9", "#8b5cf6"],
+        color: [COLOR_DARK_BG, "#2d1b69", "#4c1d95", "#6d28d9", "#8b5cf6"],
       },
     },
     series: [
