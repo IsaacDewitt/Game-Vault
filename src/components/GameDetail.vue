@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, toRef, computed } from "vue";
+import { ref, toRef, computed, watch } from "vue";
 import {
   NDrawer,
   NDrawerContent,
@@ -33,7 +33,7 @@ import {
 } from "@vicons/ionicons5";
 import CoverPickerModal from "./CoverPickerModal.vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { Game } from "../lib/tauri";
+import type { Game, PlaySessionDetail } from "../lib/tauri";
 import * as api from "../lib/tauri";
 import { formatPlayTime, formatDate } from "../lib/format";
 import { useGamesStore } from "../stores/games";
@@ -62,6 +62,24 @@ const showCoverPicker = ref(false);
 // 存档路径编辑状态
 const editingSavePaths = ref(false);
 const editPaths = ref<string[]>([]);
+
+// 最近游玩记录
+const recentSessions = ref<PlaySessionDetail[]>([]);
+
+watch(
+  () => props.game.id,
+  async (gameId) => {
+    if (gameId) {
+      try {
+        recentSessions.value = await api.getPlaySessions(gameId, 3);
+      } catch (e) {
+        console.error("获取最近游玩记录失败:", e);
+        recentSessions.value = [];
+      }
+    }
+  },
+  { immediate: true }
+);
 
 // HLTB 数据计算
 const hasHltb = computed(() =>
@@ -443,6 +461,24 @@ async function saveSavePaths() {
         </div>
       </div>
 
+      <!-- 最近游玩记录 -->
+      <div v-if="recentSessions.length > 0" class="recent-sessions-section">
+        <div class="section-title">
+          <n-icon :component="TimeOutline" size="14" />
+          最近游玩记录
+        </div>
+        <div class="session-list">
+          <div
+            v-for="session in recentSessions"
+            :key="session.id"
+            class="session-item"
+          >
+            <span class="session-date">{{ formatDate(session.start_time) }}</span>
+            <span class="session-duration">{{ formatPlayTime(session.duration_seconds) }}</span>
+          </div>
+        </div>
+      </div>
+
       <n-divider />
 
       <!-- 获取游戏信息按钮 -->
@@ -791,6 +827,36 @@ async function saveSavePaths() {
   font-size: 11px;
   color: #888;
   margin-top: 6px;
+}
+
+.recent-sessions-section {
+  margin-bottom: 16px;
+}
+
+.session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.session-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 6px;
+}
+
+.session-date {
+  font-size: 13px;
+  color: #aaa;
+}
+
+.session-duration {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e0e0e0;
 }
 
 .save-paths-section {
