@@ -482,13 +482,25 @@ impl Database {
 
     /// 获取每日游玩统计
     pub fn get_daily_stats(&self, days: u32) -> Result<Vec<DailyStats>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DATE(start_time) as date, SUM(duration_seconds) as total, COUNT(*) as sessions
+        // 获取本地时区偏移（秒）
+        let local_offset = chrono::Local::now().offset().local_minus_utc();
+        let offset_hours = local_offset / 3600;
+        let offset_str = if offset_hours >= 0 {
+            format!("+{} hours", offset_hours)
+        } else {
+            format!("{} hours", offset_hours)
+        };
+
+        let sql = format!(
+            "SELECT DATE(start_time, '{}') as date, SUM(duration_seconds) as total, COUNT(*) as sessions
              FROM play_sessions
-             WHERE start_time >= DATE('now', '-' || ?1 || ' days')
-             GROUP BY DATE(start_time)
-             ORDER BY date DESC"
-        )?;
+             WHERE start_time >= DATE('now', '{}', '-' || ?1 || ' days')
+             GROUP BY DATE(start_time, '{}')
+             ORDER BY date DESC",
+            offset_str, offset_str, offset_str
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
 
         let stats = stmt.query_map(params![days], |row| {
             Ok(DailyStats {
@@ -585,13 +597,25 @@ impl Database {
 
     /// 获取热力图数据（按日期聚合游玩时长）
     pub fn get_heatmap_stats(&self, days: u32) -> Result<Vec<HeatmapDay>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DATE(start_time) as date, SUM(duration_seconds) as total
+        // 获取本地时区偏移（秒）
+        let local_offset = chrono::Local::now().offset().local_minus_utc();
+        let offset_hours = local_offset / 3600;
+        let offset_str = if offset_hours >= 0 {
+            format!("+{} hours", offset_hours)
+        } else {
+            format!("{} hours", offset_hours)
+        };
+
+        let sql = format!(
+            "SELECT DATE(start_time, '{}') as date, SUM(duration_seconds) as total
              FROM play_sessions
-             WHERE start_time >= DATE('now', '-' || ?1 || ' days')
-             GROUP BY DATE(start_time)
-             ORDER BY date"
-        )?;
+             WHERE start_time >= DATE('now', '{}', '-' || ?1 || ' days')
+             GROUP BY DATE(start_time, '{}')
+             ORDER BY date",
+            offset_str, offset_str, offset_str
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
 
         let stats = stmt.query_map(params![days], |row| {
             Ok(HeatmapDay {
@@ -605,15 +629,27 @@ impl Database {
 
     /// 获取游玩时段分布（24小时 x 7天）
     pub fn get_hourly_stats(&self) -> Result<Vec<HourlyStats>> {
-        let mut stmt = self.conn.prepare(
+        // 获取本地时区偏移（秒）
+        let local_offset = chrono::Local::now().offset().local_minus_utc();
+        let offset_hours = local_offset / 3600;
+        let offset_str = if offset_hours >= 0 {
+            format!("+{} hours", offset_hours)
+        } else {
+            format!("{} hours", offset_hours)
+        };
+
+        let sql = format!(
             "SELECT
-                CAST(strftime('%H', start_time) AS INTEGER) as hour,
-                CAST(strftime('%w', start_time) AS INTEGER) as weekday,
+                CAST(strftime('%H', start_time, '{}') AS INTEGER) as hour,
+                CAST(strftime('%w', start_time, '{}') AS INTEGER) as weekday,
                 SUM(duration_seconds) as total
              FROM play_sessions
              GROUP BY hour, weekday
-             ORDER BY weekday, hour"
-        )?;
+             ORDER BY weekday, hour",
+            offset_str, offset_str
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
 
         let stats = stmt.query_map([], |row| {
             let weekday_raw: u32 = row.get(1)?;
