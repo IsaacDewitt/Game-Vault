@@ -35,7 +35,6 @@ import {
   GridComponent,
   LegendComponent,
   VisualMapComponent,
-  CalendarComponent,
 } from "echarts/components";
 import VChart from "vue-echarts";
 import * as api from "../lib/tauri";
@@ -65,7 +64,6 @@ use([
   GridComponent,
   LegendComponent,
   VisualMapComponent,
-  CalendarComponent,
 ]);
 
 const loading = ref(true);
@@ -214,9 +212,10 @@ const statusPieOption = computed(() => {
   };
 });
 
-// 游戏类型分布环形图
+// 游戏类型分布环形图（仅显示有游玩时长的类型）
 const genrePieOption = computed(() => {
-  const topGenres = genreStats.value.slice(0, 10);
+  const playedGenres = genreStats.value.filter((g) => g.total_seconds > 0);
+  const topGenres = playedGenres.slice(0, 10);
   const colors = [
     "#6366f1", "#8b5cf6", "#ec4899", "#f43f5e", "#f97316",
     "#eab308", "#22c55e", "#14b8a6", "#06b6d4", "#3b82f6",
@@ -572,56 +571,108 @@ const hourlyMaxHours = computed(() => {
   return Math.round(maxS / 3600);
 });
 
-// GitHub 风格热力图
-const heatmapOption = computed(() => {
-  const data = heatmapStats.value.map((d) => [d.date, d.total_seconds]);
-  const maxSeconds = Math.max(...heatmapStats.value.map((d) => d.total_seconds), 1);
+// GitHub 风格热力图 — 自定义 HTML/CSS 实现
+const HEATMAP_COLORS = ["#161b22", "#0e4429", "#006d32", "#26a641", "#39d353"] as const;
+const HEATMAP_EMPTY = "#161b22";
 
-  return {
-    tooltip: {
-      formatter: (params: any) => {
-        const date = params.data[0];
-        const hours = (params.data[1] / 3600).toFixed(1);
-        return `${date}<br/>时长: ${hours}h`;
-      },
-    },
-    visualMap: {
-      min: 0,
-      max: maxSeconds,
-      show: false,
-      inRange: {
-        color: [COLOR_DARK_BG, "#2d1b69", "#4c1d95", "#6d28d9", "#8b5cf6"],
-      },
-    },
-    calendar: {
-      top: 50,
-      left: 60,
-      right: 40,
-      bottom: 20,
-      cellSize: ["auto", 13],
-      range: getHeatmapRange(),
-      itemStyle: {
-        borderWidth: 2,
-        borderColor: COLOR_DARK_BG,
-      },
-      splitLine: { show: false },
-      yearLabel: { show: false },
-      monthLabel: { color: "#aaa", fontSize: 11 },
-      dayLabel: {
-        color: "#aaa",
-        fontSize: 11,
-        nameMap: ["日", "一", "二", "三", "四", "五", "六"],
-      },
-    },
-    series: [
-      {
-        type: "heatmap",
-        coordinateSystem: "calendar",
-        data,
-      },
-    ],
-  };
+/** 本地日期字符串 (YYYY-MM-DD)，避免 toISOString 的 UTC 偏移 */
+function toLocalDateStr(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/** 计算年度日历网格数据 */
+const heatmapGrid = computed(() => {
+  const statsMap = new Map<string, number>();
+  let maxSeconds = 0;
+  heatmapStats.value.forEach((d) => {
+    statsMap.set(d.date, d.total_seconds);
+    if (d.total_seconds > maxSeconds) maxSeconds = d.total_seconds;
+  });
+  if (maxSeconds === 0) maxSeconds = 1;
+
+  const today = new Date();
+  const endDate = new Date(today);
+  const startDate = new Date(today);
+  startDate.setFullYear(startDate.getFullYear() - 1);
+
+  // 找到 endDate 所在周的周六（本周结束，周六=6）
+  const endSaturday = new Date(endDate);
+  endSaturday.setDate(endSaturday.getDate() + (6 - endSaturday.getDay()));
+
+  // 找到 startDate 所在周的周日（本周开始，周日=0）
+  const startSunday = new Date(startDate);
+  startSunday.setDate(startSunday.getDate() - startSunday.getDay());
+
+  // 生成周列表（从周日开始，与 GitHub 一致）
+  const weeks: Array<Array<{ date: string; seconds: number; level: number; inRange: boolean }>> = [];
+  const cursor = new Date(startSunday);
+
+  while (cursor <= endSaturday) {
+    const week: Array<{ date: string; seconds: number; level: number; inRange: boolean }> = [];
+    for (let day = 0; day < 7; day++) {
+      const dateStr = toLocalDateStr(cursor);
+      const inRange = cursor >= startDate && cursor <= endDate;
+      const seconds = statsMap.get(dateStr) || 0;
+
+      // 计算颜色等级 (0-4)
+      let level = 0;
+      if (seconds > 0) {
+        const ratio = seconds / maxSeconds;
+        if (ratio <= 0.25) level = 1;
+        else if (ratio <= 0.5) level = 2;
+        else if (ratio <= 0.75) level = 3;
+        else level = 4;
+      }
+
+      week.push({ date: dateStr, seconds, level, inRange });
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    weeks.push(week);
+  }
+
+  // 生成月份标签
+  const monthLabels: Array<{ label: string; weekIndex: number }> = [];
+  let lastMonth = -1;
+  weeks.forEach((week, weekIdx) => {
+    // 用周日的日期判断月份
+    const sunDate = new Date(week[0].date + "T00:00:00");
+    const m = sunDate.getMonth();
+    if (m !== lastMonth) {
+      const monthNames = ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"];
+      monthLabels.push({ label: monthNames[m], weekIndex: weekIdx });
+      lastMonth = m;
+    }
+  });
+
+  return { weeks, monthLabels, maxSeconds };
 });
+
+const heatmapTooltip = ref<{ show: boolean; x: number; y: number; date: string; hours: string; seconds: number }>({
+  show: false, x: 0, y: 0, date: "", hours: "0", seconds: 0,
+});
+
+function onHeatmapCellHover(e: MouseEvent, cell: { date: string; seconds: number }) {
+  const hours = (cell.seconds / 3600).toFixed(1);
+  heatmapTooltip.value = {
+    show: true,
+    x: e.clientX,
+    y: e.clientY,
+    date: cell.date,
+    hours,
+    seconds: cell.seconds,
+  };
+}
+
+function onHeatmapCellLeave() {
+  heatmapTooltip.value.show = false;
+}
+
+function getHeatmapCellColor(level: number): string {
+  return HEATMAP_COLORS[level] || HEATMAP_EMPTY;
+}
 
 // 游玩时段热力图 (24小时 x 7天)
 const hourlyHeatmapOption = computed(() => {
@@ -649,55 +700,70 @@ const hourlyHeatmapOption = computed(() => {
 
   return {
     tooltip: {
+      backgroundColor: "rgba(22, 27, 34, 0.95)",
+      borderColor: "rgba(48, 54, 61, 0.8)",
+      borderWidth: 1,
+      textStyle: { color: "#e6edf3", fontSize: 12 },
       formatter: (params: any) => {
         const hour = params.data[0];
         const day = weekdays[params.data[1]];
-        const hours = (params.data[2] / 3600).toFixed(1);
-        return `${day} ${hour}:00<br/>时长: ${hours}h`;
+        const hrs = (params.data[2] / 3600).toFixed(1);
+        return `<div style="font-weight:600;margin-bottom:2px">${day} ${hour}:00</div><div style="color:#8b949e">${hrs}h 游玩时长</div>`;
       },
     },
     grid: {
-      top: 35,
-      bottom: 40,
-      left: 70,
-      right: 60,
+      top: 10,
+      bottom: 50,
+      left: 48,
+      right: 10,
+      containLabel: false,
     },
     xAxis: {
       type: "category",
-      data: hours.map((h) => h + ":00"),
-      splitArea: { show: true },
+      data: hours.map((h) => `${h}`),
+      splitArea: { show: false },
       axisLabel: {
-        color: "#aaa",
+        color: "#8b949e",
         fontSize: 10,
-        interval: 2,
-        rotate: 0,
+        interval: (idx: number) => idx % 3 === 0,
+        formatter: (val: string) => `${val}时`,
       },
+      axisLine: { show: false },
+      axisTick: { show: false },
+      splitLine: { show: false },
     },
     yAxis: {
       type: "category",
       data: weekdays,
-      splitArea: { show: true },
-      axisLabel: { color: "#aaa", fontSize: 12 },
+      splitArea: { show: false },
+      axisLabel: { color: "#8b949e", fontSize: 11 },
+      axisLine: { show: false },
+      axisTick: { show: false },
+      splitLine: { show: false },
     },
     visualMap: {
       min: 0,
       max: maxSeconds,
       show: false,
       inRange: {
-        color: [COLOR_DARK_BG, "#2d1b69", "#4c1d95", "#6d28d9", "#8b5cf6"],
+        color: HEATMAP_COLORS,
       },
     },
     series: [
       {
         type: "heatmap",
         data,
-        label: {
-          show: false,
+        label: { show: false },
+        itemStyle: {
+          borderColor: "rgba(22, 27, 34, 0.6)",
+          borderWidth: 2,
+          borderRadius: 3,
         },
         emphasis: {
           itemStyle: {
-            shadowBlur: 10,
-            shadowColor: "rgba(0, 0, 0, 0.5)",
+            borderColor: "#e6edf3",
+            borderWidth: 1,
+            shadowBlur: 0,
           },
         },
       },
@@ -747,13 +813,6 @@ watch(activeTab, (tab) => {
   }
 });
 
-function getHeatmapRange(): string[] {
-  const end = new Date();
-  const start = new Date();
-  start.setFullYear(start.getFullYear() - 1);
-  return [start.toISOString().slice(0, 10), end.toISOString().slice(0, 10)];
-}
-
 async function loadStats() {
   loading.value = true;
   try {
@@ -786,6 +845,7 @@ onMounted(() => {
   loadStats();
   updateGridCols();
   window.addEventListener('resize', updateGridCols);
+
 });
 
 // 当 store 中的封面缓存更新时，补充提取颜色（使用 shallow watch 避免深层遍历）
@@ -894,24 +954,87 @@ onUnmounted(() => {
           <n-grid :cols="1" :y-gap="16">
             <n-gi>
               <n-card title="年度游玩热力图">
-                <div class="chart-wrapper">
-                  <v-chart :option="heatmapOption" style="height: 250px" autoresize />
-                  <div class="color-legend">
-                    <span class="legend-label">0h</span>
-                    <div class="legend-bar" />
-                    <span class="legend-label">{{ heatmapMaxHours }}h</span>
+                <div class="gh-heatmap-wrapper">
+                  <!-- 月份标签 -->
+                  <div
+                    class="gh-month-labels"
+                    :style="{ '--gh-weeks': heatmapGrid.weeks.length }"
+                  >
+                    <span
+                      v-for="m in heatmapGrid.monthLabels"
+                      :key="m.weekIndex"
+                      class="gh-month-label"
+                      :style="{ gridColumn: m.weekIndex + 1 }"
+                    >{{ m.label }}</span>
+                  </div>
+                  <div class="gh-heatmap-body">
+                    <!-- 星期标签（与 7 行对齐，只在 Mon/Wed/Fri 显示） -->
+                    <div class="gh-day-labels">
+                      <span class="gh-day-label gh-day-label-empty">.</span>
+                      <span class="gh-day-label">一</span>
+                      <span class="gh-day-label gh-day-label-empty">.</span>
+                      <span class="gh-day-label">三</span>
+                      <span class="gh-day-label gh-day-label-empty">.</span>
+                      <span class="gh-day-label">五</span>
+                      <span class="gh-day-label gh-day-label-empty">.</span>
+                    </div>
+                    <!-- 网格 -->
+                    <div class="gh-grid">
+                      <div
+                        v-for="(week, wIdx) in heatmapGrid.weeks"
+                        :key="wIdx"
+                        class="gh-week"
+                      >
+                        <div
+                          v-for="(cell, dIdx) in week"
+                          :key="dIdx"
+                          class="gh-cell"
+                          :class="{ 'gh-cell-empty': !cell.inRange }"
+                          :style="{ backgroundColor: cell.inRange ? getHeatmapCellColor(cell.level) : 'transparent' }"
+                          @mouseenter="onHeatmapCellHover($event, cell)"
+                          @mouseleave="onHeatmapCellLeave"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                  <!-- 图例 -->
+                  <div class="gh-legend">
+                    <span class="gh-legend-text">{{ formatHours(0) }}h</span>
+                    <div
+                      v-for="i in 5"
+                      :key="i"
+                      class="gh-legend-cell"
+                      :style="{ backgroundColor: HEATMAP_COLORS[i - 1] }"
+                    />
+                    <span class="gh-legend-text">{{ heatmapMaxHours }}h</span>
                   </div>
                 </div>
+                <!-- 自定义 tooltip -->
+                <Teleport to="body">
+                  <div
+                    v-if="heatmapTooltip.show"
+                    class="gh-tooltip"
+                    :style="{ left: heatmapTooltip.x + 12 + 'px', top: heatmapTooltip.y - 40 + 'px' }"
+                  >
+                    <div class="gh-tooltip-time">{{ heatmapTooltip.hours }}h 游玩时长</div>
+                    <div class="gh-tooltip-date">{{ heatmapTooltip.date }}</div>
+                  </div>
+                </Teleport>
               </n-card>
             </n-gi>
             <n-gi>
               <n-card title="游玩时段分布">
-                <div class="chart-wrapper">
-                  <v-chart :option="hourlyHeatmapOption" style="height: 380px" autoresize />
-                  <div class="color-legend">
-                    <span class="legend-label">0h</span>
-                    <div class="legend-bar" />
-                    <span class="legend-label">{{ hourlyMaxHours }}h</span>
+                <div class="hourly-heatmap-wrapper">
+                  <v-chart :option="hourlyHeatmapOption" style="height: 280px" autoresize />
+                  <div class="gh-legend gh-legend-hourly">
+                    <span class="gh-legend-text">{{ formatHours(0) }}h</span>
+                    <div
+                      v-for="i in 5"
+                      :key="i"
+                      class="gh-legend-cell"
+                      :style="{ backgroundColor: HEATMAP_COLORS[i - 1] }"
+                    />
+                    <span class="gh-legend-text">{{ hourlyMaxHours }}h</span>
                   </div>
                 </div>
               </n-card>
@@ -1024,27 +1147,142 @@ onUnmounted(() => {
   position: relative;
 }
 
-.color-legend {
-  position: absolute;
-  top: 0;
-  right: 8px;
+/* ==================== GitHub 风格年度热力图 ==================== */
+.gh-heatmap-wrapper {
+  padding: 8px 0;
+  overflow-x: auto;
+}
+
+.gh-month-labels {
+  display: grid;
+  grid-template-columns: repeat(var(--gh-weeks, 53), 13px);
+  gap: 3px;
+  margin-left: 36px;
+  margin-bottom: 4px;
+  height: 18px;
+}
+
+.gh-month-label {
+  font-size: 11px;
+  color: #8b949e;
+  white-space: nowrap;
+  position: relative;
+}
+
+.gh-heatmap-body {
+  display: flex;
+  gap: 0;
+}
+
+.gh-day-labels {
+  display: grid;
+  grid-template-rows: repeat(7, 13px);
+  gap: 3px;
+  width: 28px;
+  flex-shrink: 0;
+}
+
+.gh-day-label {
+  font-size: 10px;
+  color: #8b949e;
+  line-height: 13px;
   display: flex;
   align-items: center;
-  gap: 4px;
-  z-index: 1;
 }
 
-.legend-bar {
-  width: 80px;
-  height: 8px;
+/* 只在 Mon(1), Wed(3), Fri(5) 行显示标签 */
+.gh-day-label-empty {
+  visibility: hidden;
+}
+
+.gh-grid {
+  display: flex;
+  gap: 3px;
+}
+
+.gh-week {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.gh-cell {
+  width: 13px;
+  height: 13px;
   border-radius: 2px;
-  background: linear-gradient(to right, #1a1a2e, #2d1b69, #4c1d95, #6d28d9, #8b5cf6);
+  outline: 1px solid rgba(27, 31, 35, 0.06);
+  outline-offset: -1px;
+  cursor: pointer;
+  transition: outline-color 0.1s;
 }
 
-.legend-label {
+.gh-cell:hover {
+  outline: 2px solid rgba(255, 255, 255, 0.3);
+  outline-offset: -2px;
+}
+
+.gh-cell-empty {
+  outline: none;
+  cursor: default;
+}
+
+/* 图例 */
+.gh-legend {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 12px;
+  justify-content: flex-end;
+  padding-right: 4px;
+}
+
+.gh-legend-text {
   font-size: 10px;
-  color: #aaa;
+  color: #8b949e;
+  margin: 0 4px;
+}
+
+.gh-legend-cell {
+  width: 13px;
+  height: 13px;
+  border-radius: 2px;
+  outline: 1px solid rgba(27, 31, 35, 0.06);
+  outline-offset: -1px;
+}
+
+/* 自定义 tooltip */
+.gh-tooltip {
+  position: fixed;
+  z-index: 9999;
+  background: rgba(22, 27, 34, 0.95);
+  border: 1px solid rgba(48, 54, 61, 0.8);
+  border-radius: 6px;
+  padding: 8px 12px;
+  pointer-events: none;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.gh-tooltip-time {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e6edf3;
   white-space: nowrap;
+}
+
+.gh-tooltip-date {
+  font-size: 11px;
+  color: #8b949e;
+  margin-top: 2px;
+  white-space: nowrap;
+}
+
+/* 时段热力图 */
+.hourly-heatmap-wrapper {
+  padding: 0 4px;
+}
+
+.gh-legend-hourly {
+  margin-top: 8px;
 }
 
 /* 自定义条形图 */
