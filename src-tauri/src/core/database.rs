@@ -667,10 +667,17 @@ impl Database {
         Ok(stats)
     }
 
-    /// 获取游戏状态统计
+    /// 获取游戏状态统计（智能推导：有游玩时长但状态仍为 unplayed 的游戏视为 playing）
     pub fn get_status_stats(&self) -> Result<StatusStats> {
         let mut stmt = self.conn.prepare(
-            "SELECT status, COUNT(*) FROM games GROUP BY status"
+            "SELECT
+                CASE
+                    WHEN play_time_seconds = 0 THEN 'unplayed'
+                    WHEN status = 'unplayed' AND play_time_seconds > 0 THEN 'playing'
+                    ELSE status
+                END as effective_status,
+                COUNT(*)
+            FROM games GROUP BY effective_status"
         )?;
 
         let mut stats = StatusStats {
