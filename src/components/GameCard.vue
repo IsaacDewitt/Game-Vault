@@ -141,6 +141,9 @@ function handleContextMenu(e: MouseEvent) {
         <span v-if="game.play_time_seconds > 0" class="play-time">
           {{ formatPlayTime(game.play_time_seconds) }}
         </span>
+        <span v-if="game.release_date" class="release-date">
+          {{ game.release_date }}
+        </span>
       </div>
     </div>
   </div>
@@ -297,5 +300,8 @@ function handleContextMenu(e: MouseEvent) {
 .meta {
   font-size: 11px;
   color: #888;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 </style>
