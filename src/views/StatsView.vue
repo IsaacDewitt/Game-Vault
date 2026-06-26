@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onActivated, onUnmounted, computed, watch } from "vue";
+import { ref, onMounted, onActivated, onUnmounted, computed, watch, nextTick } from "vue";
 import { lightenColor } from "../lib/color";
 import {
   NCard,
@@ -113,6 +113,7 @@ const activeTab = ref("overview");
 // 响应式网格列数
 const gridCols = ref(4);
 const chartGridCols = ref(2);
+const hourlyChartHeight = ref(280);
 
 // 监听窗口大小变化
 function updateGridCols() {
@@ -127,6 +128,22 @@ function updateGridCols() {
     gridCols.value = 4;
     chartGridCols.value = 2;
   }
+}
+
+/** 根据容器宽度计算时段热力图高度，使单元格接近正方形 */
+function updateHourlyHeight() {
+  nextTick(() => {
+    const wrapper = document.querySelector('.hourly-heatmap-wrapper');
+    if (!wrapper) return;
+    const containerWidth = wrapper.clientWidth;
+    // 减去 y 轴标签宽度(48px)、grid 左右 padding(48+10px)、以及容器 padding(8px)
+    const chartWidth = containerWidth - 48 - 48 - 10 - 8;
+    // 24 列，23 个 gap(各 2px)
+    const cellWidth = (chartWidth - 23 * 2) / 24;
+    // 7 行，6 个 gap(各 2px)，加上 grid top(10) + bottom(50)
+    const idealHeight = cellWidth * 7 + 6 * 2 + 10 + 50;
+    hourlyChartHeight.value = Math.max(200, Math.min(500, Math.round(idealHeight)));
+  });
 }
 
 // 概览卡片
@@ -841,11 +858,16 @@ async function loadStats() {
   }
 }
 
+function onWindowResize() {
+  updateGridCols();
+  updateHourlyHeight();
+}
+
 onMounted(() => {
   loadStats();
   updateGridCols();
-  window.addEventListener('resize', updateGridCols);
-
+  updateHourlyHeight();
+  window.addEventListener('resize', onWindowResize);
 });
 
 // 当 store 中的封面缓存更新时，补充提取颜色（使用 shallow watch 避免深层遍历）
@@ -859,11 +881,12 @@ watch(() => Object.keys(gamesStore.coverBase64Cache).length, (newLen, oldLen) =>
 onActivated(() => {
   loadStats();
   updateGridCols();
+  nextTick(() => updateHourlyHeight());
 });
 
 // 组件卸载时清理事件监听器
 onUnmounted(() => {
-  window.removeEventListener('resize', updateGridCols);
+  window.removeEventListener('resize', onWindowResize);
 });
 </script>
 
@@ -1025,7 +1048,7 @@ onUnmounted(() => {
             <n-gi>
               <n-card title="游玩时段分布">
                 <div class="hourly-heatmap-wrapper">
-                  <v-chart :option="hourlyHeatmapOption" style="height: 280px" autoresize />
+                  <v-chart :option="hourlyHeatmapOption" :style="{ height: hourlyChartHeight + 'px' }" autoresize />
                   <div class="gh-legend gh-legend-hourly">
                     <span class="gh-legend-text">{{ formatHours(0) }}h</span>
                     <div
@@ -1155,7 +1178,7 @@ onUnmounted(() => {
 
 .gh-month-labels {
   display: grid;
-  grid-template-columns: repeat(var(--gh-weeks, 53), 13px);
+  grid-template-columns: repeat(var(--gh-weeks, 53), 1fr);
   gap: 3px;
   margin-left: 36px;
   margin-bottom: 4px;
@@ -1176,7 +1199,7 @@ onUnmounted(() => {
 
 .gh-day-labels {
   display: grid;
-  grid-template-rows: repeat(7, 13px);
+  grid-template-rows: repeat(7, 1fr);
   gap: 3px;
   width: 28px;
   flex-shrink: 0;
@@ -1198,17 +1221,20 @@ onUnmounted(() => {
 .gh-grid {
   display: flex;
   gap: 3px;
+  width: 100%;
 }
 
 .gh-week {
   display: flex;
   flex-direction: column;
   gap: 3px;
+  flex: 1;
+  min-width: 0;
 }
 
 .gh-cell {
-  width: 13px;
-  height: 13px;
+  width: 100%;
+  aspect-ratio: 1;
   border-radius: 2px;
   outline: 1px solid rgba(27, 31, 35, 0.06);
   outline-offset: -1px;
