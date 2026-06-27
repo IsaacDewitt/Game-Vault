@@ -30,6 +30,7 @@ import {
   CloseOutline,
 } from "@vicons/ionicons5";
 import CoverPickerModal from "./CoverPickerModal.vue";
+import GameInfoEditModal from "./GameInfoEditModal.vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Game, PlaySessionDetail } from "../lib/tauri";
 import * as api from "../lib/tauri";
@@ -61,6 +62,8 @@ const fetchingLlm = ref(false);
 
 // 封面选择器状态
 const showCoverPicker = ref(false);
+// 手动填写信息弹窗状态
+const showEditInfoModal = ref(false);
 
 
 // 最近游玩记录
@@ -530,14 +533,22 @@ async function handleRemoveSavePath(index: number) {
 
       <!-- 获取游戏信息按钮 -->
       <div v-if="!game.description" class="fetch-info-section">
-        <n-button
-          size="small"
-          type="primary"
-          :loading="fetchingLlm"
-          @click="handleFetchInfoLlm"
-        >
-          获取游戏信息
-        </n-button>
+        <n-space>
+          <n-button
+            size="small"
+            type="primary"
+            :loading="fetchingLlm"
+            @click="handleFetchInfoLlm"
+          >
+            使用 LLM 获取
+          </n-button>
+          <n-button
+            size="small"
+            @click="showEditInfoModal = true"
+          >
+            手动填写
+          </n-button>
+        </n-space>
       </div>
 
       <!-- 游戏介绍 -->
@@ -630,6 +641,14 @@ async function handleRemoveSavePath(index: number) {
     :game-name="game.name"
     @close="showCoverPicker = false"
     @cover-changed="emit('close')"
+  />
+
+  <!-- 手动填写游戏信息弹窗 -->
+  <GameInfoEditModal
+    :show="showEditInfoModal"
+    :game="game"
+    @close="showEditInfoModal = false"
+    @saved="showEditInfoModal = false"
   />
 </template>
 

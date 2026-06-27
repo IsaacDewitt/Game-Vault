@@ -571,6 +571,58 @@ pub async fn fetch_game_info_llm(
     Ok(updated)
 }
 
+/// 手动更新游戏元数据（与 LLM 获取的字段一致）
+#[tauri::command]
+pub fn update_game_meta(
+    db: State<'_, Arc<Mutex<Database>>>,
+    game_id: String,
+    description: Option<String>,
+    developer: Option<String>,
+    publisher: Option<String>,
+    release_date: Option<String>,
+    genres: Option<Vec<String>>,
+    hltb_main_story: Option<u32>,
+    hltb_main_extra: Option<u32>,
+    hltb_completionist: Option<u32>,
+    save_paths: Option<Vec<String>>,
+) -> Result<Game, String> {
+    let db_guard = lock_or_recover(&db);
+    let mut game = db_guard.get_game_by_id(&game_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "游戏不存在".to_string())?;
+
+    if let Some(v) = description {
+        game.description = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = developer {
+        game.developer = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = publisher {
+        game.publisher = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = release_date {
+        game.release_date = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = genres {
+        game.genres = v;
+    }
+    if let Some(v) = hltb_main_story {
+        game.hltb_main_story = Some(v);
+    }
+    if let Some(v) = hltb_main_extra {
+        game.hltb_main_extra = Some(v);
+    }
+    if let Some(v) = hltb_completionist {
+        game.hltb_completionist = Some(v);
+    }
+    if let Some(v) = save_paths {
+        game.save_paths = v;
+    }
+
+    db_guard.update_game(&game).map_err(|e| e.to_string())?;
+    Ok(game)
+}
+
 /// 根据文件扩展名检测图片 MIME 类型
 fn detect_image_mime(path: &std::path::Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref() {

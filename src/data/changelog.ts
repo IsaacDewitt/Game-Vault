@@ -6,6 +6,21 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "0.4.3",
+    date: "2026-06-27",
+    changes: [
+      "新增手动填写游戏信息功能，右键菜单拆分为 LLM 刷新和手动填写两个选项",
+      "手动填写弹窗支持填写描述、开发商、发行商、发售日期、类型标签、HLTB 时长、存档路径",
+      "游戏详情页无信息时显示 LLM 获取和手动填写两个按钮",
+      "实现进程树追踪，修复 launcher 类游戏（如 Steam）检测截断问题",
+      "进程存活检测改用 sys.processes()，修复 32-bit 老游戏追踪",
+      "存档路径改为点击打开文件夹，旁边按钮可修改/删除",
+      "点击可执行文件路径打开所在文件夹，编辑按钮常驻显示",
+      "改进 LLM 游戏信息获取模块",
+      "修复游戏详情 drawer 遮罩层右键仍显示浏览器默认菜单",
+    ],
+  },
+  {
     version: "0.4.2",
     date: "2026-06-27",
     changes: [

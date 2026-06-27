@@ -198,6 +198,7 @@ pub fn run() {
             commands::games::get_all_genres,
             commands::games::open_save_path,
             commands::games::update_save_paths,
+            commands::games::update_game_meta,
             commands::games::export_saves_backup,
             commands::games::import_saves_backup,
             // 统计相关

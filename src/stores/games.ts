@@ -224,6 +224,18 @@ export const useGamesStore = defineStore("games", () => {
     return updated;
   }
 
+  async function updateGameMeta(gameId: string, meta: api.GameMetaInput) {
+    const updated = await api.updateGameMeta(gameId, meta);
+    const idx = games.value.findIndex((g) => g.id === gameId);
+    if (idx !== -1) {
+      games.value[idx] = updated;
+    }
+    if (selectedGame.value?.id === gameId) {
+      selectedGame.value = updated;
+    }
+    return updated;
+  }
+
   async function fetchCovers() {
     try {
       coverFetchProgress.value = null;
@@ -420,6 +432,7 @@ export const useGamesStore = defineStore("games", () => {
     loadAllGenres,
     addGameManual,
     fetchGameInfoLlm,
+    updateGameMeta,
     fetchCovers,
     fetchGameInfo,
     refreshCover,

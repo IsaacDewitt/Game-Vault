@@ -20,6 +20,7 @@ const emit = defineEmits<{
   delete: [];
   rename: [];
   refreshInfo: [];
+  editInfo: [];
   removeCover: [];
   toggleCompleted: [];
 }>();
@@ -59,9 +60,14 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => [
     action: () => emit("rename"),
   },
   {
-    label: "刷新信息",
-    icon: "🔄",
+    label: "使用 LLM 刷新",
+    icon: "🤖",
     action: () => emit("refreshInfo"),
+  },
+  {
+    label: "手动填写信息",
+    icon: "✏️",
+    action: () => emit("editInfo"),
   },
   {
     label: "删除封面",

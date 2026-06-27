@@ -22,6 +22,7 @@ import * as api from "../lib/tauri";
 import { DEBOUNCE_MS } from "../lib/constants";
 import GameCard from "../components/GameCard.vue";
 import GameDetail from "../components/GameDetail.vue";
+import GameInfoEditModal from "../components/GameInfoEditModal.vue";
 import ContextMenu from "../components/ContextMenu.vue";
 import type { ContextMenuItem } from "../components/ContextMenu.vue";
 import { formatPlayTime } from "../lib/format";
@@ -38,6 +39,9 @@ const gameNameInput = ref("");
 const showRenameModal = ref(false);
 const renamingGameId = ref("");
 const renameInput = ref("");
+// 手动填写游戏信息弹窗状态
+const showEditInfoModal = ref(false);
+const editingGameId = ref("");
 // 封面获取 loading 状态
 const refreshingCovers = ref(false);
 // 游戏信息获取 loading 状态
@@ -258,6 +262,11 @@ async function handleRefreshInfo(gameId: string) {
     loadingMsg.destroy();
     message.error("刷新信息失败，请检查 LLM 配置");
   }
+}
+
+function handleEditInfo(gameId: string) {
+  editingGameId.value = gameId;
+  showEditInfoModal.value = true;
 }
 
 async function handleRemoveCover(gameId: string) {
@@ -483,6 +492,7 @@ function handleDeleteGame(gameId: string) {
           @delete="handleDeleteGame(game.id)"
           @rename="handleRenameGame(game.id)"
           @refresh-info="handleRefreshInfo(game.id)"
+          @edit-info="handleEditInfo(game.id)"
           @remove-cover="handleRemoveCover(game.id)"
           @toggle-completed="handleToggleCompleted(game.id)"
         />
@@ -550,6 +560,15 @@ function handleDeleteGame(gameId: string) {
         </n-space>
       </template>
     </n-modal>
+
+    <!-- 手动填写游戏信息弹窗 -->
+    <GameInfoEditModal
+      v-if="showEditInfoModal && editingGameId"
+      :show="showEditInfoModal"
+      :game="store.games.find((g) => g.id === editingGameId)!"
+      @close="showEditInfoModal = false"
+      @saved="showEditInfoModal = false"
+    />
 
     <!-- 主页右键菜单 -->
     <ContextMenu

@@ -255,6 +255,22 @@ export async function updateSavePaths(gameId: string, savePaths: string[]): Prom
   return invoke("update_save_paths", { gameId, savePaths });
 }
 
+export interface GameMetaInput {
+  description?: string | null;
+  developer?: string | null;
+  publisher?: string | null;
+  release_date?: string | null;
+  genres?: string[] | null;
+  hltb_main_story?: number | null;
+  hltb_main_extra?: number | null;
+  hltb_completionist?: number | null;
+  save_paths?: string[] | null;
+}
+
+export async function updateGameMeta(gameId: string, meta: GameMetaInput): Promise<Game> {
+  return invoke("update_game_meta", { gameId, ...meta });
+}
+
 export interface SavesBackupResult {
   exported: number;
   errors: string[];
