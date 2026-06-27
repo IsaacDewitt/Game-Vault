@@ -94,11 +94,26 @@ function handleMenuUpdate(key: string) {
   activeView.value = key;
 }
 
-// 标题栏拖拽
+// 标题栏拖拽与双击最大化
+let lastMouseUpTime = 0;
+
 async function handleTitleBarDrag(e: MouseEvent) {
   // 只响应左键
   if (e.button !== 0) return;
+
+  const now = Date.now();
+  const timeSinceLastUp = now - lastMouseUpTime;
+
+  // 如果距离上次鼠标释放 < 300ms，视为双击 -> 最大化
+  if (timeSinceLastUp < 300) {
+    await handleToggleMaximize();
+    return;
+  }
+
+  // 单击拖拽：立即启动
   await getCurrentWindow().startDragging();
+  // startDragging() 返回说明鼠标已释放，记录释放时间
+  lastMouseUpTime = Date.now();
 }
 
 // 窗口控制
