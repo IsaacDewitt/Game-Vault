@@ -219,6 +219,15 @@ function handleCoverDropdown(key: string) {
   }
 }
 
+async function handleOpenExeFolder() {
+  if (!props.game.exe_path) return;
+  try {
+    await api.openSavePath(props.game.exe_path);
+  } catch (e) {
+    message.error("打开文件夹失败: " + (e as Error).toString());
+  }
+}
+
 async function handleChangeExePath() {
   try {
     const selected = await open({
@@ -512,10 +521,15 @@ async function saveSavePaths() {
           <span class="info-label">发行日期</span>
           <span class="info-value">{{ game.release_date }}</span>
         </div>
-        <div class="info-row clickable" v-if="game.exe_path" @click="handleChangeExePath">
+        <div class="info-row clickable" v-if="game.exe_path" @click="handleOpenExeFolder">
           <span class="info-label">可执行文件</span>
           <span class="info-value path">{{ game.exe_path }}</span>
-          <n-icon :component="CreateOutline" size="14" class="edit-icon" />
+          <n-tooltip trigger="hover">
+            <template #trigger>
+              <n-icon :component="CreateOutline" size="14" class="edit-icon" @click.stop="handleChangeExePath" />
+            </template>
+            修改路径
+          </n-tooltip>
         </div>
         <div class="info-row" v-if="game.exe_version">
           <span class="info-label">游戏版本</span>
@@ -749,10 +763,11 @@ async function saveSavePaths() {
 }
 
 .info-row.clickable .edit-icon {
-  opacity: 0;
+  opacity: 0.5;
   transition: opacity 0.2s;
   flex-shrink: 0;
   color: #888;
+  cursor: pointer;
 }
 
 .info-row.clickable:hover .edit-icon {
