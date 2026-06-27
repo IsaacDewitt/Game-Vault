@@ -39,18 +39,8 @@ export const useGamesStore = defineStore("games", () => {
       if (idx !== -1) {
         activeGames.value.splice(idx, 1);
       }
-      // 增量更新：只刷新该游戏的数据，而非全量重新加载
-      api.getGameDetail(gameId).then((game) => {
-        if (game) {
-          const gameIdx = games.value.findIndex((g) => g.id === gameId);
-          if (gameIdx !== -1) {
-            games.value[gameIdx] = game;
-          }
-          if (selectedGame.value?.id === gameId) {
-            selectedGame.value = game;
-          }
-        }
-      }).catch(() => {});
+      // 刷新游戏数据以更新时长
+      loadGames();
     });
 
     // 监听封面获取进度事件

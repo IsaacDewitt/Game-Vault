@@ -18,6 +18,10 @@ pub struct ActiveSession {
     pub exe_name: String,
     /// 游戏可执行文件的完整路径，用于精确匹配进程
     pub exe_path: Option<String>,
+    /// 启动时得到的进程 PID，用于进程树追踪
+    pub spawned_pid: Option<u32>,
+    /// 游戏安装目录，用于回退检测（进程不在进程树中但仍在同目录运行）
+    pub install_path: Option<String>,
     pub start_time: chrono::DateTime<chrono::Utc>,
 }
 

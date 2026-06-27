@@ -1,0 +1,35 @@
+# ============================================================
+# 构建加速配置 — 针对 8核16线程 CPU 优化
+# ============================================================
+
+# 全局：使用 LLD 链接器（比 MSVC link.exe 快 5-10 倍）
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
+
+# Rust 编译配置
+[build]
+# 并行编译任务数 = CPU 线程数
+jobs = 16
+
+# 调试构建（dev）：牺牲少量调试体验换取编译速度
+[profile.dev]
+# 更少但更大的代码生成单元 = 更快编译
+codegen-units = 256
+# 不优化，编译最快
+opt-level = 0
+# 增量编译（开发时效果显著）
+incremental = true
+# 减少 debug 信息以加速链接
+debug = "limited"
+# LTO 关闭
+lto = false
+
+# 发布构建（release）：平衡速度和体积
+[profile.release]
+codegen-units = 16
+opt-level = "s"              # 优化体积（对 Tauri 打包友好）
+lto = "thin"                 # ThinLTO 比 Full LTO 快很多
+debug = "none"               # 不去掉符号，链接更快
+strip = "symbols"            # 减小最终二进制体积
+incremental = false
+panic = "abort"

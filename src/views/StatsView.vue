@@ -826,9 +826,9 @@ watch(sessionGameFilter, () => {
   loadSessionHistory(true);
 });
 
-// 切换到游玩记录 tab 时加载数据
+// 切换到游玩记录 tab 时始终刷新数据
 watch(activeTab, (tab) => {
-  if (tab === "sessions" && sessionHistory.value.length === 0) {
+  if (tab === "sessions") {
     loadSessionHistory(true);
   }
 });
@@ -883,6 +883,10 @@ watch(() => Object.keys(gamesStore.coverBase64Cache).length, (newLen, oldLen) =>
 // keep-alive 缓存的组件再次激活时刷新数据
 onActivated(() => {
   loadStats();
+  // 如果当前正在查看游玩记录，也刷新会话历史
+  if (activeTab.value === "sessions") {
+    loadSessionHistory(true);
+  }
   updateGridCols();
   nextTick(() => updateHourlyHeight());
 });

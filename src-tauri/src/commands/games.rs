@@ -49,13 +49,19 @@ pub fn launch_game(
     };
     // DB 锁已释放
 
-    // 阶段 2：启动游戏（无锁状态下的 I/O 操作）
-    GameLauncher::launch(&game).map_err(|e| e.to_string())?;
+    // 阶段 2：启动游戏（无锁状态下的 I/O 操作），获取 PID 用于进程树追踪
+    let spawned_pid = GameLauncher::launch(&game).map_err(|e| e.to_string())?;
 
     // 阶段 3：开始追踪时长（独立获取 Tracker 锁）
     if let Some(ref exe_name) = game.exe_name {
         let mut tracker_guard = lock_or_recover(&tracker);
-        if let Some(finished_session) = tracker_guard.start_tracking(&game_id, exe_name, game.exe_path.as_deref()) {
+        if let Some(finished_session) = tracker_guard.start_tracking(
+            &game_id,
+            exe_name,
+            game.exe_path.as_deref(),
+            Some(spawned_pid),
+            game.install_path.as_deref(),
+        ) {
             // 如果有旧会话结束，持久化到数据库
             drop(tracker_guard);  // 释放 Tracker 锁再获取 DB 锁
             let db_guard = lock_or_recover(&db);

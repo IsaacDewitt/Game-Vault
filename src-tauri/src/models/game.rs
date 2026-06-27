@@ -69,13 +69,19 @@ impl Game {
     }
 
     /// 格式化游戏时长
+    /// - < 60 秒: 显示秒数（如 "30s"），避免截断为 "0m"
+    /// - < 1 小时: 显示分钟（如 "5m"）
+    /// - >= 1 小时: 显示小时+分钟（如 "2h 30m"）
     pub fn formatted_play_time(&self) -> String {
         let hours = self.play_time_seconds / 3600;
         let minutes = (self.play_time_seconds % 3600) / 60;
+        let secs = self.play_time_seconds % 60;
         if hours > 0 {
             format!("{}h {}m", hours, minutes)
-        } else {
+        } else if minutes > 0 {
             format!("{}m", minutes)
+        } else {
+            format!("{}s", secs)
         }
     }
 }

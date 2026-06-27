@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use sysinfo::System;
+use sysinfo::{Pid, System};
 use crate::models::*;
 use crate::core::Database;  // 用于 persist_finished_sessions 的参数类型
 
@@ -29,7 +29,14 @@ impl PlayTimeTracker {
 
     /// 开始追踪游戏
     /// 如果已有同 ID 的活跃会话，先结束旧会话并返回其数据供外部持久化
-    pub fn start_tracking(&mut self, game_id: &str, exe_name: &str, exe_path: Option<&str>) -> Option<FinishedSession> {
+    pub fn start_tracking(
+        &mut self,
+        game_id: &str,
+        exe_name: &str,
+        exe_path: Option<&str>,
+        spawned_pid: Option<u32>,
+        install_path: Option<&str>,
+    ) -> Option<FinishedSession> {
         let finished = if self.active_sessions.contains_key(game_id) {
             self.stop_tracking_internal(game_id)
         } else {
@@ -42,11 +49,16 @@ impl PlayTimeTracker {
                 game_id: game_id.to_string(),
                 exe_name: exe_name.to_string(),
                 exe_path: exe_path.map(|s| s.to_string()),
+                spawned_pid,
+                install_path: install_path.map(|s| s.to_string()),
                 start_time: chrono::Utc::now(),
             },
         );
 
-        tracing::info!("开始追踪游戏: {} (exe: {}, path: {:?})", game_id, exe_name, exe_path);
+        tracing::info!(
+            "开始追踪游戏: {} (exe: {}, path: {:?}, pid: {:?}, install: {:?})",
+            game_id, exe_name, exe_path, spawned_pid, install_path
+        );
         finished
     }
 
@@ -58,11 +70,14 @@ impl PlayTimeTracker {
     /// 内部停止追踪，仅从 HashMap 中移除并返回数据，不获取 DB 锁
     fn stop_tracking_internal(&mut self, game_id: &str) -> Option<FinishedSession> {
         if let Some(session) = self.active_sessions.remove(game_id) {
-            let duration = chrono::Utc::now()
+            let duration_secs = chrono::Utc::now()
                 .signed_duration_since(session.start_time)
-                .num_seconds() as u64;
+                .num_seconds();
 
-            if duration > 0 {
+            // 防御：系统时钟回退时 duration 可能为负值，
+            // 负值 as u64 会溢出为巨大正数，导致 play_time_seconds 清零
+            if duration_secs > 0 {
+                let duration = duration_secs as u64;
                 tracing::info!("游戏 {} 结束，时长: {}秒", game_id, duration);
                 return Some(FinishedSession {
                     game_id: game_id.to_string(),
@@ -74,6 +89,47 @@ impl PlayTimeTracker {
         None
     }
 
+    /// 构建进程树：parent → children 映射
+    /// 返回 (parent_to_children, pid_to_exe_path)
+    fn build_process_tree(sys: &System) -> (HashMap<Pid, Vec<Pid>>, HashMap<Pid, String>) {
+        let mut parent_to_children: HashMap<Pid, Vec<Pid>> = HashMap::new();
+        let mut pid_to_exe: HashMap<Pid, String> = HashMap::new();
+
+        for (pid, process) in sys.processes() {
+            if let Some(exe_path) = process.exe() {
+                pid_to_exe.insert(
+                    *pid,
+                    exe_path.to_string_lossy().to_lowercase(),
+                );
+            }
+            if let Some(parent_pid) = process.parent() {
+                parent_to_children
+                    .entry(parent_pid)
+                    .or_default()
+                    .push(*pid);
+            }
+        }
+
+        (parent_to_children, pid_to_exe)
+    }
+
+    /// 递归收集指定 PID 的所有子孙进程
+    fn collect_descendants(root_pid: u32, parent_to_children: &HashMap<Pid, Vec<Pid>>) -> HashSet<Pid> {
+        let root = Pid::from(root_pid as usize);
+        let mut result = HashSet::new();
+        let mut stack = vec![root];
+        while let Some(pid) = stack.pop() {
+            if let Some(children) = parent_to_children.get(&pid) {
+                for &child in children {
+                    if result.insert(child) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        result
+    }
+
     /// 检查活跃会话（定期调用）
     /// 返回已结束的会话数据，由调用方负责持久化到数据库
     pub fn check_active_sessions(&mut self) -> Vec<FinishedSession> {
@@ -82,31 +138,104 @@ impl PlayTimeTracker {
         // 增量刷新进程列表，而非全量重建
         self.sys.refresh_processes();
 
+        // 构建进程树供所有 session 复用
+        let (parent_to_children, pid_to_exe) = Self::build_process_tree(&self.sys);
+
         // 收集需要检查的会话信息，避免借用冲突
-        let sessions_to_check: Vec<(String, String, Option<String>)> = self.active_sessions
+        let sessions_to_check: Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<u32>,
+            Option<String>,
+        )> = self
+            .active_sessions
             .iter()
-            .map(|(id, session)| (id.clone(), session.exe_name.clone(), session.exe_path.clone()))
+            .map(|(id, session)| {
+                (
+                    id.clone(),
+                    session.exe_name.clone(),
+                    session.exe_path.clone(),
+                    session.spawned_pid,
+                    session.install_path.clone(),
+                )
+            })
             .collect();
 
-        for (game_id, exe_name, exe_path) in sessions_to_check {
-            let exe_lower = exe_name.to_lowercase();
+        for (game_id, exe_name, exe_path, spawned_pid, install_path) in sessions_to_check {
+            let mut still_running = false;
 
-            // 优先用完整路径匹配，回退到文件名匹配
-            // 注意：Windows 上 sysinfo 可能返回 NT 设备路径 (\Device\HarddiskVolume...)
-            // 与数据库存储的 DOS 路径 (C:\...) 格式不同，因此路径匹配失败时需回退到进程名
-            let still_running = if let Some(ref expected_path) = exe_path {
-                let expected_lower = expected_path.to_lowercase();
-                self.sys.processes().values().any(|p| {
-                    let path_match = p.exe().map_or(false, |exe| {
-                        exe.to_string_lossy().to_lowercase() == expected_lower
+            // ============================================
+            // 策略 1: 进程树检测 (最可靠)
+            // ============================================
+            if let Some(pid) = spawned_pid {
+                let root_pid = Pid::from(pid as usize);
+
+                // 检查原始 PID 是否还活着
+                let root_alive = pid_to_exe.contains_key(&root_pid);
+
+                // 收集所有子孙进程
+                let descendants = Self::collect_descendants(pid, &parent_to_children);
+
+                // 检查是否有子孙进程还在运行
+                let descendants_alive = descendants.iter().any(|d| pid_to_exe.contains_key(d));
+
+                if root_alive || descendants_alive {
+                    still_running = true;
+                    if !root_alive {
+                        tracing::info!(
+                            "游戏 {} 原始进程 PID {} 已退出，但检测到 {} 个子孙进程仍在运行",
+                            game_id,
+                            pid,
+                            descendants.iter().filter(|d| pid_to_exe.contains_key(d)).count()
+                        );
+                    }
+                }
+            }
+
+            // ============================================
+            // 策略 2: 安装目录检测 (回退)
+            // ============================================
+            if !still_running {
+                if let Some(ref install) = install_path {
+                    // 仅当 install_path 足够具体时才启用此策略
+                    // 避免匹配到不相关进程
+                    if install.len() >= 4 {
+                        let install_lower = install.to_lowercase();
+                        let found_in_install = pid_to_exe.values().any(|exe| {
+                            exe.starts_with(&install_lower)
+                        });
+                        if found_in_install {
+                            still_running = true;
+                            tracing::info!(
+                                "游戏 {} 通过安装目录检测到进程仍然活跃: {}",
+                                game_id,
+                                install
+                            );
+                        }
+                    }
+                }
+            }
+
+            // ============================================
+            // 策略 3: exe 文件名/路径匹配 (兼容旧数据)
+            // ============================================
+            if !still_running {
+                let exe_lower = exe_name.to_lowercase();
+
+                if let Some(ref expected_path) = exe_path {
+                    let expected_lower = expected_path.to_lowercase();
+                    still_running = self.sys.processes().values().any(|p| {
+                        p.exe().map_or(false, |exe| {
+                            exe.to_string_lossy().to_lowercase() == expected_lower
+                        })
                     });
-                    path_match || p.name().to_lowercase() == exe_lower
-                })
-            } else {
-                self.sys.processes().values().any(|p| {
-                    p.name().to_lowercase() == exe_lower
-                })
-            };
+                } else {
+                    still_running = self.sys.processes().values().any(|p| {
+                        p.name().to_lowercase() == exe_lower
+                    });
+                }
+            }
 
             if !still_running {
                 tracing::info!("游戏 {} 已退出", game_id);

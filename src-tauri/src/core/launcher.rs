@@ -6,8 +6,8 @@ use crate::models::*;
 pub struct GameLauncher;
 
 impl GameLauncher {
-    /// 启动游戏
-    pub fn launch(game: &Game) -> Result<()> {
+    /// 启动游戏，返回进程 PID 用于后续进程树追踪
+    pub fn launch(game: &Game) -> Result<u32> {
         let exe_path = game.exe_path.as_ref()
             .ok_or_else(|| anyhow::anyhow!("游戏没有可执行文件路径"))?;
 
@@ -21,9 +21,10 @@ impl GameLauncher {
             cmd.current_dir(install_path);
         }
 
-        cmd.spawn()?;
+        let child = cmd.spawn()?;
+        let pid = child.id();
 
-        tracing::info!("启动游戏: {}", game.name);
-        Ok(())
+        tracing::info!("启动游戏: {} (PID: {})", game.name, pid);
+        Ok(pid)
     }
 }
