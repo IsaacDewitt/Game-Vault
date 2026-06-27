@@ -11,7 +11,6 @@ import {
   NGi,
   NTooltip,
   NProgress,
-  NInput,
   NDropdown,
   useMessage,
 } from "naive-ui";
@@ -29,7 +28,6 @@ import {
   CreateOutline,
   AddOutline,
   CloseOutline,
-  CheckmarkOutline,
 } from "@vicons/ionicons5";
 import CoverPickerModal from "./CoverPickerModal.vue";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -59,9 +57,6 @@ const fetchingLlm = ref(false);
 // 封面选择器状态
 const showCoverPicker = ref(false);
 
-// 存档路径编辑状态
-const editingSavePaths = ref(false);
-const editPaths = ref<string[]>([]);
 
 // 最近游玩记录
 const recentSessions = ref<PlaySessionDetail[]>([]);
@@ -258,27 +253,66 @@ async function handleOpenSavePath(path: string) {
   }
 }
 
-function startEditSavePaths() {
-  editPaths.value = [...(props.game.save_paths || [])];
-  editingSavePaths.value = true;
+async function handleChangeSavePath(index: number) {
+  try {
+    const selected = await open({
+      multiple: false,
+      directory: true,
+      title: "选择存档文件夹",
+    });
+    if (selected) {
+      const paths = [...(props.game.save_paths || [])];
+      paths[index] = selected as string;
+      await api.updateSavePaths(props.game.id, paths);
+      // 更新本地游戏数据
+      const updated = await api.getGameDetail(props.game.id);
+      if (updated) {
+        const idx = store.games.findIndex((g) => g.id === props.game.id);
+        if (idx !== -1) {
+          store.games[idx] = updated;
+        }
+        if (store.selectedGame?.id === props.game.id) {
+          store.selectedGame = updated;
+        }
+      }
+      message.success("存档路径已更新");
+    }
+  } catch (e) {
+    message.error("修改路径失败: " + (e as Error).toString());
+  }
 }
 
-function cancelEditSavePaths() {
-  editingSavePaths.value = false;
-  editPaths.value = [];
+async function handleAddSavePath() {
+  try {
+    const selected = await open({
+      multiple: false,
+      directory: true,
+      title: "选择存档文件夹",
+    });
+    if (selected) {
+      const paths = [...(props.game.save_paths || []), selected as string];
+      await api.updateSavePaths(props.game.id, paths);
+      // 更新本地游戏数据
+      const updated = await api.getGameDetail(props.game.id);
+      if (updated) {
+        const idx = store.games.findIndex((g) => g.id === props.game.id);
+        if (idx !== -1) {
+          store.games[idx] = updated;
+        }
+        if (store.selectedGame?.id === props.game.id) {
+          store.selectedGame = updated;
+        }
+      }
+      message.success("存档路径已添加");
+    }
+  } catch (e) {
+    message.error("添加路径失败: " + (e as Error).toString());
+  }
 }
 
-function addSavePath() {
-  editPaths.value.push("");
-}
-
-function removeSavePath(index: number) {
-  editPaths.value.splice(index, 1);
-}
-
-async function saveSavePaths() {
-  // 过滤空路径
-  const paths = editPaths.value.filter((p) => p.trim() !== "");
+async function handleRemoveSavePath(index: number) {
+  const paths = [...(props.game.save_paths || [])];
+  paths.splice(index, 1);
   try {
     await api.updateSavePaths(props.game.id, paths);
     // 更新本地游戏数据
@@ -292,10 +326,9 @@ async function saveSavePaths() {
         store.selectedGame = updated;
       }
     }
-    editingSavePaths.value = false;
-    message.success("存档路径已更新");
+    message.success("存档路径已删除");
   } catch (e) {
-    message.error("保存失败: " + (e as Error).toString());
+    message.error("删除失败: " + (e as Error).toString());
   }
 }
 </script>
@@ -543,89 +576,42 @@ async function saveSavePaths() {
           <n-icon :component="FolderOpenOutline" size="14" />
           存档路径
           <n-button
-            v-if="!editingSavePaths"
             size="tiny"
             quaternary
-            @click="startEditSavePaths"
+            @click="handleAddSavePath"
             style="margin-left: auto"
           >
             <template #icon>
-              <n-icon :component="CreateOutline" />
+              <n-icon :component="AddOutline" />
             </template>
-            编辑
+            添加
           </n-button>
         </div>
 
-        <!-- 查看模式 -->
-        <div v-if="!editingSavePaths">
-          <div v-if="game.save_paths && game.save_paths.length > 0">
-            <div
-              v-for="(path, index) in game.save_paths"
-              :key="index"
-              class="save-path-item"
-            >
-              <span class="save-path-text" :title="path">{{ path }}</span>
-              <n-tooltip trigger="hover">
-                <template #trigger>
-                  <n-button
-                    size="tiny"
-                    quaternary
-                    @click="handleOpenSavePath(path)"
-                  >
-                    <template #icon>
-                      <n-icon :component="FolderOpenOutline" />
-                    </template>
-                  </n-button>
-                </template>
-                打开文件夹
-              </n-tooltip>
-            </div>
-          </div>
-          <div v-else class="save-path-empty">
-            暂无存档路径信息
+        <div v-if="game.save_paths && game.save_paths.length > 0">
+          <div
+            v-for="(path, index) in game.save_paths"
+            :key="index"
+            class="save-path-item clickable"
+            @click="handleOpenSavePath(path)"
+          >
+            <span class="save-path-text" :title="path">{{ path }}</span>
+            <n-icon
+              :component="CreateOutline"
+              size="14"
+              class="edit-icon"
+              @click.stop="handleChangeSavePath(index)"
+            />
+            <n-icon
+              :component="CloseOutline"
+              size="14"
+              class="delete-icon"
+              @click.stop="handleRemoveSavePath(index)"
+            />
           </div>
         </div>
-
-        <!-- 编辑模式 -->
-        <div v-else>
-          <div
-            v-for="(_, index) in editPaths"
-            :key="index"
-            class="save-path-edit-item"
-          >
-            <n-input
-              v-model:value="editPaths[index]"
-              placeholder="输入存档路径，支持 %APPDATA% 等环境变量"
-              size="small"
-            />
-            <n-button
-              size="tiny"
-              quaternary
-              type="error"
-              @click="removeSavePath(index)"
-            >
-              <template #icon>
-                <n-icon :component="CloseOutline" />
-              </template>
-            </n-button>
-          </div>
-          <n-space style="margin-top: 8px">
-            <n-button size="small" quaternary @click="addSavePath">
-              <template #icon>
-                <n-icon :component="AddOutline" />
-              </template>
-              添加路径
-            </n-button>
-            <n-button size="small" type="primary" @click="saveSavePaths">
-              <template #icon>
-                <n-icon :component="CheckmarkOutline" />
-              </template>
-              保存
-            </n-button>
-            <n-button size="small" quaternary @click="cancelEditSavePaths">
-              取消
-            </n-button>
-          </n-space>
+        <div v-else class="save-path-empty">
+          暂无存档路径信息
         </div>
       </div>
 
@@ -882,8 +868,33 @@ async function saveSavePaths() {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 0;
+  padding: 6px 4px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.save-path-item:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.save-path-item .edit-icon,
+.save-path-item .delete-icon {
+  opacity: 0.3;
+  transition: opacity 0.2s;
+  flex-shrink: 0;
+  color: #888;
+  cursor: pointer;
+}
+
+.save-path-item:hover .edit-icon,
+.save-path-item:hover .delete-icon {
+  opacity: 1;
+}
+
+.save-path-item .delete-icon:hover {
+  color: #e74c3c;
 }
 
 .save-path-text {
@@ -900,12 +911,5 @@ async function saveSavePaths() {
   font-size: 12px;
   color: #666;
   padding: 8px 0;
-}
-
-.save-path-edit-item {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-bottom: 6px;
 }
 </style>
