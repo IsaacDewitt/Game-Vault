@@ -171,23 +171,25 @@ impl PlayTimeTracker {
             if let Some(pid) = spawned_pid {
                 let root_pid = Pid::from(pid as usize);
 
-                // 检查原始 PID 是否还活着
-                let root_alive = pid_to_exe.contains_key(&root_pid);
+                // 检查原始 PID 是否还活着（用 sys.processes() 而非 pid_to_exe，
+                // 因为 pid_to_exe 依赖 GetModuleFileNameExW，对 32-bit 老游戏可能失败）
+                let root_alive = self.sys.processes().contains_key(&root_pid);
 
                 // 收集所有子孙进程
                 let descendants = Self::collect_descendants(pid, &parent_to_children);
 
-                // 检查是否有子孙进程还在运行
-                let descendants_alive = descendants.iter().any(|d| pid_to_exe.contains_key(d));
+                // 检查是否有子孙进程还在运行（同上，用 sys.processes() ）
+                let descendants_alive = descendants.iter().any(|d| self.sys.processes().contains_key(d));
 
                 if root_alive || descendants_alive {
                     still_running = true;
                     if !root_alive {
+                        let alive_count = descendants.iter()
+                            .filter(|d| self.sys.processes().contains_key(d))
+                            .count();
                         tracing::info!(
                             "游戏 {} 原始进程 PID {} 已退出，但检测到 {} 个子孙进程仍在运行",
-                            game_id,
-                            pid,
-                            descendants.iter().filter(|d| pid_to_exe.contains_key(d)).count()
+                            game_id, pid, alive_count
                         );
                     }
                 }
@@ -199,18 +201,25 @@ impl PlayTimeTracker {
             if !still_running {
                 if let Some(ref install) = install_path {
                     // 仅当 install_path 足够具体时才启用此策略
-                    // 避免匹配到不相关进程
                     if install.len() >= 4 {
                         let install_lower = install.to_lowercase();
+
+                        // 两层检查：先查 pid_to_exe（快速，exe 路径缓存），
+                        // 再直接遍历 sys.processes()（覆盖 exe() 失败的 32-bit 老游戏）
                         let found_in_install = pid_to_exe.values().any(|exe| {
                             exe.starts_with(&install_lower)
+                        }) || self.sys.processes().values().any(|p| {
+                            p.exe().map_or(false, |exe| {
+                                exe.to_string_lossy().to_lowercase()
+                                    .starts_with(&install_lower)
+                            })
                         });
+
                         if found_in_install {
                             still_running = true;
                             tracing::info!(
                                 "游戏 {} 通过安装目录检测到进程仍然活跃: {}",
-                                game_id,
-                                install
+                                game_id, install
                             );
                         }
                     }
@@ -238,7 +247,14 @@ impl PlayTimeTracker {
             }
 
             if !still_running {
-                tracing::info!("游戏 {} 已退出", game_id);
+                let descendant_count = spawned_pid
+                    .map(|pid| Self::collect_descendants(pid, &parent_to_children).len())
+                    .unwrap_or(0);
+                tracing::info!(
+                    "游戏 {} 已退出 (spawned_pid: {:?}, descendants_in_tree: {}, \
+                     install_path: {:?}, strategies_exhausted: all)",
+                    game_id, spawned_pid, descendant_count, install_path
+                );
                 if let Some(session) = self.stop_tracking_internal(&game_id) {
                     finished_sessions.push(session);
                 }
