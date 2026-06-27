@@ -3,6 +3,22 @@ use rusqlite::{Connection, params};
 use std::path::Path;
 use crate::models::*;
 
+/// 将时区偏移（秒）格式化为 SQLite 的 strftime 修饰符
+/// 支持非整小时时区（如 UTC+5:30 → "+5.5 hours"，UTC+5:45 → "+5.75 hours"）
+fn format_offset_for_sqlite(offset_secs: i32) -> String {
+    let offset_minutes = offset_secs / 60;
+    // 符号由正负决定，后续用绝对值计算，避免 format 中出现双负号
+    let sign = if offset_minutes >= 0 { "+" } else { "-" };
+    let abs_minutes = offset_minutes.abs();
+    let hours = abs_minutes as f64 / 60.0;
+    // 避免浮点精度问题：如果能整除就显示整数
+    if abs_minutes % 60 == 0 {
+        format!("{}{} hours", sign, abs_minutes / 60)
+    } else {
+        format!("{}{} hours", sign, hours)
+    }
+}
+
 /// SQLite 数据库管理
 pub struct Database {
     conn: Connection,
@@ -482,14 +498,9 @@ impl Database {
 
     /// 获取每日游玩统计
     pub fn get_daily_stats(&self, days: u32) -> Result<Vec<DailyStats>> {
-        // 获取本地时区偏移（秒）
+        // 获取本地时区偏移（秒），支持非整小时时区（如 UTC+5:30）
         let local_offset = chrono::Local::now().offset().local_minus_utc();
-        let offset_hours = local_offset / 3600;
-        let offset_str = if offset_hours >= 0 {
-            format!("+{} hours", offset_hours)
-        } else {
-            format!("{} hours", offset_hours)
-        };
+        let offset_str = format_offset_for_sqlite(local_offset);
 
         let sql = format!(
             "SELECT DATE(start_time, '{}') as date, SUM(duration_seconds) as total, COUNT(*) as sessions
@@ -597,14 +608,9 @@ impl Database {
 
     /// 获取热力图数据（按日期聚合游玩时长）
     pub fn get_heatmap_stats(&self, days: u32) -> Result<Vec<HeatmapDay>> {
-        // 获取本地时区偏移（秒）
+        // 获取本地时区偏移（秒），支持非整小时时区
         let local_offset = chrono::Local::now().offset().local_minus_utc();
-        let offset_hours = local_offset / 3600;
-        let offset_str = if offset_hours >= 0 {
-            format!("+{} hours", offset_hours)
-        } else {
-            format!("{} hours", offset_hours)
-        };
+        let offset_str = format_offset_for_sqlite(local_offset);
 
         let sql = format!(
             "SELECT DATE(start_time, '{}') as date, SUM(duration_seconds) as total
@@ -629,14 +635,9 @@ impl Database {
 
     /// 获取游玩时段分布（24小时 x 7天）
     pub fn get_hourly_stats(&self) -> Result<Vec<HourlyStats>> {
-        // 获取本地时区偏移（秒）
+        // 获取本地时区偏移（秒），支持非整小时时区
         let local_offset = chrono::Local::now().offset().local_minus_utc();
-        let offset_hours = local_offset / 3600;
-        let offset_str = if offset_hours >= 0 {
-            format!("+{} hours", offset_hours)
-        } else {
-            format!("{} hours", offset_hours)
-        };
+        let offset_str = format_offset_for_sqlite(local_offset);
 
         let sql = format!(
             "SELECT

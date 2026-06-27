@@ -36,6 +36,9 @@ onMounted(() => {
       if (props.y + rect.height > windowHeight) {
         adjustedY.value = windowHeight - rect.height - 8;
       }
+      // 防止菜单超出左边界和上边界
+      if (adjustedX.value < 8) adjustedX.value = 8;
+      if (adjustedY.value < 8) adjustedY.value = 8;
     }
   });
 

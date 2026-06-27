@@ -96,9 +96,9 @@ pub fn delete_game(
         game.and_then(|g| g.cover_local)
     };
 
-    // 清理封面缓存文件（.jpg 和 .png）
+    // 清理封面缓存文件（所有可能的扩展名，与 set_game_cover 保持一致）
     let covers_dir = utils::path::get_covers_dir();
-    for ext in &["jpg", "png"] {
+    for ext in &["jpg", "png", "jpeg", "webp"] {
         let cover_path = covers_dir.join(format!("{}.{}", game_id, ext));
         let _ = std::fs::remove_file(cover_path);
     }
@@ -202,6 +202,14 @@ pub fn set_game_cover(
     let covers_dir = utils::path::get_covers_dir();
     utils::path::ensure_dir_exists(&covers_dir).map_err(|e| e.to_string())?;
     let dest = covers_dir.join(format!("{}.{}", game_id, ext));
+
+    // 清理旧封面文件（删除 covers 目录下该 game_id 的所有图片）
+    for old_ext in &["jpg", "png", "jpeg", "webp"] {
+        let old_path = covers_dir.join(format!("{}.{}", game_id, old_ext));
+        if old_path != dest {
+            let _ = std::fs::remove_file(&old_path);
+        }
+    }
 
     std::fs::copy(src, &dest).map_err(|e| format!("复制封面文件失败: {}", e))?;
 
@@ -505,7 +513,10 @@ pub async fn fetch_game_info_llm(
     // 重新获取锁更新游戏数据
     let db_guard = lock_or_recover(&db);
 
-    let mut updated = game;
+    // 重新从数据库读取最新数据，避免覆盖 LLM 请求期间用户的并发修改
+    let mut updated = db_guard.get_game_by_id(&game_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "游戏不存在".to_string())?;
     if let Some(name) = meta.name {
         let trimmed = name.trim().to_string();
         if !trimmed.is_empty() && trimmed != updated.name {
@@ -970,8 +981,10 @@ pub async fn import_saves_backup(
             .map_err(|e| format!("解析 manifest.json 失败: {}", e))?
     };
 
-    // 预处理：构建每个 manifest 条目对应的目标路径映射
-    // 一次性收集所有需要解压的 ZIP 条目 -> 目标路径的映射
+    // 预处理：一次性收集所有 ZIP 文件名，避免对每个 manifest 条目重复遍历 ZIP 目录
+    let all_zip_names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+
+    // 构建每个 manifest 条目对应的目标路径映射
     let mut extract_plan: Vec<(String, std::path::PathBuf)> = Vec::new();
     for entry in &manifest {
         let original_path = entry["original_path"].as_str().unwrap_or("");
@@ -992,16 +1005,16 @@ pub async fn import_saves_backup(
             }
         }
 
-        // 收集该前缀下的所有 ZIP 条目及其目标路径
+        // 从已缓存的 ZIP 文件名列表中筛选该前缀下的条目
         let prefix_with_slash = format!("{}/", zip_prefix);
-        let file_names: Vec<String> = archive.file_names()
-            .filter(|name| *name == zip_prefix || name.starts_with(&prefix_with_slash))
-            .map(|s| s.to_string())
+        let file_names: Vec<&str> = all_zip_names.iter()
+            .filter(|name| name.as_str() == zip_prefix || name.starts_with(&prefix_with_slash))
+            .map(|s| s.as_str())
             .collect();
 
         for file_name in file_names {
             let relative = file_name.strip_prefix(&prefix_with_slash)
-                .unwrap_or(&file_name);
+                .unwrap_or(file_name);
 
             // 安全检查：防止 ZIP 路径穿越攻击（如 prefix/../../etc/important_file）
             let relative_path = std::path::Path::new(relative);
@@ -1027,15 +1040,32 @@ pub async fn import_saves_backup(
                 target_path.join(relative)
             };
             // 最终安全检查：确保解压目标在预期目录下
-            if let Ok(canonical_dest) = dest.canonicalize() {
-                if let Ok(canonical_target) = target_path.canonicalize() {
-                    if !canonical_dest.starts_with(&canonical_target) {
-                        tracing::warn!("跳过目标路径超出预期目录的 ZIP 条目: {}", file_name);
-                        continue;
+            // canonicalize 要求路径存在，因此对不存在的路径使用父目录检查
+            let is_safe = if let Ok(canonical_dest) = dest.canonicalize() {
+                // 路径已存在，直接比较
+                target_path.canonicalize()
+                    .map(|ct| canonical_dest.starts_with(&ct))
+                    .unwrap_or(false)
+            } else {
+                // 路径不存在（新文件），检查其父目录
+                let parent = dest.parent().unwrap_or(&dest);
+                if let Ok(canonical_parent) = parent.canonicalize() {
+                    if let Ok(canonical_target) = target_path.canonicalize() {
+                        // 父目录必须在目标目录下，且文件名不含路径分隔符
+                        canonical_parent.starts_with(&canonical_target)
+                            && dest.file_name().is_some()
+                    } else {
+                        false
                     }
+                } else {
+                    false
                 }
+            };
+            if !is_safe {
+                tracing::warn!("跳过目标路径超出预期目录的 ZIP 条目: {}", file_name);
+                continue;
             }
-            extract_plan.push((file_name, dest));
+            extract_plan.push((file_name.to_string(), dest));
         }
     }
 
@@ -1173,10 +1203,14 @@ pub async fn fetch_missing_game_info(
         match llm_fetcher::fetch_game_meta(&config, &game.name).await {
             Ok(meta) => {
                 // 将获取的信息更新到游戏数据（只更新非空字段，保留用户已有的数据）
-                let update_result = {
+                // 使用闭包限制 ? 传播：单个游戏失败不应中断整个批量处理
+                let update_result: Result<(), String> = (|| {
                     let db_guard = lock_or_recover(&db);
 
-                    let mut updated = game.clone();
+                    // 重新从数据库读取最新数据，避免覆盖 LLM 请求期间用户的并发修改
+                    let mut updated = db_guard.get_game_by_id(&game.id)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "游戏不存在".to_string())?;
                     if let Some(name) = meta.name {
                         let trimmed = name.trim().to_string();
                         if !trimmed.is_empty() && trimmed != updated.name {
@@ -1220,8 +1254,8 @@ pub async fn fetch_missing_game_info(
                         updated.save_paths = meta.save_paths;
                     }
 
-                    db_guard.update_game(&updated)
-                };
+                    db_guard.update_game(&updated).map_err(|e| e.to_string())
+                })();
 
                 match update_result {
                     Ok(_) => {

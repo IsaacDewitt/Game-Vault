@@ -69,6 +69,7 @@ function updateTheme(dark: boolean) {
 }
 
 // 通过 provide/inject 提供给子组件（替代全局 window 属性）
+provide("accentColor", accentColor);
 provide("updateAccentColor", updateAccentColor);
 provide("updateTheme", updateTheme);
 
@@ -156,15 +157,14 @@ onMounted(async () => {
   const win = getCurrentWindow();
   isMaximized.value = await win.isMaximized();
 
-  // 缓存 discrete API 实例，避免每次事件都创建新的 DOM 挂载点
-  const { dialog } = createDiscreteApi(["dialog"], {
-    configProviderProps: {
-      theme: isDark.value ? darkTheme : lightTheme,
-      themeOverrides: themeOverrides.value,
-    },
-  });
-
+  // 每次弹出时使用当前主题创建 discrete API，确保主题实时同步
   unlistenClose = await listen("close-requested", () => {
+    const { dialog } = createDiscreteApi(["dialog"], {
+      configProviderProps: {
+        theme: isDark.value ? darkTheme : lightTheme,
+        themeOverrides: themeOverrides.value,
+      },
+    });
     dialog.warning({
       title: "关闭确认",
       content: "您想要最小化到系统托盘，还是直接退出程序？",

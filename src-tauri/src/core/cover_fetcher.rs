@@ -189,9 +189,11 @@ impl CoverFetcher {
                     let grids_data: serde_json::Value = grids_response.json().await?;
                     if let Some(grids) = grids_data["data"].as_array() {
                         if let Some(first_grid) = grids.first() {
-                            let thumb_url = first_grid["thumb"].as_str().unwrap_or_default();
-                            if !thumb_url.is_empty() {
-                                return Ok(Some(thumb_url.to_string()));
+                            // 优先使用原图 url，回退到缩略图 thumb
+                            let url = first_grid["url"].as_str().filter(|s| !s.is_empty())
+                                .or_else(|| first_grid["thumb"].as_str().filter(|s| !s.is_empty()));
+                            if let Some(url) = url {
+                                return Ok(Some(url.to_string()));
                             }
                         }
                     }
@@ -286,9 +288,12 @@ impl CoverFetcher {
         };
 
         let options: Vec<CoverOption> = grids.iter().filter_map(|grid| {
-            let thumb_url = grid["thumb"].as_str().unwrap_or_default();
-            let url = grid["url"].as_str().unwrap_or_default();
-            if thumb_url.is_empty() || url.is_empty() {
+            // 优先用缩略图展示，无缩略图时用原图作为回退
+            let thumb_url = grid["thumb"].as_str().filter(|s| !s.is_empty())
+                .or_else(|| grid["url"].as_str().filter(|s| !s.is_empty()))
+                .unwrap_or("");
+            let url = grid["url"].as_str().unwrap_or("");
+            if url.is_empty() {
                 return None;
             }
             Some(CoverOption {

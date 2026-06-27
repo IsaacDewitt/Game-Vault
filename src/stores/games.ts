@@ -39,8 +39,18 @@ export const useGamesStore = defineStore("games", () => {
       if (idx !== -1) {
         activeGames.value.splice(idx, 1);
       }
-      // 刷新游戏数据以更新时长
-      loadGames();
+      // 增量更新：只刷新该游戏的数据，而非全量重新加载
+      api.getGameDetail(gameId).then((game) => {
+        if (game) {
+          const gameIdx = games.value.findIndex((g) => g.id === gameId);
+          if (gameIdx !== -1) {
+            games.value[gameIdx] = game;
+          }
+          if (selectedGame.value?.id === gameId) {
+            selectedGame.value = game;
+          }
+        }
+      }).catch(() => {});
     });
 
     // 监听封面获取进度事件
@@ -86,10 +96,19 @@ export const useGamesStore = defineStore("games", () => {
       result = result.filter((g) => g.name.toLowerCase().includes(query));
     }
 
-    // 状态筛选
+    // 状态筛选（与后端 get_status_stats 保持一致：
+    // status='unplayed' 但有游玩时长的游戏视为 'playing'）
     if (statusFilter.value) {
       if (statusFilter.value === "favorites") {
         result = result.filter((g) => g.is_favorite);
+      } else if (statusFilter.value === "playing") {
+        result = result.filter((g) =>
+          g.status === "playing" || (g.status === "unplayed" && g.play_time_seconds > 0)
+        );
+      } else if (statusFilter.value === "unplayed") {
+        result = result.filter((g) =>
+          g.status === "unplayed" && g.play_time_seconds === 0
+        );
       } else {
         result = result.filter((g) => g.status === statusFilter.value);
       }
@@ -109,7 +128,10 @@ export const useGamesStore = defineStore("games", () => {
   // 方法
   let loadGamesLock = false;
   async function loadGames() {
-    if (loadGamesLock) return;
+    if (loadGamesLock) {
+      console.warn("[GamesStore] loadGames 正在执行中，跳过重复调用");
+      return;
+    }
     loadGamesLock = true;
     loading.value = true;
     try {

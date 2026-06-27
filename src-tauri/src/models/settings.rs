@@ -12,7 +12,7 @@ pub struct Settings {
     pub language: String,
     pub steamgriddb_api_key: String,
     /// LLM 协议：openai / anthropic
-    #[serde(default)]
+    #[serde(default = "default_llm_protocol")]
     pub llm_protocol: String,
     /// LLM API Key
     #[serde(default)]
@@ -33,6 +33,10 @@ pub struct Settings {
 
 fn default_accent_color() -> String {
     "#6366f1".to_string()
+}
+
+fn default_llm_protocol() -> String {
+    DEFAULT_LLM_PROTOCOL.to_string()
 }
 
 impl Default for Settings {

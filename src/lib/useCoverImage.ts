@@ -1,4 +1,4 @@
-import { computed, ref, type Ref } from "vue";
+import { computed, ref, watch, type Ref } from "vue";
 import type { Game } from "./tauri";
 import { useGamesStore } from "../stores/games";
 
@@ -12,10 +12,13 @@ export function useCoverImage(game: Ref<Game>) {
   // 标记图片渲染是否失败（base64 数据存在但无法渲染）
   const renderFailed = ref(false);
 
+  // 仅当 game.id 变化时重置渲染失败状态（避免在 computed 内修改 ref 导致死循环）
+  watch(() => game.value.id, () => {
+    renderFailed.value = false;
+  }, { immediate: true });
+
   // 直接从 store 的 base64 缓存中获取封面
   const coverImage = computed(() => {
-    // 当 game.id 变化时重置渲染失败状态
-    renderFailed.value = false;
     return store.coverBase64Cache[game.value.id] || null;
   });
 

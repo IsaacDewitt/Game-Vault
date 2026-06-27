@@ -174,7 +174,7 @@ function handleContextMenu(e: MouseEvent) {
 }
 
 .game-card.active {
-  border: 2px solid #6366f1;
+  border: 2px solid var(--accent-color, #6366f1);
 }
 
 .cover {
@@ -230,12 +230,12 @@ function handleContextMenu(e: MouseEvent) {
 }
 
 .launch-btn {
-  background: #6366f1;
+  background: var(--accent-color, #6366f1);
   color: white;
 }
 
 .launch-btn:hover {
-  background: #4f46e5;
+  filter: brightness(0.85);
 }
 
 .fav-btn {
@@ -255,7 +255,7 @@ function handleContextMenu(e: MouseEvent) {
   border-radius: 4px;
   font-size: 11px;
   color: white;
-  background: rgba(99, 102, 241, 0.9);
+  background: color-mix(in srgb, var(--accent-color, #6366f1) 90%, transparent);
   display: flex;
   align-items: center;
   gap: 6px;

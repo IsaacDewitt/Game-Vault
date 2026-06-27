@@ -92,12 +92,15 @@ impl PlayTimeTracker {
             let exe_lower = exe_name.to_lowercase();
 
             // 优先用完整路径匹配，回退到文件名匹配
+            // 注意：Windows 上 sysinfo 可能返回 NT 设备路径 (\Device\HarddiskVolume...)
+            // 与数据库存储的 DOS 路径 (C:\...) 格式不同，因此路径匹配失败时需回退到进程名
             let still_running = if let Some(ref expected_path) = exe_path {
                 let expected_lower = expected_path.to_lowercase();
                 self.sys.processes().values().any(|p| {
-                    p.exe().map_or(false, |exe| {
+                    let path_match = p.exe().map_or(false, |exe| {
                         exe.to_string_lossy().to_lowercase() == expected_lower
-                    })
+                    });
+                    path_match || p.name().to_lowercase() == exe_lower
                 })
             } else {
                 self.sys.processes().values().any(|p| {

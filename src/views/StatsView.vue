@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onActivated, onUnmounted, computed, watch, nextTick } from "vue";
+import { ref, inject, onMounted, onActivated, onUnmounted, computed, watch, nextTick, type Ref } from "vue";
 import { lightenColor } from "../lib/color";
 import {
   NCard,
@@ -52,6 +52,9 @@ import { formatPlayTime, formatDate } from "../lib/format";
 import { DEFAULT_ACCENT_COLOR, DEFAULT_ACCENT_RGB, COLOR_DARK_BG, COVER_SAMPLE_SIZE, COVER_BRIGHTNESS_MIN, COVER_BRIGHTNESS_MAX } from "../lib/constants";
 
 const gamesStore = useGamesStore();
+
+// 从 App.vue 注入响应式主题色，用于图表动态配色
+const accentColor = inject<Ref<string>>("accentColor", ref(DEFAULT_ACCENT_COLOR));
 
 use([
   CanvasRenderer,
@@ -561,13 +564,13 @@ const lineOption = computed(() => ({
           type: "linear",
           x: 0, y: 0, x2: 0, y2: 1,
           colorStops: [
-            { offset: 0, color: "rgba(99,102,241,0.3)" },
-            { offset: 1, color: "rgba(99,102,241,0.05)" },
+            { offset: 0, color: accentColor.value + "4d" },
+            { offset: 1, color: accentColor.value + "0d" },
           ],
         },
       },
-      lineStyle: { color: DEFAULT_ACCENT_COLOR, width: 2 },
-      itemStyle: { color: DEFAULT_ACCENT_COLOR },
+      lineStyle: { color: accentColor.value, width: 2 },
+      itemStyle: { color: accentColor.value },
     },
   ],
 }));
