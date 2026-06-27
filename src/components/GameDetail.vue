@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, toRef, computed, watch } from "vue";
+import { ref, toRef, computed, watch, onMounted, onUnmounted } from "vue";
 import {
   NDrawer,
   NDrawerContent,
@@ -49,6 +49,11 @@ const emit = defineEmits<{
   delete: [];
   setStatus: [status: string];
 }>();
+
+// 阻止 drawer 遮罩层的右键默认菜单（Naive UI 内部渲染的 mask 元素，Vue 的 @contextmenu.prevent 管不到）
+const preventMaskContextMenu = (e: MouseEvent) => e.preventDefault();
+onMounted(() => document.addEventListener("contextmenu", preventMaskContextMenu));
+onUnmounted(() => document.removeEventListener("contextmenu", preventMaskContextMenu));
 
 const store = useGamesStore();
 const message = useMessage();
