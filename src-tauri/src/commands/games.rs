@@ -3,7 +3,7 @@ use tauri_plugin_opener::OpenerExt;
 use std::sync::{Arc, Mutex};
 use crate::core::{Database, PlayTimeTracker, GameLauncher};
 use crate::core::cover_fetcher::CoverFetcher;
-use crate::core::llm_fetcher::{self, LlmConfig, LlmProtocol};
+use crate::core::llm_fetcher::{LlmFetcher, LlmConfig, LlmProtocol};
 use crate::models::*;
 use crate::models::settings::Settings;
 use crate::utils;
@@ -512,7 +512,8 @@ pub async fn fetch_game_info_llm(
     };
 
     // 此处已无 MutexGuard，可以安全 .await
-    let meta = llm_fetcher::fetch_game_meta(&config, &game.name)
+    let fetcher = LlmFetcher::new().map_err(|e| format!("创建 LLM 客户端失败: {}", e))?;
+    let meta = fetcher.fetch_game_meta(&config, &game.name)
         .await
         .map_err(|e| format!("LLM 获取游戏信息失败: {}", e))?;
 
@@ -1194,6 +1195,10 @@ pub async fn fetch_missing_game_info(
     };
 
     // 阶段2：逐个获取游戏信息（串行，避免 API 限流）
+    let fetcher = match LlmFetcher::new() {
+        Ok(f) => f,
+        Err(e) => return Err(format!("创建 LLM 客户端失败: {}", e)),
+    };
     let mut fetched_count: u32 = 0;
     let mut errors: Vec<String> = Vec::new();
 
@@ -1206,7 +1211,7 @@ pub async fn fetch_missing_game_info(
         }));
 
         // 调用 LLM 获取游戏信息
-        match llm_fetcher::fetch_game_meta(&config, &game.name).await {
+        match fetcher.fetch_game_meta(&config, &game.name).await {
             Ok(meta) => {
                 // 将获取的信息更新到游戏数据（只更新非空字段，保留用户已有的数据）
                 // 使用闭包限制 ? 传播：单个游戏失败不应中断整个批量处理

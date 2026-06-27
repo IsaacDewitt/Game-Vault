@@ -29,8 +29,20 @@ pub const WEB_SEARCH_TIMEOUT_SECS: u64 = 15;
 /// LLM 工具调用最大循环次数（防止无限循环）
 pub const LLM_MAX_TOOL_ITERATIONS: u32 = 5;
 
-/// LLM 最大输出 token 数
-pub const LLM_MAX_TOKENS: u32 = 1024;
+/// LLM 最大输出 token 数（需要容纳完整游戏信息 + 存档路径）
+pub const LLM_MAX_TOKENS: u32 = 2048;
+
+// ==================== 网络搜索 ====================
+
+/// SearXNG 公开实例列表（按优先级排序，依次尝试）
+pub const SEARCH_ENGINE_INSTANCES: &[&str] = &[
+    "https://searxng.site",
+    "https://search.sapti.me",
+    "https://searx.tiekoetter.com",
+];
+
+/// 搜索结果最大返回条数
+pub const SEARCH_RESULT_LIMIT: usize = 5;
 
 // ==================== 文件 I/O ====================
 
