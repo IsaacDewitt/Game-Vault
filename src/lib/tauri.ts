@@ -305,3 +305,11 @@ export async function getPlaySessions(gameId?: string, limit?: number, offset?: 
 export async function quitApp(): Promise<void> {
   return invoke("quit_app");
 }
+
+export async function getAutostartEnabled(): Promise<boolean> {
+  return invoke("get_autostart_enabled");
+}
+
+export async function setAutostartEnabled(enabled: boolean): Promise<void> {
+  return invoke("set_autostart_enabled", { enabled });
+}

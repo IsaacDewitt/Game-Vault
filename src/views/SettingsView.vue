@@ -96,6 +96,8 @@ const exporting = ref(false);
 const importing = ref(false);
 const exportingSaves = ref(false);
 const importingSaves = ref(false);
+const autostartEnabled = ref(false);
+const autostartLoading = ref(false);
 
 async function loadSettings() {
   loading.value = true;
@@ -188,7 +190,34 @@ async function handleImportData() {
   }
 }
 
-onMounted(loadSettings);
+async function loadAutostartState() {
+  try {
+    autostartEnabled.value = await api.getAutostartEnabled();
+  } catch (e) {
+    console.error("获取自启动状态失败:", e);
+  }
+}
+
+async function toggleAutostart(enabled: boolean) {
+  autostartLoading.value = true;
+  try {
+    await api.setAutostartEnabled(enabled);
+    autostartEnabled.value = enabled;
+    message.success(enabled ? "已开启开机自启动" : "已关闭开机自启动");
+  } catch (e) {
+    console.error("设置自启动失败:", e);
+    message.error("设置自启动失败");
+    // 恢复原状态
+    autostartEnabled.value = !enabled;
+  } finally {
+    autostartLoading.value = false;
+  }
+}
+
+onMounted(() => {
+  loadSettings();
+  loadAutostartState();
+});
 
 // 组件卸载时清理定时器
 onUnmounted(() => {
@@ -311,6 +340,16 @@ async function handleImportSaves() {
     <!-- 基本设置 -->
     <n-card title="基本设置" style="margin-bottom: 16px">
       <n-form label-placement="left" label-width="140">
+        <n-form-item label="开机自启动">
+          <n-switch
+            v-model:value="autostartEnabled"
+            :loading="autostartLoading"
+            @update:value="toggleAutostart"
+          />
+          <span style="margin-left: 12px; font-size: 12px; color: #888">
+            开启后将在系统启动时自动运行 Game Vault
+          </span>
+        </n-form-item>
         <n-form-item label="SteamGridDB API Key">
           <n-input
             v-model:value="settings.steamgriddb_api_key"

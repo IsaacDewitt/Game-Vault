@@ -34,6 +34,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![]),
+        ))
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // 当用户尝试打开第二个实例时，将已有窗口显示到前台
             if let Some(window) = app.get_webview_window("main") {
@@ -213,6 +217,8 @@ pub fn run() {
             // 设置相关
             commands::settings::get_settings,
             commands::settings::save_settings,
+            commands::settings::get_autostart_enabled,
+            commands::settings::set_autostart_enabled,
             // 应用
             quit_app,
         ])
