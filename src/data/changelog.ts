@@ -6,6 +6,15 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "0.4.4",
+    date: "2026-07-03",
+    changes: [
+      "新增开机自启动功能，可在设置中开关",
+      "优化 exe 版本号读取：使用文件修改时间+大小缓存，仅文件变化时才重新读取",
+      "数据库迁移支持自动添加 exe 文件元数据缓存字段",
+    ],
+  },
+  {
     version: "0.4.3",
     date: "2026-06-27",
     changes: [

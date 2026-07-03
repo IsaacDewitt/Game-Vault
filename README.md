@@ -5,7 +5,7 @@
 基于 **Tauri 2.0** + **Rust** + **Vue 3** 构建，本机运行，数据完全离线。
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.2-6366f1" alt="version">
+  <img src="https://img.shields.io/badge/version-0.4.4-6366f1" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2B-blue" alt="platform">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
 </p>
@@ -23,7 +23,7 @@
 | 收藏 | 收藏常玩游戏，快速访问 |
 | 重命名 / 删除 | 右键菜单操作，支持批量管理 |
 | 游戏详情 | 侧边抽屉展示完整信息：封面、版本、时长、HLTB、存档路径 |
-| 版本号读取 | 自动从 exe 文件读取产品版本号 |
+| 版本号读取 | 自动从 exe 文件读取产品版本号，文件元数据缓存避免重复读取 |
 
 ### 🤖 智能信息获取
 
@@ -62,6 +62,7 @@
 - **自定义强调色**：8 种预设 + 手动输入，图表、按钮、边框实时跟随
 - **自定义标题栏**：双击空白区域最大化 / 还原
 - **系统托盘**：关闭窗口时选择最小化到托盘继续追踪
+- **开机自启动**：可在设置中开关，Windows 启动时自动运行
 
 ### 💾 数据管理
 
