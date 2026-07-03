@@ -35,6 +35,10 @@ pub struct Game {
     /// 游戏存档路径列表
     #[serde(default)]
     pub save_paths: Vec<String>,
+    /// exe 文件最后修改时间（Unix 时间戳秒数），用于缓存判断
+    pub exe_modified_at: Option<i64>,
+    /// exe 文件大小（字节），用于缓存判断
+    pub exe_file_size: Option<i64>,
 }
 
 impl Game {
@@ -65,6 +69,8 @@ impl Game {
             hltb_main_extra: None,
             hltb_completionist: None,
             save_paths: Vec::new(),
+            exe_modified_at: None,
+            exe_file_size: None,
         }
     }
 

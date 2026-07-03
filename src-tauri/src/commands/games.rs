@@ -147,12 +147,19 @@ pub fn add_game_manual(
     // 从 exe 文件读取版本号
     game.exe_version = utils::path::read_exe_version(&exe_path);
 
+    // 获取并保存文件元数据（用于后续缓存判断）
+    if let Some(metadata) = utils::path::get_file_metadata(&exe_path) {
+        game.exe_modified_at = Some(metadata.modified_at);
+        game.exe_file_size = Some(metadata.file_size);
+    }
+
     db.upsert_game(&game).map_err(|e| e.to_string())?;
     Ok(game)
 }
 
 /// 启动时批量刷新所有游戏的 exe 版本号
 /// 仅对有 exe_path 且版本号为空或 exe 文件已变更的游戏进行更新
+/// 使用文件元数据（修改时间 + 文件大小）进行缓存判断，避免每次都读取 exe 文件
 #[tauri::command]
 pub fn refresh_exe_versions(
     db: State<'_, Arc<Mutex<Database>>>,
@@ -168,18 +175,44 @@ pub fn refresh_exe_versions(
             None => continue,
         };
 
-        // 读取当前 exe 的版本号
-        let new_version = utils::path::read_exe_version(&exe_path);
+        // 获取当前文件元数据
+        let current_metadata = utils::path::get_file_metadata(&exe_path);
 
-        // 仅当版本号有变化时才更新数据库
-        if new_version != game.exe_version {
-            let mut updated_game = game.clone();
-            updated_game.exe_version = new_version;
-            updated_game.updated_at = Some(chrono::Utc::now().to_rfc3339());
-            if let Err(e) = db_guard.update_game(&updated_game) {
-                tracing::warn!("更新游戏版本号失败 {}: {}", updated_game.name, e);
-            } else {
-                updated += 1;
+        match current_metadata {
+            Some(metadata) => {
+                // 检查文件是否发生变化（比较修改时间和文件大小）
+                let file_changed = match (game.exe_modified_at, game.exe_file_size) {
+                    (Some(cached_modified), Some(cached_size)) => {
+                        // 有缓存，比较元数据
+                        metadata.modified_at != cached_modified || metadata.file_size != cached_size
+                    }
+                    _ => {
+                        // 没有缓存，需要读取版本号
+                        true
+                    }
+                };
+
+                if file_changed {
+                    // 文件发生变化或没有缓存，读取版本号
+                    let new_version = utils::path::read_exe_version(&exe_path);
+
+                    let mut updated_game = game.clone();
+                    updated_game.exe_version = new_version;
+                    updated_game.exe_modified_at = Some(metadata.modified_at);
+                    updated_game.exe_file_size = Some(metadata.file_size);
+                    updated_game.updated_at = Some(chrono::Utc::now().to_rfc3339());
+
+                    if let Err(e) = db_guard.update_game(&updated_game) {
+                        tracing::warn!("更新游戏版本号失败 {}: {}", updated_game.name, e);
+                    } else {
+                        updated += 1;
+                    }
+                }
+                // 文件没变化，跳过
+            }
+            None => {
+                // 文件不存在或无法读取元数据，跳过
+                tracing::debug!("无法读取文件元数据: {}", exe_path);
             }
         }
     }
@@ -702,6 +735,16 @@ pub fn update_exe_path(
         .to_string_lossy()
         .to_string());
     game.exe_version = utils::path::read_exe_version(&new_exe_path);
+
+    // 获取并保存文件元数据（用于后续缓存判断）
+    if let Some(metadata) = utils::path::get_file_metadata(&new_exe_path) {
+        game.exe_modified_at = Some(metadata.modified_at);
+        game.exe_file_size = Some(metadata.file_size);
+    } else {
+        game.exe_modified_at = None;
+        game.exe_file_size = None;
+    }
+
     game.updated_at = Some(chrono::Utc::now().to_rfc3339());
 
     db.update_game(&game).map_err(|e| e.to_string())?;

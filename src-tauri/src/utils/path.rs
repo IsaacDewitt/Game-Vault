@@ -1,5 +1,34 @@
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use super::constants::EXE_VERSION_READ_LIMIT;
+
+/// 文件元数据信息（用于缓存判断）
+pub struct FileMetadata {
+    /// 最后修改时间（Unix 时间戳秒数）
+    pub modified_at: i64,
+    /// 文件大小（字节）
+    pub file_size: i64,
+}
+
+/// 获取文件的元数据（修改时间和大小）
+/// 用于判断文件是否发生变化，避免每次都读取 exe 版本
+pub fn get_file_metadata(path: &str) -> Option<FileMetadata> {
+    let metadata = std::fs::metadata(path).ok()?;
+
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let file_size = metadata.len() as i64;
+
+    Some(FileMetadata {
+        modified_at,
+        file_size,
+    })
+}
 
 /// 获取应用数据目录
 pub fn get_app_data_dir() -> PathBuf {

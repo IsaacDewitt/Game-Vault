@@ -99,6 +99,9 @@ impl Database {
         // 迁移：为旧数据库添加 exe_version 字段
         self.migrate_add_exe_version_column()?;
 
+        // 迁移：为旧数据库添加 exe 文件元数据缓存字段
+        self.migrate_add_exe_metadata_columns()?;
+
         // 创建 status 索引（在列存在之后）
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_games_status ON games(status);"
@@ -150,6 +153,7 @@ impl Database {
         // 11:release_date 12:genres 13:play_time_seconds 14:last_played
         // 15:play_count 16:is_favorite 17:status 18:added_at 19:updated_at
         // 20:hltb_main_story 21:hltb_main_extra 22:hltb_completionist 23:save_paths
+        // 24:exe_modified_at 25:exe_file_size
         let genres_str: String = row.get(12)?;
         let genres: Vec<String> = serde_json::from_str(&genres_str).unwrap_or_default();
 
@@ -183,6 +187,8 @@ impl Database {
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default()
             },
+            exe_modified_at: row.get(24)?,
+            exe_file_size: row.get(25)?,
         })
     }
 
@@ -192,7 +198,7 @@ impl Database {
         genres, play_time_seconds, last_played, play_count,
         is_favorite, status, added_at, updated_at,
         hltb_main_story, hltb_main_extra, hltb_completionist,
-        save_paths
+        save_paths, exe_modified_at, exe_file_size
     ";
 
     // ==================== 游戏 CRUD ====================
@@ -206,9 +212,9 @@ impl Database {
                 genres, play_time_seconds, last_played, play_count,
                 is_favorite, status, added_at, updated_at,
                 hltb_main_story, hltb_main_extra, hltb_completionist,
-                save_paths
+                save_paths, exe_modified_at, exe_file_size
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -231,7 +237,9 @@ impl Database {
                 hltb_main_story = COALESCE(excluded.hltb_main_story, games.hltb_main_story),
                 hltb_main_extra = COALESCE(excluded.hltb_main_extra, games.hltb_main_extra),
                 hltb_completionist = COALESCE(excluded.hltb_completionist, games.hltb_completionist),
-                save_paths = excluded.save_paths
+                save_paths = excluded.save_paths,
+                exe_modified_at = excluded.exe_modified_at,
+                exe_file_size = excluded.exe_file_size
             ",
             params![
                 game.id,
@@ -258,6 +266,8 @@ impl Database {
                 game.hltb_main_extra.map(|v| v as i64),
                 game.hltb_completionist.map(|v| v as i64),
                 serde_json::to_string(&game.save_paths)?,
+                game.exe_modified_at,
+                game.exe_file_size,
             ],
         )?;
         Ok(())
@@ -395,8 +405,8 @@ impl Database {
                 developer = ?9, publisher = ?10, release_date = ?11,
                 genres = ?12, is_favorite = ?13, status = ?14, updated_at = ?15,
                 hltb_main_story = ?16, hltb_main_extra = ?17, hltb_completionist = ?18,
-                save_paths = ?19
-             WHERE id = ?20",
+                save_paths = ?19, exe_modified_at = ?20, exe_file_size = ?21
+             WHERE id = ?22",
             params![
                 game.name,
                 game.install_path,
@@ -417,6 +427,8 @@ impl Database {
                 game.hltb_main_extra.map(|v| v as i64),
                 game.hltb_completionist.map(|v| v as i64),
                 serde_json::to_string(&game.save_paths)?,
+                game.exe_modified_at,
+                game.exe_file_size,
                 game.id,
             ],
         )?;
@@ -828,6 +840,29 @@ impl Database {
                 [],
             )?;
             tracing::info!("已添加 exe_version 字段到 games 表");
+        }
+
+        Ok(())
+    }
+
+    /// 迁移：添加 exe 文件元数据缓存字段到旧数据库
+    fn migrate_add_exe_metadata_columns(&self) -> Result<()> {
+        if !self.has_column("games", "exe_modified_at")? {
+            tracing::info!("exe_modified_at 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE games ADD COLUMN exe_modified_at INTEGER",
+                [],
+            )?;
+            tracing::info!("已添加 exe_modified_at 字段到 games 表");
+        }
+
+        if !self.has_column("games", "exe_file_size")? {
+            tracing::info!("exe_file_size 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE games ADD COLUMN exe_file_size INTEGER",
+                [],
+            )?;
+            tracing::info!("已添加 exe_file_size 字段到 games 表");
         }
 
         Ok(())

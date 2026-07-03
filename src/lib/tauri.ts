@@ -33,6 +33,10 @@ export interface Game {
   hltb_completionist: number | null;
   /** 游戏存档路径列表 */
   save_paths: string[];
+  /** exe 文件最后修改时间（Unix 时间戳秒数），用于缓存判断 */
+  exe_modified_at: number | null;
+  /** exe 文件大小（字节），用于缓存判断 */
+  exe_file_size: number | null;
 }
 
 export interface GameFilter {
