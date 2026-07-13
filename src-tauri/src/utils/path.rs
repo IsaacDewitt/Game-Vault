@@ -60,17 +60,69 @@ pub fn ensure_dir_exists(path: &Path) -> std::io::Result<()> {
 }
 
 /// 展开路径中的 Windows 环境变量（如 %APPDATA%、%USERPROFILE% 等）
+/// 支持 %% 表示字面量百分号（如 %%USERPROFILE%% 等同于 %USERPROFILE%）
+/// 支持不带 % 的常见环境变量名开头（如 USERPROFILE\Documents\...）
 pub fn expand_env_vars(path: &str) -> String {
-    let mut result = path.to_string();
+    // 规范化：去除首尾空白和不可见字符，统一斜杠
+    let trimmed: String = path.chars().filter(|c| !c.is_control()).collect();
+    let mut result = trimmed.trim().to_string();
 
-    // 匹配 %VARNAME% 格式的环境变量
+    /// 解析环境变量，优先系统环境变量，兜底用 dirs crate
+    fn resolve_env_var(var_name: &str) -> Option<String> {
+        if let Ok(val) = std::env::var(var_name) {
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+        match var_name {
+            "USERPROFILE" | "HOME" => dirs::home_dir().map(|p| p.to_string_lossy().to_string()),
+            "APPDATA" => dirs::config_dir().map(|p| p.to_string_lossy().to_string()),
+            "LOCALAPPDATA" => dirs::data_local_dir().map(|p| p.to_string_lossy().to_string()),
+            "TEMP" | "TMP" => Some(std::env::temp_dir().to_string_lossy().to_string()),
+            "PUBLIC" => std::env::var("PUBLIC").ok().filter(|s| !s.is_empty()),
+            _ => None,
+        }
+    }
+
+    // 第一步：把 %%VARNAME%% 规范化为 %VARNAME%
+    // 用正则太重，手动解析：找到 %%...%% 结构，直接替换为 %...%
+    {
+        let mut normalized = String::with_capacity(result.len());
+        let bytes = result.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if i + 3 < bytes.len() && bytes[i] == b'%' && bytes[i + 1] == b'%' {
+                // 找到 %% 开头，看看后面有没有 %%
+                if let Some(end) = result[i + 2..].find("%%") {
+                    let var_name = &result[i + 2..i + 2 + end];
+                    // 确保变量名非空且不含 %（避免误匹配）
+                    if !var_name.is_empty() && !var_name.contains('%') {
+                        normalized.push('%');
+                        normalized.push_str(var_name);
+                        normalized.push('%');
+                        i = i + 2 + end + 2; // 跳过整个 %%VARNAME%%
+                        continue;
+                    }
+                }
+            }
+            normalized.push(bytes[i] as char);
+            i += 1;
+        }
+        result = normalized;
+    }
+
+    // 第二步：展开 %VARNAME% 格式
     let mut start = 0;
     while let Some(prefix_pos) = result[start..].find('%') {
         let abs_prefix = start + prefix_pos;
         if let Some(suffix_pos) = result[abs_prefix + 1..].find('%') {
             let abs_suffix = abs_prefix + 1 + suffix_pos;
             let var_name = &result[abs_prefix + 1..abs_suffix];
-            if let Ok(var_value) = std::env::var(var_name) {
+            if var_name.is_empty() {
+                start = abs_suffix + 1;
+                continue;
+            }
+            if let Some(var_value) = resolve_env_var(var_name) {
                 result = format!("{}{}{}", &result[..abs_prefix], var_value, &result[abs_suffix + 1..]);
                 start = abs_prefix + var_value.len();
             } else {
@@ -81,7 +133,27 @@ pub fn expand_env_vars(path: &str) -> String {
         }
     }
 
-    // 处理 ~ 路径（Unix 风格，部分 Windows 工具也支持）
+    // 第二步：处理不带 % 的裸变量名（如 "USERPROFILE\Documents\..."）
+    // 按长度倒序匹配，避免短名称误匹配长名称前缀
+    const COMMON_ENV_VARS: &[&str] = &[
+        "CommonProgramFiles(x86)", "ProgramFiles(x86)",
+        "USERPROFILE", "LOCALAPPDATA", "CommonProgramFiles",
+        "APPDATA", "ProgramFiles", "SystemRoot", "TEMP", "PUBLIC", "TMP",
+    ];
+    for var_name in COMMON_ENV_VARS {
+        if result.len() > var_name.len()
+            && result.starts_with(var_name)
+            && matches!(result.as_bytes().get(var_name.len()), Some(b'\\') | Some(b'/'))
+        {
+            if let Some(val) = resolve_env_var(var_name) {
+                let after = &result[var_name.len()..];
+                result = format!("{}{}", val, after);
+            }
+            break;
+        }
+    }
+
+    // 处理 ~ 路径
     if result.starts_with('~') {
         if let Some(home) = dirs::home_dir() {
             if result.len() == 1 || result.starts_with("~/") || result.starts_with("~\\") {

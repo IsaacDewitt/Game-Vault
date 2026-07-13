@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, toRef } from "vue";
 import { NIcon, NEllipsis } from "naive-ui";
-import { HeartOutline, Heart, PlayOutline } from "@vicons/ionicons5";
+import { HeartOutline, Heart, PlayOutline, FolderOutline } from "@vicons/ionicons5";
 import type { Game } from "../lib/tauri";
 import { formatPlayTime } from "../lib/format";
 import { useCoverImage } from "../lib/useCoverImage";
@@ -11,6 +11,8 @@ import type { ContextMenuItem } from "./ContextMenu.vue";
 const props = defineProps<{
   game: Game;
   isActive?: boolean;
+  /** 存档路径检查结果：true=存在, false=不存在, undefined=未检查 */
+  savePathExists?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -135,6 +137,16 @@ function handleContextMenu(e: MouseEvent) {
       <!-- 已通关 -->
       <div v-if="game.status === 'completed'" class="completed-badge">
         🏆 已通关
+      </div>
+
+      <!-- 存档路径状态图标 -->
+      <div
+        v-if="savePathExists !== undefined"
+        class="save-status-icon"
+        :class="{ exists: savePathExists }"
+        :title="savePathExists ? '存档路径存在' : '存档路径不存在或未设置'"
+      >
+        <n-icon :component="FolderOutline" />
       </div>
     </div>
 
@@ -276,6 +288,27 @@ function handleContextMenu(e: MouseEvent) {
   font-size: 11px;
   color: white;
   background: rgba(34, 197, 94, 0.9);
+}
+
+.save-status-icon {
+  position: absolute;
+  bottom: 6px;
+  left: 6px;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  color: rgba(180, 180, 180, 0.7);
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  pointer-events: none;
+}
+
+.save-status-icon.exists {
+  color: #60a5fa;
 }
 
 .pulse {

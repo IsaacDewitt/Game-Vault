@@ -283,6 +283,8 @@ async function handleChangeSavePath(index: number) {
           store.selectedGame = updated;
         }
       }
+      // 刷新存档路径状态图标
+      store.updateSingleSavePathStatus(props.game.id);
       message.success("存档路径已更新");
     }
   } catch (e) {
@@ -311,6 +313,8 @@ async function handleAddSavePath() {
           store.selectedGame = updated;
         }
       }
+      // 刷新存档路径状态图标
+      store.updateSingleSavePathStatus(props.game.id);
       message.success("存档路径已添加");
     }
   } catch (e) {
@@ -334,6 +338,8 @@ async function handleRemoveSavePath(index: number) {
         store.selectedGame = updated;
       }
     }
+    // 刷新存档路径状态图标
+    store.updateSingleSavePathStatus(props.game.id);
     message.success("存档路径已删除");
   } catch (e) {
     message.error("删除失败: " + (e as Error).toString());

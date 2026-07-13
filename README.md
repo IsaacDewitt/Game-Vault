@@ -5,7 +5,7 @@
 基于 **Tauri 2.0** + **Rust** + **Vue 3** 构建，本机运行，数据完全离线。
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.4-6366f1" alt="version">
+  <img src="https://img.shields.io/badge/version-0.4.5-6366f1" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2B-blue" alt="platform">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
 </p>
@@ -24,6 +24,7 @@
 | 重命名 / 删除 | 右键菜单操作，支持批量管理 |
 | 游戏详情 | 侧边抽屉展示完整信息：封面、版本、时长、HLTB、存档路径 |
 | 版本号读取 | 自动从 exe 文件读取产品版本号，文件元数据缓存避免重复读取 |
+| 存档检查 | 一键检查所有游戏存档路径是否存在，游戏卡片显示状态图标（蓝色=存在，灰色=不存在） |
 
 ### 🤖 智能信息获取
 
@@ -70,7 +71,7 @@
 |------|------|
 | JSON 导出 | 导出全部游戏数据和设置为 JSON 文件 |
 | JSON 导入 | 从备份文件恢复数据，自动合并设置 |
-| 存档路径 | 为每个游戏配置存档目录，支持批量管理 |
+| 存档路径 | 为每个游戏配置存档目录，支持批量管理；环境变量展开兼容 `%%VAR%%`、`%VAR%`、裸变量名三种格式 |
 | 存档备份 | 将配置的存档路径打包为 ZIP 导出 |
 | 存档恢复 | 从 ZIP 备份还原存档文件，含路径穿越安全防护 |
 

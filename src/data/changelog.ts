@@ -6,6 +6,16 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "0.4.5",
+    date: "2026-07-13",
+    changes: [
+      "新增存档检查功能：一键检查所有游戏存档路径是否存在，游戏卡片左下角显示状态图标",
+      "存档路径点击打开时，若精确路径不存在，自动向上查找游戏级父文件夹",
+      "修复环境变量展开：兼容 %%VARNAME%%、%VARNAME%、裸变量名三种格式",
+      "环境变量解析增加 dirs crate 兜底，USERPROFILE/APPDATA/LOCALAPPDATA 等在进程环境变量缺失时仍可正确解析",
+    ],
+  },
+  {
     version: "0.4.4",
     date: "2026-07-03",
     changes: [

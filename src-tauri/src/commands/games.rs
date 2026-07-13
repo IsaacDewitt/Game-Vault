@@ -901,20 +901,53 @@ pub fn read_covers_batch_as_base64(paths: Vec<String>) -> Result<std::collection
 }
 
 /// 打开存档路径（在文件管理器中）
+/// 如果精确路径不存在，自动向上查找存在的游戏级父文件夹并打开
 #[tauri::command]
 pub async fn open_save_path(path: String, app_handle: tauri::AppHandle) -> Result<(), String> {
+    /// 系统/用户级大文件夹名称（与 check_save_paths 保持一致）
+    const GENERIC_DIRS: &[&str] = &[
+        "Documents", "文档", "My Documents",
+        "AppData", "Local", "Roaming", "LocalLow",
+        "ProgramData", "Program Files", "Program Files (x86)",
+        "Users", "Windows", "System32",
+        "Saved Games", "AppDataLocal", "AppDataRoaming",
+    ];
+
     let expanded = utils::path::expand_env_vars(&path);
     let path = std::path::PathBuf::from(&expanded);
 
-    if !path.exists() {
-        return Err(format!("路径不存在: {}", expanded));
-    }
-
-    // 如果是文件，打开其父目录；如果是目录，直接打开
-    let target = if path.is_file() {
-        path.parent().unwrap_or(&path).to_path_buf()
+    // 如果精确路径不存在，向上查找存在的游戏级父文件夹
+    let target = if path.exists() {
+        if path.is_file() {
+            path.parent().unwrap_or(&path).to_path_buf()
+        } else {
+            path
+        }
     } else {
-        path
+        let mut current = path.as_path();
+        let mut found = None;
+        loop {
+            if let Some(parent) = current.parent() {
+                if parent == current { break; }
+                // 遇到系统级大文件夹就停止
+                if let Some(name) = current.file_name().and_then(|n| n.to_str()) {
+                    if GENERIC_DIRS.iter().any(|g| g.eq_ignore_ascii_case(name)) {
+                        break;
+                    }
+                }
+                if parent.exists() {
+                    found = Some(parent.to_path_buf());
+                    break;
+                }
+                current = parent;
+            } else {
+                break;
+            }
+        }
+        match found {
+            Some(p) => p,
+            None => return Err(format!("路径不存在: {}", expanded)),
+        }
     };
 
     app_handle.opener().open_path(
@@ -940,6 +973,68 @@ pub fn update_save_paths(
     game.save_paths = save_paths;
     game.updated_at = Some(chrono::Utc::now().to_rfc3339());
     db_guard.update_game(&game).map_err(|e| e.to_string())
+}
+
+/// 检查所有游戏的存档路径是否存在
+/// 返回 game_id -> bool 的映射，true 表示至少有一条存档路径（或其游戏级父文件夹）存在
+#[tauri::command]
+pub fn check_save_paths(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<std::collections::HashMap<String, bool>, String> {
+    use crate::models::GameFilter;
+    use crate::utils::path::expand_env_vars;
+
+    /// 系统/用户级大文件夹名称，不应视为"存档存在"
+    const GENERIC_DIRS: &[&str] = &[
+        "Documents", "文档", "My Documents",
+        "AppData", "Local", "Roaming", "LocalLow",
+        "ProgramData", "Program Files", "Program Files (x86)",
+        "Users", "Windows", "System32",
+        "Saved Games", "AppDataLocal", "AppDataRoaming",
+    ];
+
+    /// 检查路径或其游戏级父文件夹是否存在
+    /// 向上查找直到遇到系统级大文件夹为止
+    fn save_path_effectively_exists(path: &str) -> bool {
+        let p = std::path::Path::new(path);
+        let mut current = p;
+        loop {
+            if current.exists() {
+                return true;
+            }
+            match current.parent() {
+                Some(parent) if parent != current => {
+                    // 遇到系统级大文件夹就停止
+                    if let Some(name) = current.file_name().and_then(|n| n.to_str()) {
+                        if GENERIC_DIRS.iter().any(|g| g.eq_ignore_ascii_case(name)) {
+                            return false;
+                        }
+                    }
+                    current = parent;
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    let db_guard = lock_or_recover(&db);
+    let games = db_guard.get_games(&GameFilter::default()).map_err(|e| e.to_string())?;
+
+    let mut result = std::collections::HashMap::new();
+
+    for game in games {
+        let exists = if game.save_paths.is_empty() {
+            false
+        } else {
+            game.save_paths.iter().any(|p| {
+                let expanded = expand_env_vars(p);
+                save_path_effectively_exists(&expanded)
+            })
+        };
+        result.insert(game.id, exists);
+    }
+
+    Ok(result)
 }
 
 /// 将目录或文件添加到 ZIP 归档中

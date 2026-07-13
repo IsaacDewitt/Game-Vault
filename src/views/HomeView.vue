@@ -13,7 +13,7 @@ import {
   useMessage,
   useDialog,
 } from "naive-ui";
-import { SearchOutline, CloudDownloadOutline, AddOutline, DocumentTextOutline } from "@vicons/ionicons5";
+import { SearchOutline, CloudDownloadOutline, AddOutline, DocumentTextOutline, FolderOutline } from "@vicons/ionicons5";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ref, computed } from "vue";
 import { useDebounceFn } from "@vueuse/core";
@@ -422,6 +422,12 @@ function handleDeleteGame(gameId: string) {
             </template>
             刷新游戏信息
           </n-button>
+          <n-button @click="store.checkSavePaths()" :loading="store.checkingSavePaths">
+            <template #icon>
+              <n-icon :component="FolderOutline" />
+            </template>
+            检查存档
+          </n-button>
           <n-button type="primary" @click="handleAddGame">
             <template #icon>
               <n-icon :component="AddOutline" />
@@ -486,6 +492,7 @@ function handleDeleteGame(gameId: string) {
           :key="game.id"
           :game="game"
           :is-active="store.activeGames.includes(game.id)"
+          :save-path-exists="Object.keys(store.savePathStatus).length > 0 ? store.savePathStatus[game.id] : undefined"
           @click="store.selectGame(game)"
           @launch="store.launch(game.id).catch(() => {})"
           @favorite="store.toggleFav(game.id)"

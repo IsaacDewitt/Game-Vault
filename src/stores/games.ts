@@ -25,6 +25,9 @@ export const useGamesStore = defineStore("games", () => {
   const statusFilter = ref("");
   const genreFilter = ref("");
   const allGenres = ref<string[]>([]);
+  // 存档路径检查结果 (game_id -> 是否存在)
+  const savePathStatus = ref<Record<string, boolean>>({});
+  const checkingSavePaths = ref(false);
 
   // 监听后端游戏停止事件，清理 activeGames
   let unlistenGameStopped: (() => void) | null = null;
@@ -404,6 +407,29 @@ export const useGamesStore = defineStore("games", () => {
     }
   }
 
+  async function checkSavePaths() {
+    checkingSavePaths.value = true;
+    try {
+      savePathStatus.value = await api.checkSavePaths();
+    } catch (e) {
+      console.error("检查存档路径失败:", e);
+    } finally {
+      checkingSavePaths.value = false;
+    }
+  }
+
+  /** 更新单个游戏的存档路径检查状态（当用户手动编辑存档路径后调用） */
+  async function updateSingleSavePathStatus(gameId: string) {
+    try {
+      const allStatus = await api.checkSavePaths();
+      if (allStatus[gameId] !== undefined) {
+        savePathStatus.value[gameId] = allStatus[gameId];
+      }
+    } catch (e) {
+      console.error("更新存档路径状态失败:", e);
+    }
+  }
+
   function selectGame(game: Game) {
     selectedGame.value = game;
   }
@@ -426,6 +452,8 @@ export const useGamesStore = defineStore("games", () => {
     statusFilter,
     genreFilter,
     allGenres,
+    savePathStatus,
+    checkingSavePaths,
     filteredGames,
     loadGames,
     loadAllCovers,
@@ -445,6 +473,8 @@ export const useGamesStore = defineStore("games", () => {
     renameGame,
     updateExePath,
     setGameStatus,
+    checkSavePaths,
+    updateSingleSavePathStatus,
     selectGame,
     clearSelection,
     setupEventListeners,

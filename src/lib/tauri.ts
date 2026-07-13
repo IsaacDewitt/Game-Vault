@@ -259,6 +259,11 @@ export async function updateSavePaths(gameId: string, savePaths: string[]): Prom
   return invoke("update_save_paths", { gameId, savePaths });
 }
 
+/** 检查所有游戏的存档路径是否存在，返回 game_id -> 存在与否 的映射 */
+export async function checkSavePaths(): Promise<Record<string, boolean>> {
+  return invoke("check_save_paths");
+}
+
 export interface GameMetaInput {
   description?: string | null;
   developer?: string | null;
