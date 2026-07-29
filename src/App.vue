@@ -146,6 +146,11 @@ onMounted(async () => {
   await loadThemeSettings();
   document.documentElement.style.setProperty("--accent-color", accentColor.value);
 
+  // 后台检查存档路径状态（不阻塞 UI）
+  gamesStore.checkSavePaths().catch((e) => {
+    console.error("启动时检查存档路径失败:", e);
+  });
+
   // 获取应用版本号
   try {
     appVersion.value = await getVersion();
