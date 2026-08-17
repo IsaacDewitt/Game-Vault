@@ -22,6 +22,14 @@ const emit = defineEmits<{
 const menuRef = ref<HTMLElement | null>(null);
 const adjustedX = ref(props.x);
 const adjustedY = ref(props.y);
+const focusedIndex = ref(-1);
+
+/** 获取可操作（非分割线）的菜单项索引列表 */
+function getActionableIndices(): number[] {
+  return props.items
+    .map((item, i) => (!item.divider ? i : -1))
+    .filter((i) => i !== -1);
+}
 
 onMounted(() => {
   nextTick(() => {
@@ -39,16 +47,23 @@ onMounted(() => {
       // 防止菜单超出左边界和上边界
       if (adjustedX.value < 8) adjustedX.value = 8;
       if (adjustedY.value < 8) adjustedY.value = 8;
+
+      // 自动聚焦第一个可操作项
+      const actionable = getActionableIndices();
+      if (actionable.length > 0) {
+        focusedIndex.value = actionable[0];
+        focusItem(focusedIndex.value);
+      }
     }
   });
 
   document.addEventListener("click", handleOutsideClick);
-  document.addEventListener("contextmenu", handleOutsideClick);
+  document.addEventListener("keydown", handleKeydown);
 });
 
 onUnmounted(() => {
   document.removeEventListener("click", handleOutsideClick);
-  document.removeEventListener("contextmenu", handleOutsideClick);
+  document.removeEventListener("keydown", handleKeydown);
 });
 
 function handleOutsideClick() {
@@ -59,6 +74,51 @@ function handleItemClick(item: ContextMenuItem) {
   item.action();
   emit("close");
 }
+
+/** 聚焦指定原始索引的菜单项（通过可操作项映射，兼容含分割线的菜单） */
+function focusItem(index: number) {
+  const actionable = getActionableIndices();
+  const pos = actionable.indexOf(index);
+  if (pos === -1) return;
+  const items = menuRef.value?.querySelectorAll<HTMLElement>("[role='menuitem']");
+  items?.[pos]?.focus();
+}
+
+function handleKeydown(e: KeyboardEvent) {
+  const actionable = getActionableIndices();
+  if (actionable.length === 0) return;
+
+  const currentPos = actionable.indexOf(focusedIndex.value);
+
+  switch (e.key) {
+    case "Escape":
+      e.preventDefault();
+      emit("close");
+      break;
+    case "ArrowDown": {
+      e.preventDefault();
+      const nextPos = (currentPos + 1) % actionable.length;
+      focusedIndex.value = actionable[nextPos];
+      focusItem(focusedIndex.value);
+      break;
+    }
+    case "ArrowUp": {
+      e.preventDefault();
+      const prevPos = (currentPos - 1 + actionable.length) % actionable.length;
+      focusedIndex.value = actionable[prevPos];
+      focusItem(focusedIndex.value);
+      break;
+    }
+    case "Enter":
+    case " ": {
+      e.preventDefault();
+      if (focusedIndex.value >= 0 && focusedIndex.value < props.items.length) {
+        handleItemClick(props.items[focusedIndex.value]);
+      }
+      break;
+    }
+  }
+}
 </script>
 
 <template>
@@ -66,16 +126,19 @@ function handleItemClick(item: ContextMenuItem) {
     <div
       ref="menuRef"
       class="context-menu"
+      role="menu"
       :style="{ left: adjustedX + 'px', top: adjustedY + 'px' }"
       @click.stop
       @contextmenu.stop.prevent
     >
       <template v-for="(item, index) in items" :key="index">
-        <div v-if="item.divider" class="context-menu-divider" />
+        <div v-if="item.divider" class="context-menu-divider" role="separator" />
         <div
           v-else
           class="context-menu-item"
           :class="{ danger: item.danger }"
+          role="menuitem"
+          tabindex="-1"
           @click="handleItemClick(item)"
         >
           <span v-if="item.icon" class="context-menu-icon">{{ item.icon }}</span>

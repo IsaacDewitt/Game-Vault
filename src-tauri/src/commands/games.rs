@@ -3,7 +3,7 @@ use tauri_plugin_opener::OpenerExt;
 use std::sync::{Arc, Mutex};
 use crate::core::{Database, PlayTimeTracker, GameLauncher};
 use crate::core::cover_fetcher::CoverFetcher;
-use crate::core::llm_fetcher::{LlmFetcher, LlmConfig, LlmProtocol};
+use crate::core::llm_fetcher::{LlmFetcher, LlmConfig, LlmProtocol, LlmGameMeta};
 use crate::models::*;
 use crate::models::settings::Settings;
 use crate::utils;
@@ -160,60 +160,65 @@ pub fn add_game_manual(
 /// 启动时批量刷新所有游戏的 exe 版本号
 /// 仅对有 exe_path 且版本号为空或 exe 文件已变更的游戏进行更新
 /// 使用文件元数据（修改时间 + 文件大小）进行缓存判断，避免每次都读取 exe 文件
+/// 两阶段设计：收集游戏列表后立即释放 DB 锁，文件 I/O 在无锁状态下进行，最后重取锁批量更新
 #[tauri::command]
 pub fn refresh_exe_versions(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<u32, String> {
-    let db_guard = lock_or_recover(&db);
-    let filter = GameFilter::default();
-    let games = db_guard.get_games(&filter).map_err(|e| e.to_string())?;
+    // 阶段 1：收集所有游戏，然后立即释放锁
+    let games = {
+        let db_guard = lock_or_recover(&db);
+        let filter = GameFilter::default();
+        db_guard.get_games(&filter).map_err(|e| e.to_string())?
+    };
 
-    let mut updated = 0u32;
+    // 阶段 2：无锁状态下逐个检查文件元数据、读取版本号
+    let mut to_update: Vec<Game> = Vec::new();
     for game in games {
         let exe_path = match game.exe_path {
             Some(ref p) => p.clone(),
             None => continue,
         };
 
-        // 获取当前文件元数据
-        let current_metadata = utils::path::get_file_metadata(&exe_path);
-
-        match current_metadata {
-            Some(metadata) => {
-                // 检查文件是否发生变化（比较修改时间和文件大小）
-                let file_changed = match (game.exe_modified_at, game.exe_file_size) {
-                    (Some(cached_modified), Some(cached_size)) => {
-                        // 有缓存，比较元数据
-                        metadata.modified_at != cached_modified || metadata.file_size != cached_size
-                    }
-                    _ => {
-                        // 没有缓存，需要读取版本号
-                        true
-                    }
-                };
-
-                if file_changed {
-                    // 文件发生变化或没有缓存，读取版本号
-                    let new_version = utils::path::read_exe_version(&exe_path);
-
-                    let mut updated_game = game.clone();
-                    updated_game.exe_version = new_version;
-                    updated_game.exe_modified_at = Some(metadata.modified_at);
-                    updated_game.exe_file_size = Some(metadata.file_size);
-                    updated_game.updated_at = Some(chrono::Utc::now().to_rfc3339());
-
-                    if let Err(e) = db_guard.update_game(&updated_game) {
-                        tracing::warn!("更新游戏版本号失败 {}: {}", updated_game.name, e);
-                    } else {
-                        updated += 1;
-                    }
-                }
-                // 文件没变化，跳过
-            }
+        let current_metadata = match utils::path::get_file_metadata(&exe_path) {
+            Some(m) => m,
             None => {
-                // 文件不存在或无法读取元数据，跳过
                 tracing::debug!("无法读取文件元数据: {}", exe_path);
+                continue;
             }
+        };
+
+        // 检查文件是否发生变化（比较修改时间和文件大小）
+        let file_changed = match (game.exe_modified_at, game.exe_file_size) {
+            (Some(cached_modified), Some(cached_size)) => {
+                current_metadata.modified_at != cached_modified || current_metadata.file_size != cached_size
+            }
+            _ => true, // 没有缓存，需要读取版本号
+        };
+
+        if file_changed {
+            let new_version = utils::path::read_exe_version(&exe_path);
+            let mut updated_game = game.clone();
+            updated_game.exe_version = new_version;
+            updated_game.exe_modified_at = Some(current_metadata.modified_at);
+            updated_game.exe_file_size = Some(current_metadata.file_size);
+            updated_game.updated_at = Some(chrono::Utc::now().to_rfc3339());
+            to_update.push(updated_game);
+        }
+    }
+
+    if to_update.is_empty() {
+        return Ok(0);
+    }
+
+    // 阶段 3：重新获取锁批量更新
+    let db_guard = lock_or_recover(&db);
+    let mut updated = 0u32;
+    for updated_game in to_update {
+        if let Err(e) = db_guard.update_game(&updated_game) {
+            tracing::warn!("更新游戏版本号失败 {}: {}", updated_game.name, e);
+        } else {
+            updated += 1;
         }
     }
 
@@ -491,17 +496,74 @@ pub async fn set_game_cover_from_url(
 
     let covers_dir = utils::path::get_covers_dir();
     utils::path::ensure_dir_exists(&covers_dir).map_err(|e| e.to_string())?;
+    // 默认请求 .jpg；download_from_url 会按实际图片格式决定最终扩展名并返回真实路径
     let save_path = covers_dir.join(format!("{}.jpg", game_id));
 
     let fetcher = CoverFetcher::new(covers_dir.clone(), api_key).map_err(|e| e.to_string())?;
-    fetcher.download_from_url(&url, &save_path)
+    let actual_path = fetcher.download_from_url(&url, &save_path)
         .await
         .map_err(|e| format!("下载封面失败: {}", e))?;
 
-    let cover_path = save_path.to_string_lossy().to_string();
+    // 清理该游戏同 id 的其他扩展名封面（避免残留旧文件）
+    let base_stem = format!("{}", game_id);
+    for ext in ["jpg", "png", "jpeg", "webp"] {
+        let old = covers_dir.join(format!("{}.{}", base_stem, ext));
+        if old != actual_path {
+            let _ = std::fs::remove_file(&old);
+        }
+    }
+
+    let cover_path = actual_path.to_string_lossy().to_string();
     let db_guard = lock_or_recover(&db);
     db_guard.update_game_cover(&game_id, &cover_path)
         .map_err(|e| e.to_string())
+}
+
+/// 将 LLM 返回的元数据合并到游戏对象（只更新非空字段，保留用户已有数据）
+/// 供单游戏刷新与批量刷新共用
+fn apply_llm_meta(updated: &mut Game, meta: &LlmGameMeta) {
+    if let Some(name) = &meta.name {
+        let trimmed = name.trim().to_string();
+        if !trimmed.is_empty() && trimmed != updated.name {
+            tracing::info!("LLM 纠正游戏名称: '{}' -> '{}'", updated.name, trimmed);
+            updated.name = trimmed;
+        }
+    }
+    if let Some(desc) = &meta.description {
+        if !desc.is_empty() {
+            updated.description = Some(desc.clone());
+        }
+    }
+    if let Some(dev) = &meta.developer {
+        if !dev.is_empty() {
+            updated.developer = Some(dev.clone());
+        }
+    }
+    if let Some(pub_) = &meta.publisher {
+        if !pub_.is_empty() {
+            updated.publisher = Some(pub_.clone());
+        }
+    }
+    if let Some(date) = &meta.release_date {
+        if !date.is_empty() {
+            updated.release_date = Some(date.clone());
+        }
+    }
+    if !meta.genres.is_empty() {
+        updated.genres = meta.genres.clone();
+    }
+    if let Some(v) = meta.hltb_main_story {
+        updated.hltb_main_story = Some(v);
+    }
+    if let Some(v) = meta.hltb_main_extra {
+        updated.hltb_main_extra = Some(v);
+    }
+    if let Some(v) = meta.hltb_completionist {
+        updated.hltb_completionist = Some(v);
+    }
+    if !meta.save_paths.is_empty() {
+        updated.save_paths = meta.save_paths.clone();
+    }
 }
 
 /// 从 LLM 获取游戏元数据
@@ -557,54 +619,16 @@ pub async fn fetch_game_info_llm(
     let mut updated = db_guard.get_game_by_id(&game_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "游戏不存在".to_string())?;
-    if let Some(name) = meta.name {
-        let trimmed = name.trim().to_string();
-        if !trimmed.is_empty() && trimmed != updated.name {
-            tracing::info!("LLM 纠正游戏名称: '{}' -> '{}'", updated.name, trimmed);
-            updated.name = trimmed;
-        }
-    }
-    if let Some(desc) = meta.description {
-        if !desc.is_empty() {
-            updated.description = Some(desc);
-        }
-    }
-    if let Some(dev) = meta.developer {
-        if !dev.is_empty() {
-            updated.developer = Some(dev);
-        }
-    }
-    if let Some(pub_) = meta.publisher {
-        if !pub_.is_empty() {
-            updated.publisher = Some(pub_);
-        }
-    }
-    if let Some(date) = meta.release_date {
-        if !date.is_empty() {
-            updated.release_date = Some(date);
-        }
-    }
-    if !meta.genres.is_empty() {
-        updated.genres = meta.genres;
-    }
-    if let Some(v) = meta.hltb_main_story {
-        updated.hltb_main_story = Some(v);
-    }
-    if let Some(v) = meta.hltb_main_extra {
-        updated.hltb_main_extra = Some(v);
-    }
-    if let Some(v) = meta.hltb_completionist {
-        updated.hltb_completionist = Some(v);
-    }
-    if !meta.save_paths.is_empty() {
-        updated.save_paths = meta.save_paths;
-    }
+    apply_llm_meta(&mut updated, &meta);
 
     db_guard.update_game(&updated).map_err(|e| e.to_string())?;
+    // LLM 补全计数（成就 G-13）
+    let _ = db_guard.increment_llm_filled_count();
     Ok(updated)
 }
 
 /// 手动更新游戏元数据（与 LLM 获取的字段一致）
+/// hltb 参数用 Option<Option<u32>>：外层 Some 表示字段被提交，内层 Some(v) 设置值、None 表示清空
 #[tauri::command]
 pub fn update_game_meta(
     db: State<'_, Arc<Mutex<Database>>>,
@@ -614,9 +638,9 @@ pub fn update_game_meta(
     publisher: Option<String>,
     release_date: Option<String>,
     genres: Option<Vec<String>>,
-    hltb_main_story: Option<u32>,
-    hltb_main_extra: Option<u32>,
-    hltb_completionist: Option<u32>,
+    hltb_main_story: Option<Option<u32>>,
+    hltb_main_extra: Option<Option<u32>>,
+    hltb_completionist: Option<Option<u32>>,
     save_paths: Option<Vec<String>>,
 ) -> Result<Game, String> {
     let db_guard = lock_or_recover(&db);
@@ -639,14 +663,15 @@ pub fn update_game_meta(
     if let Some(v) = genres {
         game.genres = v;
     }
+    // Some(Some(v)) 设置值，Some(None) 清空（用户清空输入框），None 不处理
     if let Some(v) = hltb_main_story {
-        game.hltb_main_story = Some(v);
+        game.hltb_main_story = v;
     }
     if let Some(v) = hltb_main_extra {
-        game.hltb_main_extra = Some(v);
+        game.hltb_main_extra = v;
     }
     if let Some(v) = hltb_completionist {
-        game.hltb_completionist = Some(v);
+        game.hltb_completionist = v;
     }
     if let Some(v) = save_paths {
         game.save_paths = v;
@@ -788,12 +813,23 @@ pub fn export_game_data(
     // 获取设置
     let settings = Settings::load_from_db(&db_guard).map_err(|e| e.to_string())?;
 
-    // 构建导出数据结构
+    // 构建导出数据结构（脱敏 API Key，避免用户分享备份时泄露密钥）
+    let sanitized_settings = serde_json::json!({
+        "theme": settings.theme,
+        "language": settings.language,
+        "accent_color": settings.accent_color,
+        "steamgriddb_api_key": "",
+        "llm_protocol": settings.llm_protocol,
+        "llm_api_key": "",
+        "llm_base_url": settings.llm_base_url,
+        "llm_model": settings.llm_model,
+        "llm_enabled": settings.llm_enabled,
+    });
     let export_data = serde_json::json!({
         "version": "1.0",
         "exported_at": chrono::Utc::now().to_rfc3339(),
         "games": games,
-        "settings": settings,
+        "settings": sanitized_settings,
     });
 
     // 序列化为 JSON
@@ -820,6 +856,14 @@ pub fn import_game_data(
         for game_json in games_array {
             match serde_json::from_value::<Game>(game_json.clone()) {
                 Ok(game) => {
+                    // 校验 game_id 格式（必须为合法 UUID，防止路径遍历）
+                    if uuid::Uuid::parse_str(&game.id).is_err() {
+                        tracing::warn!("跳过无效 game_id 的游戏: {}", game.id);
+                        continue;
+                    }
+                    // 封面策略：upsert_game 的 ON CONFLICT 对 cover 字段使用
+                    // COALESCE(excluded, games) —— 导入时若本地已有该游戏，保留现有封面；
+                    // 其他机器导出的封面路径不会生效（文件不存在时前端自动显示占位并可由"刷新封面"重新获取）
                     if let Err(e) = db_guard.upsert_game(&game) {
                         tracing::warn!("导入游戏失败 {}: {}", game.name, e);
                     } else {
@@ -975,6 +1019,37 @@ pub fn update_save_paths(
     db_guard.update_game(&game).map_err(|e| e.to_string())
 }
 
+/// 系统/用户级大文件夹名称，不应视为"存档存在"
+const GENERIC_DIRS: &[&str] = &[
+    "Documents", "文档", "My Documents",
+    "AppData", "Local", "Roaming", "LocalLow",
+    "ProgramData", "Program Files", "Program Files (x86)",
+    "Users", "Windows", "System32",
+    "Saved Games", "AppDataLocal", "AppDataRoaming",
+];
+
+/// 检查路径或其游戏级父文件夹是否存在（向上查找直到遇到系统级大文件夹为止）
+fn save_path_effectively_exists(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let mut current = p;
+    loop {
+        if current.exists() {
+            return true;
+        }
+        match current.parent() {
+            Some(parent) if parent != current => {
+                if let Some(name) = current.file_name().and_then(|n| n.to_str()) {
+                    if GENERIC_DIRS.iter().any(|g| g.eq_ignore_ascii_case(name)) {
+                        return false;
+                    }
+                }
+                current = parent;
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// 检查所有游戏的存档路径是否存在
 /// 返回 game_id -> bool 的映射，true 表示至少有一条存档路径（或其游戏级父文件夹）存在
 #[tauri::command]
@@ -983,39 +1058,6 @@ pub fn check_save_paths(
 ) -> Result<std::collections::HashMap<String, bool>, String> {
     use crate::models::GameFilter;
     use crate::utils::path::expand_env_vars;
-
-    /// 系统/用户级大文件夹名称，不应视为"存档存在"
-    const GENERIC_DIRS: &[&str] = &[
-        "Documents", "文档", "My Documents",
-        "AppData", "Local", "Roaming", "LocalLow",
-        "ProgramData", "Program Files", "Program Files (x86)",
-        "Users", "Windows", "System32",
-        "Saved Games", "AppDataLocal", "AppDataRoaming",
-    ];
-
-    /// 检查路径或其游戏级父文件夹是否存在
-    /// 向上查找直到遇到系统级大文件夹为止
-    fn save_path_effectively_exists(path: &str) -> bool {
-        let p = std::path::Path::new(path);
-        let mut current = p;
-        loop {
-            if current.exists() {
-                return true;
-            }
-            match current.parent() {
-                Some(parent) if parent != current => {
-                    // 遇到系统级大文件夹就停止
-                    if let Some(name) = current.file_name().and_then(|n| n.to_str()) {
-                        if GENERIC_DIRS.iter().any(|g| g.eq_ignore_ascii_case(name)) {
-                            return false;
-                        }
-                    }
-                    current = parent;
-                }
-                _ => return false,
-            }
-        }
-    }
 
     let db_guard = lock_or_recover(&db);
     let games = db_guard.get_games(&GameFilter::default()).map_err(|e| e.to_string())?;
@@ -1035,6 +1077,30 @@ pub fn check_save_paths(
     }
 
     Ok(result)
+}
+
+/// 检查单个游戏的存档路径是否存在（编辑存档路径后局部刷新用，避免全量检查）
+#[tauri::command]
+pub fn check_save_paths_for_game(
+    db: State<'_, Arc<Mutex<Database>>>,
+    game_id: String,
+) -> Result<bool, String> {
+    use crate::utils::path::expand_env_vars;
+
+    let db_guard = lock_or_recover(&db);
+    let game = db_guard.get_game_by_id(&game_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "游戏不存在".to_string())?;
+
+    if game.save_paths.is_empty() {
+        return Ok(false);
+    }
+
+    let exists = game.save_paths.iter().any(|p| {
+        let expanded = expand_env_vars(p);
+        save_path_effectively_exists(&expanded)
+    });
+    Ok(exists)
 }
 
 /// 将目录或文件添加到 ZIP 归档中
@@ -1111,13 +1177,15 @@ pub async fn export_saves_backup(
             }
 
             // ZIP 内的目录名：游戏名_序号（避免特殊字符）
+            // 追加 game_id 前 8 位做去重，防止同名游戏（或安全化后同名）在 ZIP 内互相覆盖
             let safe_name = game.name.chars()
                 .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
                 .collect::<String>();
+            let id_hint = game.id.chars().take(8).collect::<String>();
             let zip_prefix = if game.save_paths.len() > 1 {
-                format!("{}_{}", safe_name, idx + 1)
+                format!("{}_{}_{}", safe_name, idx + 1, id_hint)
             } else {
-                safe_name.clone()
+                format!("{}_{}", safe_name, id_hint)
             };
 
             match add_path_to_zip(&mut zip, &path, &path, &zip_prefix) {
@@ -1412,50 +1480,12 @@ pub async fn fetch_missing_game_info(
                     let mut updated = db_guard.get_game_by_id(&game.id)
                         .map_err(|e| e.to_string())?
                         .ok_or_else(|| "游戏不存在".to_string())?;
-                    if let Some(name) = meta.name {
-                        let trimmed = name.trim().to_string();
-                        if !trimmed.is_empty() && trimmed != updated.name {
-                            tracing::info!("LLM 纠正游戏名称: '{}' -> '{}'", updated.name, trimmed);
-                            updated.name = trimmed;
-                        }
-                    }
-                    if let Some(desc) = meta.description {
-                        if !desc.is_empty() {
-                            updated.description = Some(desc);
-                        }
-                    }
-                    if let Some(dev) = meta.developer {
-                        if !dev.is_empty() {
-                            updated.developer = Some(dev);
-                        }
-                    }
-                    if let Some(pub_) = meta.publisher {
-                        if !pub_.is_empty() {
-                            updated.publisher = Some(pub_);
-                        }
-                    }
-                    if let Some(date) = meta.release_date {
-                        if !date.is_empty() {
-                            updated.release_date = Some(date);
-                        }
-                    }
-                    if !meta.genres.is_empty() {
-                        updated.genres = meta.genres;
-                    }
-                    if let Some(v) = meta.hltb_main_story {
-                        updated.hltb_main_story = Some(v);
-                    }
-                    if let Some(v) = meta.hltb_main_extra {
-                        updated.hltb_main_extra = Some(v);
-                    }
-                    if let Some(v) = meta.hltb_completionist {
-                        updated.hltb_completionist = Some(v);
-                    }
-                    if !meta.save_paths.is_empty() {
-                        updated.save_paths = meta.save_paths;
-                    }
+                    apply_llm_meta(&mut updated, &meta);
 
-                    db_guard.update_game(&updated).map_err(|e| e.to_string())
+                    db_guard.update_game(&updated).map_err(|e| e.to_string())?;
+                    // LLM 补全计数（成就 G-13）
+                    let _ = db_guard.increment_llm_filled_count();
+                    Ok(())
                 })();
 
                 match update_result {

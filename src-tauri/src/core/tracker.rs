@@ -113,6 +113,15 @@ impl PlayTimeTracker {
         (parent_to_children, pid_to_exe)
     }
 
+    /// 判断进程 exe 路径是否位于安装目录下（精确分隔符匹配，避免 "D:\Games\Steam" 误匹配 "D:\Games\SteamLibrary"）
+    fn exe_under_dir(exe_lower: &str, dir_lower: &str) -> bool {
+        if exe_lower.len() <= dir_lower.len() {
+            return exe_lower == dir_lower;
+        }
+        exe_lower.starts_with(dir_lower)
+            && matches!(exe_lower.as_bytes().get(dir_lower.len()), Some(b'\\') | Some(b'/'))
+    }
+
     /// 递归收集指定 PID 的所有子孙进程
     fn collect_descendants(root_pid: u32, parent_to_children: &HashMap<Pid, Vec<Pid>>) -> HashSet<Pid> {
         let root = Pid::from(root_pid as usize);
@@ -207,11 +216,10 @@ impl PlayTimeTracker {
                         // 两层检查：先查 pid_to_exe（快速，exe 路径缓存），
                         // 再直接遍历 sys.processes()（覆盖 exe() 失败的 32-bit 老游戏）
                         let found_in_install = pid_to_exe.values().any(|exe| {
-                            exe.starts_with(&install_lower)
+                            Self::exe_under_dir(exe, &install_lower)
                         }) || self.sys.processes().values().any(|p| {
                             p.exe().map_or(false, |exe| {
-                                exe.to_string_lossy().to_lowercase()
-                                    .starts_with(&install_lower)
+                                Self::exe_under_dir(&exe.to_string_lossy().to_lowercase(), &install_lower)
                             })
                         });
 
@@ -264,6 +272,18 @@ impl PlayTimeTracker {
         finished_sessions
     }
 
+    /// 强制结束所有活跃会话（用于应用退出时的数据保全）
+    pub fn force_finish_all(&mut self) -> Vec<FinishedSession> {
+        let game_ids: Vec<String> = self.active_sessions.keys().cloned().collect();
+        let mut finished = Vec::new();
+        for game_id in game_ids {
+            if let Some(session) = self.stop_tracking_internal(&game_id) {
+                finished.push(session);
+            }
+        }
+        finished
+    }
+
     /// 获取当前活跃的游戏
     pub fn get_active_games(&self) -> Vec<String> {
         self.active_sessions.keys().cloned().collect()
@@ -275,7 +295,7 @@ impl PlayTimeTracker {
     }
 
     /// 持久化已结束的会话到数据库（在 Tracker 锁释放后调用）
-    /// 一次性获取锁并批量插入，避免逐条获取/释放锁的开销
+    /// 一次性获取锁并批量插入（单事务），避免逐条获取/释放锁与逐条事务的开销
     pub fn persist_finished_sessions(
         db: &Arc<Mutex<Database>>,
         sessions: &[FinishedSession],
@@ -284,17 +304,25 @@ impl PlayTimeTracker {
             return;
         }
         let db = db.lock().unwrap_or_else(|e| e.into_inner());
-        for session in sessions {
-            match db.add_play_session(
-                &session.game_id,
-                &session.start_time,
-                session.duration_seconds,
-            ) {
-                Ok(_) => {
-                    tracing::info!("已保存游戏会话: {}", session.game_id);
-                }
-                Err(e) => {
-                    tracing::error!("保存游戏会话失败: {}", e);
+        let batch: Vec<(String, String, u64)> = sessions
+            .iter()
+            .map(|s| (s.game_id.clone(), s.start_time.clone(), s.duration_seconds))
+            .collect();
+        match db.add_play_sessions_batch(&batch) {
+            Ok(saved) => {
+                tracing::info!("已批量保存 {} 条游戏会话", saved);
+            }
+            Err(e) => {
+                // 批量失败时回退到逐条保存，尽量不丢数据
+                tracing::error!("批量保存游戏会话失败: {}", e);
+                for session in sessions {
+                    if let Err(e2) = db.add_play_session(
+                        &session.game_id,
+                        &session.start_time,
+                        session.duration_seconds,
+                    ) {
+                        tracing::error!("保存游戏会话失败: {}", e2);
+                    }
                 }
             }
         }

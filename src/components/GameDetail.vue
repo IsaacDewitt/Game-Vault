@@ -52,7 +52,13 @@ const emit = defineEmits<{
 }>();
 
 // 阻止 drawer 遮罩层的右键默认菜单（Naive UI 内部渲染的 mask 元素，Vue 的 @contextmenu.prevent 管不到）
-const preventMaskContextMenu = (e: MouseEvent) => e.preventDefault();
+// 仅拦截遮罩层本身，避免像之前那样在 document 上全局禁用右键（会导致输入框粘贴菜单等全部失效）
+const preventMaskContextMenu = (e: MouseEvent) => {
+  const target = e.target as HTMLElement | null;
+  if (target?.classList?.contains("n-drawer-mask")) {
+    e.preventDefault();
+  }
+};
 onMounted(() => document.addEventListener("contextmenu", preventMaskContextMenu));
 onUnmounted(() => document.removeEventListener("contextmenu", preventMaskContextMenu));
 
@@ -275,13 +281,7 @@ async function handleChangeSavePath(index: number) {
       // 更新本地游戏数据
       const updated = await api.getGameDetail(props.game.id);
       if (updated) {
-        const idx = store.games.findIndex((g) => g.id === props.game.id);
-        if (idx !== -1) {
-          store.games[idx] = updated;
-        }
-        if (store.selectedGame?.id === props.game.id) {
-          store.selectedGame = updated;
-        }
+        store.updateGameInStore(props.game.id, updated);
       }
       // 刷新存档路径状态图标
       store.updateSingleSavePathStatus(props.game.id);
@@ -305,13 +305,7 @@ async function handleAddSavePath() {
       // 更新本地游戏数据
       const updated = await api.getGameDetail(props.game.id);
       if (updated) {
-        const idx = store.games.findIndex((g) => g.id === props.game.id);
-        if (idx !== -1) {
-          store.games[idx] = updated;
-        }
-        if (store.selectedGame?.id === props.game.id) {
-          store.selectedGame = updated;
-        }
+        store.updateGameInStore(props.game.id, updated);
       }
       // 刷新存档路径状态图标
       store.updateSingleSavePathStatus(props.game.id);
@@ -330,13 +324,7 @@ async function handleRemoveSavePath(index: number) {
     // 更新本地游戏数据
     const updated = await api.getGameDetail(props.game.id);
     if (updated) {
-      const idx = store.games.findIndex((g) => g.id === props.game.id);
-      if (idx !== -1) {
-        store.games[idx] = updated;
-      }
-      if (store.selectedGame?.id === props.game.id) {
-        store.selectedGame = updated;
-      }
+      store.updateGameInStore(props.game.id, updated);
     }
     // 刷新存档路径状态图标
     store.updateSingleSavePathStatus(props.game.id);

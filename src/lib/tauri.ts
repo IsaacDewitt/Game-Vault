@@ -97,6 +97,70 @@ export interface Settings {
   llm_model: string;
   llm_enabled: boolean;
   accent_color: string;
+  window_width: number;
+  window_height: number;
+}
+
+// ==================== 成就系统 ====================
+
+export interface AchievementDef {
+  id: string;
+  base_id: string;
+  name: string;
+  /** "global" | "pergame" */
+  scope: string;
+  /** "progress" | "collect" | "fun" | "challenge" */
+  category: string;
+  desc: string;
+  icon: string;
+  /** 当前等级（从 1 开始） */
+  tier: number;
+  /** 总等级数 */
+  tier_total: number;
+  target: number;
+}
+
+export interface GlobalAchievementStatus {
+  def: AchievementDef;
+  unlocked: boolean;
+  unlocked_at: string | null;
+  progress: number;
+  target: number;
+}
+
+export interface GameAchievementStatus {
+  def: AchievementDef;
+  unlocked: boolean;
+  unlocked_at: string | null;
+  progress: number;
+  target: number;
+}
+
+export interface GameAchievements {
+  game_id: string;
+  game_name: string;
+  achievements: GameAchievementStatus[];
+}
+
+export interface AchievementSummary {
+  global: GlobalAchievementStatus[];
+  per_game: GameAchievements[];
+  total_count: number;
+  unlocked_count: number;
+}
+
+export interface UnlockEvent {
+  def: AchievementDef;
+  game_id: string | null;
+}
+
+export async function getAchievements(): Promise<AchievementSummary> {
+  return invoke("get_achievements");
+}
+
+/** 手动触发成就检测，返回本次新解锁的事件列表 */
+export async function checkAchievements(): Promise<UnlockEvent[]> {
+  return invoke("check_achievements");
 }
 
 // ==================== Tauri 命令封装 ====================
@@ -157,12 +221,9 @@ export async function getAllCovers(): Promise<Record<string, string>> {
   return invoke("get_all_covers");
 }
 
-export async function readCoverAsBase64(path: string): Promise<string> {
-  return invoke("read_cover_as_base64", { path });
-}
-
-export async function readCoversBatchAsBase64(paths: string[]): Promise<Record<string, string>> {
-  return invoke("read_covers_batch_as_base64", { paths });
+/** 检查单个游戏的存档路径是否存在（编辑后局部刷新用） */
+export async function checkSavePathsForGame(gameId: string): Promise<boolean> {
+  return invoke("check_save_paths_for_game", { gameId });
 }
 
 export interface CoverOption {
@@ -321,4 +382,8 @@ export async function getAutostartEnabled(): Promise<boolean> {
 
 export async function setAutostartEnabled(enabled: boolean): Promise<void> {
   return invoke("set_autostart_enabled", { enabled });
+}
+
+export async function setWindowSize(width: number, height: number): Promise<void> {
+  return invoke("set_window_size", { width, height });
 }

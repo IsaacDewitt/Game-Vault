@@ -5,7 +5,7 @@
 基于 **Tauri 2.0** + **Rust** + **Vue 3** 构建，本机运行，数据完全离线。
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.5-6366f1" alt="version">
+  <img src="https://img.shields.io/badge/version-0.5.0-6366f1" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2B-blue" alt="platform">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
 </p>
@@ -56,6 +56,17 @@
 | 每日趋势 | 折线图 | 一段时间内的游玩时长变化趋势 |
 | 年度热力图 | 热力图 | GitHub 贡献图风格，一年中每天的游玩分布 |
 | 时段分布 | 热力图 | 24h × 7天，展示一周中每个时段的游玩热度 |
+
+### 🏆 成就系统
+
+| 功能 | 说明 |
+|------|------|
+| 全局成就 | 衡量整个游戏库：库规模、总时长、连续游玩、深夜游玩等 19 个基础成就 |
+| 单游戏成就 | 每款游戏独立解锁、独立进度：玩满 1/10/50/100 小时、通关、HLTB 对照等 15 个基础成就 |
+| 多级里程碑 | 藏书家、铁杆玩家等成就分多级（最多 4 级），解锁后进度条指向下一级 |
+| 四类设计 | 进度 / 收集 / 趣味 / 挑战，参考 RetroAchievements 设计哲学 |
+| 存量结算 | 功能上线时按历史数据回溯解锁，之后增量检测，与 Steam 行为一致 |
+| 解锁通知 | 游戏退出、库操作后自动检测，右上角弹出解锁动画 |
 
 ### 🎨 个性化
 
@@ -169,6 +180,7 @@ game-vault/
 │   ├── views/                    # 页面视图
 │   │   ├── HomeView.vue          # 主页（游戏库 + 搜索筛选）
 │   │   ├── StatsView.vue         # 统计页面（图表仪表盘）
+│   │   ├── AchievementsView.vue  # 成就页面（全局 + 单游戏成就）
 │   │   └── SettingsView.vue      # 设置页面
 │   ├── stores/                   # 状态管理 (Pinia)
 │   │   └── games.ts              # 游戏数据 store
@@ -188,13 +200,15 @@ game-vault/
 │   │   ├── commands/             # Tauri 命令（前后端桥接）
 │   │   │   ├── games.rs          # 游戏增删改查、封面、LLM、存档
 │   │   │   ├── stats.rs          # 统计查询、概览
+│   │   │   ├── achievements.rs   # 成就查询与检测命令
 │   │   │   └── settings.rs       # 设置读写
 │   │   ├── core/                 # 核心业务逻辑
 │   │   │   ├── database.rs       # SQLite 数据库操作
 │   │   │   ├── launcher.rs       # 游戏启动器
 │   │   │   ├── tracker.rs        # 进程监控 + 游玩时长追踪
 │   │   │   ├── cover_fetcher.rs  # SteamGridDB 封面获取
-│   │   │   └── llm_fetcher.rs    # LLM 游戏信息获取
+│   │   │   ├── llm_fetcher.rs    # LLM 游戏信息获取
+│   │   │   └── achievements.rs   # 成就引擎（定义 + 检测 + 汇总）
 │   │   ├── models/               # 数据模型
 │   │   │   ├── game.rs           # 游戏、封面选项、筛选器
 │   │   │   ├── play_session.rs   # 游玩会话

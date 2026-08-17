@@ -455,48 +455,54 @@ function getBarGradient(gameId: string): string {
   return `linear-gradient(90deg, ${base}, ${lighter})`;
 }
 
-// 从封面图片提取主色调
+// 从封面图片提取主色调（canvas 可能被 CORS 污染，需容错）
 function extractDominantColor(imgSrc: string): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.onload = () => {
-      const canvas = document.createElement("canvas");
-      canvas.width = COVER_SAMPLE_SIZE;
-      canvas.height = COVER_SAMPLE_SIZE;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) { resolve(DEFAULT_ACCENT_COLOR); return; }
-      ctx.drawImage(img, 0, 0, COVER_SAMPLE_SIZE, COVER_SAMPLE_SIZE);
-      const data = ctx.getImageData(0, 0, COVER_SAMPLE_SIZE, COVER_SAMPLE_SIZE).data;
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = COVER_SAMPLE_SIZE;
+        canvas.height = COVER_SAMPLE_SIZE;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) { resolve(DEFAULT_ACCENT_COLOR); return; }
+        ctx.drawImage(img, 0, 0, COVER_SAMPLE_SIZE, COVER_SAMPLE_SIZE);
+        const data = ctx.getImageData(0, 0, COVER_SAMPLE_SIZE, COVER_SAMPLE_SIZE).data;
 
-      // 统计颜色频率（量化为 32 级）
-      const colorMap = new Map<string, { r: number; g: number; b: number; count: number }>();
-      for (let i = 0; i < data.length; i += 4) {
-        const r = data[i], g = data[i + 1], b = data[i + 2];
-        // 跳过过暗和过亮的像素
-        const brightness = (r + g + b) / 3;
-        if (brightness < COVER_BRIGHTNESS_MIN || brightness > COVER_BRIGHTNESS_MAX) continue;
-        // 量化
-        const qr = (r >> 5) << 5;
-        const qg = (g >> 5) << 5;
-        const qb = (b >> 5) << 5;
-        const key = `${qr},${qg},${qb}`;
-        const existing = colorMap.get(key);
-        if (existing) {
-          existing.count++;
-        } else {
-          colorMap.set(key, { r: qr, g: qg, b: qb, count: 1 });
+        // 统计颜色频率（量化为 32 级）
+        const colorMap = new Map<string, { r: number; g: number; b: number; count: number }>();
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i], g = data[i + 1], b = data[i + 2];
+          // 跳过过暗和过亮的像素
+          const brightness = (r + g + b) / 3;
+          if (brightness < COVER_BRIGHTNESS_MIN || brightness > COVER_BRIGHTNESS_MAX) continue;
+          // 量化
+          const qr = (r >> 5) << 5;
+          const qg = (g >> 5) << 5;
+          const qb = (b >> 5) << 5;
+          const key = `${qr},${qg},${qb}`;
+          const existing = colorMap.get(key);
+          if (existing) {
+            existing.count++;
+          } else {
+            colorMap.set(key, { r: qr, g: qg, b: qb, count: 1 });
+          }
         }
-      }
 
-      // 找最高频颜色
-      let best = { ...DEFAULT_ACCENT_RGB, count: 0 };
-      for (const val of colorMap.values()) {
-        if (val.count > best.count) best = val;
-      }
+        // 找最高频颜色
+        let best = { ...DEFAULT_ACCENT_RGB, count: 0 };
+        for (const val of colorMap.values()) {
+          if (val.count > best.count) best = val;
+        }
 
-      const hex = `#${((best.r << 16) | (best.g << 8) | best.b).toString(16).padStart(6, "0")}`;
-      resolve(hex);
+        const hex = `#${((best.r << 16) | (best.g << 8) | best.b).toString(16).padStart(6, "0")}`;
+        resolve(hex);
+      } catch (e) {
+        // canvas 被 CORS 污染等异常：回退到默认色
+        console.warn("提取封面主色失败:", e);
+        resolve(DEFAULT_ACCENT_COLOR);
+      }
     };
     img.onerror = () => resolve(DEFAULT_ACCENT_COLOR);
     img.src = imgSrc;
@@ -505,12 +511,11 @@ function extractDominantColor(imgSrc: string): Promise<string> {
 
 // 加载封面并提取颜色
 async function loadGameColors(stats: PlayStats[]) {
-  const coverCache = gamesStore.coverBase64Cache;
   const tasks: Promise<void>[] = [];
 
   for (const s of stats) {
     if (gameColors.value[s.game_id]) continue; // 已有缓存
-    const cover = coverCache[s.game_id];
+    const cover = gamesStore.coverSrc(s.game_id);
     if (cover) {
       tasks.push(
         extractDominantColor(cover).then((color) => {
@@ -795,8 +800,11 @@ function formatHours(seconds: number): string {
   return (seconds / 3600).toFixed(1);
 }
 
-// 加载游玩会话历史
+// 加载游玩会话历史（带请求序号，防止快速切换筛选时旧响应覆盖新结果）
+let sessionRequestSeq = 0;
 async function loadSessionHistory(reset = false) {
+  const seq = ++sessionRequestSeq;
+
   if (reset) {
     sessionOffset.value = 0;
     sessionHistory.value = [];
@@ -809,6 +817,7 @@ async function loadSessionHistory(reset = false) {
   try {
     const gameId = sessionGameFilter.value || undefined;
     const sessions = await api.getPlaySessions(gameId, SESSION_PAGE_SIZE, sessionOffset.value);
+    if (seq !== sessionRequestSeq) return; // 已有更新的请求，丢弃本次过期结果
     if (sessions.length < SESSION_PAGE_SIZE) {
       sessionHasMore.value = false;
     }
@@ -817,7 +826,9 @@ async function loadSessionHistory(reset = false) {
   } catch (e) {
     console.error("加载会话历史失败:", e);
   } finally {
-    sessionLoading.value = false;
+    if (seq === sessionRequestSeq) {
+      sessionLoading.value = false;
+    }
   }
 }
 
@@ -873,8 +884,8 @@ onMounted(() => {
   window.addEventListener('resize', onWindowResize);
 });
 
-// 当 store 中的封面缓存更新时，补充提取颜色（使用 shallow watch 避免深层遍历）
-watch(() => Object.keys(gamesStore.coverBase64Cache).length, (newLen, oldLen) => {
+// 当 store 中的封面路径更新时，补充提取颜色（使用 shallow watch 避免深层遍历）
+watch(() => Object.keys(gamesStore.coverPaths).length, (newLen, oldLen) => {
   if (newLen > (oldLen ?? 0) && playStats.value.length > 0) {
     loadGameColors(playStats.value).catch(() => {});
   }
@@ -946,8 +957,8 @@ onUnmounted(() => {
                     <div class="bar-rank">{{ index + 1 }}</div>
                     <div class="bar-icon">
                       <img
-                        v-if="gamesStore.coverBase64Cache[game.game_id]"
-                        :src="gamesStore.coverBase64Cache[game.game_id]"
+                        v-if="gamesStore.coverSrc(game.game_id)"
+                        :src="gamesStore.coverSrc(game.game_id)!"
                         :alt="game.game_name"
                         class="bar-icon-img"
                       />

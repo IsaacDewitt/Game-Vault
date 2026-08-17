@@ -10,6 +10,7 @@ import {
   NSpace,
   NSelect,
   NIcon,
+  NInputNumber,
   useMessage,
 } from "naive-ui";
 import { DownloadOutline, CloudUploadOutline } from "@vicons/ionicons5";
@@ -18,6 +19,7 @@ import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
 import * as api from "../lib/tauri";
 import type { Settings } from "../lib/tauri";
 import { DEFAULT_ACCENT_COLOR, DEBOUNCE_MS } from "../lib/constants";
+import { isValidHexColor } from "../lib/color";
 
 const message = useMessage();
 
@@ -32,7 +34,17 @@ const settings = ref<Settings>({
   llm_model: "",
   llm_enabled: false,
   accent_color: DEFAULT_ACCENT_COLOR,
+  window_width: 1400,
+  window_height: 900,
 });
+
+// 窗口大小预设选项
+const windowSizePresets = [
+  { label: "1200 × 800", width: 1200, height: 800 },
+  { label: "1400 × 900 (默认)", width: 1400, height: 900 },
+  { label: "1600 × 1000", width: 1600, height: 1000 },
+  { label: "1920 × 1080", width: 1920, height: 1080 },
+];
 
 const protocolOptions = [
   { label: "OpenAI 格式", value: "openai" },
@@ -60,10 +72,12 @@ const updateTheme = inject<(dark: boolean) => void>("updateTheme");
 
 // 主题色变化时实时预览并自动保存
 watch(() => settings.value.accent_color, (color) => {
-  if (color && updateAccentColor) {
+  // 非法值（输入未完成等）不应用、不保存，避免 NaN 颜色
+  if (!color || !isValidHexColor(color)) return;
+  if (updateAccentColor) {
     updateAccentColor(color);
   }
-  if (!loading.value && color) {
+  if (!loading.value) {
     autoSaveThemeSettings();
   }
 });
@@ -109,6 +123,28 @@ async function loadSettings() {
     // 等待 DOM 更新后再解除加载标记，避免 watch 误触发保存
     setTimeout(() => { loading.value = false; }, 0);
   }
+}
+
+async function applyWindowSize() {
+  const w = settings.value.window_width;
+  const h = settings.value.window_height;
+  if (w < 900 || h < 600) {
+    message.warning("窗口最小尺寸为 900 × 600");
+    return;
+  }
+  try {
+    await api.setWindowSize(w, h);
+    message.success("窗口大小已调整");
+  } catch (e) {
+    console.error("设置窗口大小失败:", e);
+    message.error("设置窗口大小失败");
+  }
+}
+
+function applyPresetSize(preset: { width: number; height: number }) {
+  settings.value.window_width = preset.width;
+  settings.value.window_height = preset.height;
+  applyWindowSize();
 }
 
 async function saveSettings() {
@@ -357,6 +393,51 @@ async function handleImportSaves() {
             show-password-on="click"
             placeholder="可选，用于自动获取封面图"
           />
+        </n-form-item>
+      </n-form>
+    </n-card>
+
+    <!-- 窗口设置 -->
+    <n-card title="窗口设置" style="margin-bottom: 16px">
+      <n-form label-placement="left" label-width="140">
+        <n-form-item label="预设尺寸">
+          <n-space>
+            <n-button
+              v-for="preset in windowSizePresets"
+              :key="preset.label"
+              :type="settings.window_width === preset.width && settings.window_height === preset.height ? 'primary' : 'default'"
+              size="small"
+              @click="applyPresetSize(preset)"
+            >
+              {{ preset.label }}
+            </n-button>
+          </n-space>
+        </n-form-item>
+        <n-form-item label="自定义尺寸">
+          <n-space align="center">
+            <n-input-number
+              v-model:value="settings.window_width"
+              :min="900"
+              :max="3840"
+              :step="50"
+              size="small"
+              style="width: 120px"
+              placeholder="宽度"
+            />
+            <span>×</span>
+            <n-input-number
+              v-model:value="settings.window_height"
+              :min="600"
+              :max="2160"
+              :step="50"
+              size="small"
+              style="width: 120px"
+              placeholder="高度"
+            />
+            <n-button type="primary" size="small" @click="applyWindowSize">
+              应用
+            </n-button>
+          </n-space>
         </n-form-item>
       </n-form>
     </n-card>

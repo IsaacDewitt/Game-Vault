@@ -29,6 +29,12 @@ pub struct Settings {
     /// 主题色（hex）
     #[serde(default = "default_accent_color")]
     pub accent_color: String,
+    /// 窗口宽度
+    #[serde(default = "default_window_width")]
+    pub window_width: u32,
+    /// 窗口高度
+    #[serde(default = "default_window_height")]
+    pub window_height: u32,
 }
 
 fn default_accent_color() -> String {
@@ -37,6 +43,14 @@ fn default_accent_color() -> String {
 
 fn default_llm_protocol() -> String {
     DEFAULT_LLM_PROTOCOL.to_string()
+}
+
+fn default_window_width() -> u32 {
+    1400
+}
+
+fn default_window_height() -> u32 {
+    900
 }
 
 impl Default for Settings {
@@ -51,6 +65,8 @@ impl Default for Settings {
             llm_model: DEFAULT_LLM_MODEL.to_string(),
             llm_enabled: false,
             accent_color: default_accent_color(),
+            window_width: default_window_width(),
+            window_height: default_window_height(),
         }
     }
 }
@@ -72,6 +88,12 @@ impl Settings {
             llm_model: get("llm_model", DEFAULT_LLM_MODEL)?,
             llm_enabled: get("llm_enabled", "false")? == "true",
             accent_color: get("accent_color", &default_accent_color())?,
+            window_width: get("window_width", &default_window_width().to_string())?
+                .parse()
+                .unwrap_or(default_window_width()),
+            window_height: get("window_height", &default_window_height().to_string())?
+                .parse()
+                .unwrap_or(default_window_height()),
         })
     }
 
@@ -86,6 +108,8 @@ impl Settings {
         db.set_setting("llm_model", &self.llm_model)?;
         db.set_setting("llm_enabled", &self.llm_enabled.to_string())?;
         db.set_setting("accent_color", &self.accent_color)?;
+        db.set_setting("window_width", &self.window_width.to_string())?;
+        db.set_setting("window_height", &self.window_height.to_string())?;
         Ok(())
     }
 }

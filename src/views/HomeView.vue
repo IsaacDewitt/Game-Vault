@@ -42,6 +42,9 @@ const renameInput = ref("");
 // 手动填写游戏信息弹窗状态
 const showEditInfoModal = ref(false);
 const editingGameId = ref("");
+const editingGame = computed(() =>
+  editingGameId.value ? store.games.find((g) => g.id === editingGameId.value) ?? null : null
+);
 // 封面获取 loading 状态
 const refreshingCovers = ref(false);
 // 游戏信息获取 loading 状态
@@ -56,7 +59,10 @@ const homeContextMenuY = ref(0);
 const statusOptions = [
   { label: "全部", value: "" },
   { label: "收藏", value: "favorites" },
+  { label: "未游玩", value: "unplayed" },
+  { label: "游玩中", value: "playing" },
   { label: "已通关", value: "completed" },
+  { label: "已弃坑", value: "abandoned" },
 ];
 
 // 类型筛选选项（从 store 动态加载）
@@ -74,6 +80,11 @@ const recentGames = computed(() => {
 });
 
 function handleHomeContextMenu(e: MouseEvent) {
+  // 输入框/文本编辑区域保留原生右键菜单（粘贴/复制等）
+  const target = e.target as HTMLElement | null;
+  if (target?.closest?.("input, textarea, [contenteditable='true']")) {
+    return;
+  }
   e.preventDefault();
   e.stopPropagation();
   homeContextMenuX.value = e.clientX;
@@ -186,6 +197,18 @@ function handleCancelRename() {
   showRenameModal.value = false;
   renamingGameId.value = "";
   renameInput.value = "";
+}
+
+/** 启动游戏并提示失败原因（不再静默吞错） */
+async function handleLaunchGame(gameId: string) {
+  const game = store.games.find((g) => g.id === gameId);
+  const gameName = game?.name || "该游戏";
+  try {
+    await store.launch(gameId);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    message.error(`启动「${gameName}」失败: ${msg}`);
+  }
 }
 
 // 搜索去抖动（300ms）
@@ -354,13 +377,17 @@ function handleDeleteGame(gameId: string) {
         >
           <div class="recent-cover">
             <img
-              v-if="store.coverBase64Cache[game.id]"
-              :src="store.coverBase64Cache[game.id]"
+              v-if="store.coverSrc(game.id)"
+              :src="store.coverSrc(game.id)!"
               :alt="game.name"
               loading="lazy"
             />
             <div v-else class="recent-cover-placeholder">{{ game.name.charAt(0) }}</div>
-            <button class="recent-launch" @click.stop="store.launch(game.id).catch(() => {})" title="启动">▶</button>
+            <button
+              class="recent-launch"
+              @click.stop="handleLaunchGame(game.id)"
+              title="启动"
+            >▶</button>
           </div>
           <div class="recent-info">
             <div class="recent-name">{{ game.name }}</div>
@@ -494,7 +521,7 @@ function handleDeleteGame(gameId: string) {
           :is-active="store.activeGames.includes(game.id)"
           :save-path-exists="Object.keys(store.savePathStatus).length > 0 ? store.savePathStatus[game.id] : undefined"
           @click="store.selectGame(game)"
-          @launch="store.launch(game.id).catch(() => {})"
+          @launch="handleLaunchGame(game.id)"
           @favorite="store.toggleFav(game.id)"
           @delete="handleDeleteGame(game.id)"
           @rename="handleRenameGame(game.id)"
@@ -512,7 +539,7 @@ function handleDeleteGame(gameId: string) {
       :game="store.selectedGame"
       :is-active="store.activeGames.includes(store.selectedGame.id)"
       @close="store.clearSelection()"
-      @launch="store.launch(store.selectedGame!.id).catch(() => {})"
+      @launch="handleLaunchGame(store.selectedGame!.id)"
       @favorite="store.toggleFav(store.selectedGame!.id)"
       @delete="handleDeleteGame(store.selectedGame!.id)"
       @set-status="handleSetGameStatus(store.selectedGame!.id, $event)"
@@ -570,9 +597,9 @@ function handleDeleteGame(gameId: string) {
 
     <!-- 手动填写游戏信息弹窗 -->
     <GameInfoEditModal
-      v-if="showEditInfoModal && editingGameId"
+      v-if="showEditInfoModal && editingGame"
       :show="showEditInfoModal"
-      :game="store.games.find((g) => g.id === editingGameId)!"
+      :game="editingGame"
       @close="showEditInfoModal = false"
       @saved="showEditInfoModal = false"
     />

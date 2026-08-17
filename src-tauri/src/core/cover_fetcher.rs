@@ -32,36 +32,37 @@ impl CoverFetcher {
 
     /// 获取游戏封面（异步）
     pub async fn fetch_cover(&self, game: &Game) -> Result<Option<String>> {
-        // 1. 检查缓存（需要验证文件有效性）
-        let cache_path = self.get_cache_path(&game.id);
-        if cache_path.exists() {
-            // 检查文件大小，如果小于 100 字节，认为是无效的缓存文件
-            if let Ok(metadata) = std::fs::metadata(&cache_path) {
-                if metadata.len() >= COVER_MIN_FILE_SIZE {
-                    return Ok(Some(cache_path.to_string_lossy().to_string()));
-                }
-                // 文件太小，可能是损坏的，删除它继续获取
-                tracing::warn!("缓存文件太小({} bytes)，删除重新获取: {}", metadata.len(), game.name);
-                let _ = std::fs::remove_file(&cache_path);
-            }
+        // 1. 检查缓存（需要验证文件有效性，兼容 jpg/png/webp 扩展名）
+        if let Some(cache_path) = self.find_cached_cover(&game.id) {
+            return Ok(Some(cache_path.to_string_lossy().to_string()));
         }
 
         // 2. 尝试从本地游戏目录获取
         if let Some(ref install_path) = game.install_path {
             if let Some(local_cover) = self.find_local_cover(install_path) {
-                // 复制到缓存
-                std::fs::copy(&local_cover, &cache_path)?;
-                return Ok(Some(cache_path.to_string_lossy().to_string()));
+                // 复制到缓存（按源文件扩展名决定目标扩展名，避免 MIME 误判）
+                let dest = self.get_cache_path(&game.id);
+                let src_ext = local_cover.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_lowercase());
+                let final_dest = match src_ext.as_deref() {
+                    Some("png") => dest.with_extension("png"),
+                    Some("webp") => dest.with_extension("webp"),
+                    _ => dest,
+                };
+                std::fs::copy(&local_cover, &final_dest)?;
+                return Ok(Some(final_dest.to_string_lossy().to_string()));
             }
         }
 
         // 3. 尝试 SteamGridDB（先用游戏名搜索，再用文件夹名搜索）
         if !self.steamgriddb_api_key.is_empty() {
+            let cache_path = self.get_cache_path(&game.id);
             // 用游戏名搜索
             match self.search_steamgriddb(&game.name).await {
                 Ok(Some(cover_url)) => {
-                    if self.download_image(&cover_url, &cache_path).await.is_ok() {
-                        return Ok(Some(cache_path.to_string_lossy().to_string()));
+                    if let Ok(actual_path) = self.download_image(&cover_url, &cache_path).await {
+                        return Ok(Some(actual_path.to_string_lossy().to_string()));
                     }
                 }
                 Err(e) => return Err(e), // API Key 错误等，直接上抛
@@ -79,8 +80,8 @@ impl CoverFetcher {
                         tracing::info!("尝试用文件夹名搜索封面: {}", folder);
                         match self.search_steamgriddb(folder).await {
                             Ok(Some(cover_url)) => {
-                                if self.download_image(&cover_url, &cache_path).await.is_ok() {
-                                    return Ok(Some(cache_path.to_string_lossy().to_string()));
+                                if let Ok(actual_path) = self.download_image(&cover_url, &cache_path).await {
+                                    return Ok(Some(actual_path.to_string_lossy().to_string()));
                                 }
                             }
                             Err(e) => return Err(e),
@@ -95,7 +96,26 @@ impl CoverFetcher {
         Ok(None)
     }
 
-    /// 获取缓存路径
+    /// 查找已缓存的封面（兼容 jpg/png/webp 扩展名），文件有效则返回路径
+    /// 历史缓存可能存为任意扩展名（早期固定 .jpg），此处统一遍历
+    fn find_cached_cover(&self, game_id: &str) -> Option<PathBuf> {
+        for ext in ["jpg", "png", "webp"] {
+            let p = self.cache_dir.join(format!("{}.{}", game_id, ext));
+            if p.exists() {
+                if let Ok(metadata) = std::fs::metadata(&p) {
+                    if metadata.len() >= COVER_MIN_FILE_SIZE {
+                        return Some(p);
+                    }
+                    // 文件太小，可能是损坏的，删除它继续获取
+                    tracing::warn!("缓存文件太小({} bytes)，删除重新获取: {}", metadata.len(), game_id);
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+        None
+    }
+
+    /// 获取缓存路径（默认 .jpg；实际保存时按图片内容决定扩展名）
     fn get_cache_path(&self, game_id: &str) -> PathBuf {
         self.cache_dir.join(format!("{}.jpg", game_id))
     }
@@ -161,6 +181,10 @@ impl CoverFetcher {
             // 401/403 表示 API Key 无效，返回明确错误
             if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
                 anyhow::bail!("SteamGridDB API Key 无效，请在设置中检查");
+            }
+            // 429 表示限流（免费层约 1 req/s），提示用户稍后重试而非误报"未找到"
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                anyhow::bail!("SteamGridDB 请求过于频繁（429），请稍后重试");
             }
             return Ok(None);
         }
@@ -251,6 +275,9 @@ impl CoverFetcher {
             if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
                 anyhow::bail!("SteamGridDB API Key 无效，请在设置中检查");
             }
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                anyhow::bail!("SteamGridDB 请求过于频繁（429），请稍后重试");
+            }
             return Ok(Vec::new());
         }
 
@@ -309,12 +336,32 @@ impl CoverFetcher {
     }
 
     /// 从 URL 下载图片到指定路径（供外部调用）
-    pub async fn download_from_url(&self, url: &str, save_path: &Path) -> Result<()> {
+    /// 返回实际写入的文件路径（按图片内容决定扩展名）
+    pub async fn download_from_url(&self, url: &str, save_path: &Path) -> Result<PathBuf> {
         self.download_image(url, save_path).await
     }
 
+    /// 根据文件头魔数检测图片格式，返回扩展名（jpg/png/webp）
+    /// 非图片内容返回 None，用于拒绝将 HTML 错误页等误存为封面
+    fn detect_image_ext(bytes: &[u8]) -> Option<&'static str> {
+        if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+            Some("jpg")
+        } else if bytes.len() >= 8
+            && bytes[0] == 0x89 && bytes[1] == b'P' && bytes[2] == b'N' && bytes[3] == b'G'
+            && bytes[4] == 0x0D && bytes[5] == 0x0A && bytes[6] == 0x1A && bytes[7] == 0x0A
+        {
+            Some("png")
+        } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+            Some("webp")
+        } else {
+            None
+        }
+    }
+
     /// 下载图片（异步）
-    async fn download_image(&self, url: &str, save_path: &Path) -> Result<()> {
+    /// 校验内容魔数并按实际格式保存（避免 .jpg 扩展名存 PNG 导致 MIME 误判），
+    /// 返回实际写入的文件路径
+    async fn download_image(&self, url: &str, save_path: &Path) -> Result<PathBuf> {
         let response = self.client.get(url).send().await?;
 
         if !response.status().is_success() {
@@ -328,8 +375,24 @@ impl CoverFetcher {
             anyhow::bail!("下载失败: 响应内容太小({} bytes)", bytes.len());
         }
 
+        // 魔数校验：必须是 JPEG/PNG/WebP 之一，拒绝 HTML 错误页等非图片内容
+        let ext = Self::detect_image_ext(&bytes)
+            .ok_or_else(|| anyhow::anyhow!("下载内容不是有效的图片格式 (JPEG/PNG/WebP)"))?;
+
+        // 若请求路径的扩展名与实际格式不符，改用正确扩展名
+        let actual_path = if save_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case(ext))
+            == Some(true)
+        {
+            save_path.to_path_buf()
+        } else {
+            save_path.with_extension(ext)
+        };
+
         // 先写入临时文件，成功后再重命名，避免留下损坏的文件
-        let temp_path = save_path.with_extension("jpg.tmp");
+        let temp_path = actual_path.with_extension("tmp");
         std::fs::write(&temp_path, &bytes)?;
 
         // 验证临时文件大小
@@ -339,9 +402,10 @@ impl CoverFetcher {
             anyhow::bail!("下载失败: 写入后文件太小({} bytes)", metadata.len());
         }
 
-        // 重命名为正式文件
-        std::fs::rename(&temp_path, save_path)?;
+        // 重命名为正式文件（Windows 上 rename 不覆盖已有文件，先删除旧文件）
+        let _ = std::fs::remove_file(&actual_path);
+        std::fs::rename(&temp_path, &actual_path)?;
 
-        Ok(())
+        Ok(actual_path)
     }
 }

@@ -211,7 +211,13 @@ impl LlmFetcher {
                 }
             }
             LlmProtocol::Anthropic => {
-                extract_response_text(&config.protocol, &resp_json)?
+                // Anthropic server tool（web_search_20250305）可能在首个响应中只返回
+                // tool_use 块而无最终文本，需要把 tool_result 回传继续对话
+                if Self::has_anthropic_tool_use(&resp_json) {
+                    self.handle_anthropic_tool_loop(config, resp_json, &system_prompt, &user_prompt).await?
+                } else {
+                    extract_response_text(&config.protocol, &resp_json)?
+                }
             }
         };
 
@@ -346,6 +352,115 @@ impl LlmFetcher {
             }
 
             anyhow::bail!("模型未返回有效内容，请重试");
+        }
+
+        anyhow::bail!("工具调用循环超过最大次数")
+    }
+
+    /// 判断 Anthropic 响应中是否包含 tool_use 块
+    fn has_anthropic_tool_use(resp: &serde_json::Value) -> bool {
+        resp["content"].as_array().map_or(false, |arr| {
+            arr.iter().any(|b| b["type"].as_str() == Some("tool_use"))
+        })
+    }
+
+    /// 处理 Anthropic 服务器工具（web_search_20250305）的调用循环
+    /// 把 tool_use 块作为 assistant 消息、其结果为 tool_result user 消息回传，直到模型给出最终文本
+    async fn handle_anthropic_tool_loop(
+        &self,
+        config: &LlmConfig,
+        initial_response: serde_json::Value,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<String> {
+        let mut messages: Vec<serde_json::Value> = vec![
+            serde_json::json!({"role": "user", "content": user_prompt}),
+        ];
+        let mut current_response = initial_response;
+
+        for _ in 0..LLM_MAX_TOOL_ITERATIONS {
+            let content_arr: Vec<serde_json::Value> = current_response["content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+
+            let text_blocks: Vec<String> = content_arr.iter()
+                .filter_map(|b| b["text"].as_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect();
+            let tool_uses: Vec<serde_json::Value> = content_arr.iter()
+                .filter(|b| b["type"].as_str() == Some("tool_use"))
+                .cloned()
+                .collect();
+
+            // 无 tool_use：返回文本（若为空则报错）
+            if tool_uses.is_empty() {
+                if let Some(text) = text_blocks.first() {
+                    return Ok(text.clone());
+                }
+                anyhow::bail!("模型未返回有效内容，请重试");
+            }
+
+            // 有 tool_use：回传 assistant 消息（含 tool_use 块，Anthropic 要求完整回显）
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": content_arr,
+            }));
+
+            // 构造 tool_result user 消息（server tool 的 input 已含搜索结果）
+            let tool_results: Vec<serde_json::Value> = tool_uses.iter().map(|tu| {
+                let tool_use_id = tu["id"].as_str().unwrap_or("");
+                serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": tu["input"].to_string(),
+                })
+            }).collect();
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": tool_results,
+            }));
+
+            // 重发请求（保持相同的工具定义）
+            let url = {
+                let base = config.base_url.trim_end_matches('/');
+                if base.ends_with("/v1") {
+                    format!("{}/messages", base)
+                } else {
+                    format!("{}/v1/messages", base)
+                }
+            };
+            let body = serde_json::json!({
+                "model": config.model,
+                "max_tokens": LLM_MAX_TOKENS,
+                "system": system_prompt,
+                "messages": messages,
+                "tools": [
+                    {
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "max_uses": 5
+                    }
+                ]
+            });
+
+            let resp = self.client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("x-api-key", &config.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body)
+                .send()
+                .await
+                .context("发送后续 LLM 请求失败")?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let err_text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("LLM API 返回错误 {}: {}", status, err_text);
+            }
+
+            current_response = resp.json().await.context("解析后续 LLM 响应失败")?;
         }
 
         anyhow::bail!("工具调用循环超过最大次数")
@@ -492,9 +607,13 @@ fn build_system_prompt() -> String {
         .to_string()
 }
 
-/// 构建 user prompt
+/// 构建 user prompt（清理控制字符，防止 LLM 提示注入）
 fn build_user_prompt(game_name: &str) -> String {
-    format!("请提供游戏《{}》的信息。", game_name)
+    let sanitized: String = game_name
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    format!("请提供游戏《{}》的信息。", sanitized.trim())
 }
 
 /// 对 LLM 返回的元数据做后处理校验

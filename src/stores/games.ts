@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import { listen } from "@tauri-apps/api/event";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import type { Game } from "../lib/tauri";
 import * as api from "../lib/tauri";
 
@@ -8,15 +9,12 @@ export const useGamesStore = defineStore("games", () => {
   // 状态
   const games = ref<Game[]>([]);
   const loading = ref(false);
+  const error = ref<string | null>(null);
   const searchQuery = ref("");
   const selectedGame = ref<Game | null>(null);
   const activeGames = ref<string[]>([]);
   // 封面文件路径映射 (game_id -> 本地文件路径)
   const coverPaths = ref<Record<string, string>>({});
-  // 封面 base64 缓存 (game_id -> data URL)
-  const coverBase64Cache = ref<Record<string, string>>({});
-  // 封面加载状态
-  const coversLoading = ref(false);
   // 封面获取进度
   const coverFetchProgress = ref<{ current: number; total: number; game_name: string } | null>(null);
   // 游戏信息获取进度
@@ -120,13 +118,15 @@ export const useGamesStore = defineStore("games", () => {
 
   // 方法
   let loadGamesLock = false;
+  let pendingRefresh = false;
   async function loadGames() {
     if (loadGamesLock) {
-      console.warn("[GamesStore] loadGames 正在执行中，跳过重复调用");
+      pendingRefresh = true;
       return;
     }
     loadGamesLock = true;
     loading.value = true;
+    error.value = null;
     try {
       games.value = await api.getGames({
         sort_by: "last_played",
@@ -135,13 +135,30 @@ export const useGamesStore = defineStore("games", () => {
       await loadAllCovers();
       await loadAllGenres();
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      error.value = `加载游戏列表失败: ${msg}`;
       console.error("加载游戏列表失败:", e);
     } finally {
       loading.value = false;
       loadGamesLock = false;
+      // 如果在加载期间有新的刷新请求，执行一次补刷新
+      if (pendingRefresh) {
+        pendingRefresh = false;
+        loadGames();
+      }
     }
-    // 后台刷新 exe 版本号（不阻塞 UI）
+    // 后台刷新 exe 版本号（节流：5 分钟内最多执行一次，不阻塞 UI）
     // 注意：不重新获取整个列表，避免覆盖用户在两次请求之间的操作
+    throttledRefreshExeVersions();
+  }
+
+  // exe 版本刷新节流（5 分钟），避免每次 loadGames 都触发全量 stat
+  let lastVersionRefreshAt = 0;
+  const VERSION_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+  function throttledRefreshExeVersions() {
+    const now = Date.now();
+    if (now - lastVersionRefreshAt < VERSION_REFRESH_INTERVAL_MS) return;
+    lastVersionRefreshAt = now;
     api.refreshExeVersions().then(async (updated) => {
       if (updated > 0) {
         // 仅更新有变化的游戏的 exe_version 字段，而非替换整个列表
@@ -161,6 +178,11 @@ export const useGamesStore = defineStore("games", () => {
     }).catch(() => {});
   }
 
+  /** 静默触发成就检测（数据变更后调用，由后端事件负责弹通知） */
+  function checkAchievementsQuietly() {
+    api.checkAchievements().catch(() => {});
+  }
+
   async function loadAllGenres() {
     try {
       allGenres.value = await api.getAllGenres();
@@ -172,35 +194,20 @@ export const useGamesStore = defineStore("games", () => {
   async function loadAllCovers() {
     try {
       coverPaths.value = await api.getAllCovers();
-      // 批量加载所有封面的 base64 数据
-      await loadCoversBatch();
     } catch (e) {
       console.error("加载封面路径失败:", e);
     }
   }
 
-  async function loadCoversBatch() {
-    const paths = Object.values(coverPaths.value);
-    if (paths.length === 0) {
-      coverBase64Cache.value = {};
-      return;
-    }
-
-    coversLoading.value = true;
+  /** 将封面本地路径转为 asset URL（Tauri asset 协议直接加载，避免全量 base64 传输） */
+  function coverSrc(gameId: string): string | null {
+    const p = coverPaths.value[gameId];
+    if (!p) return null;
     try {
-      const result = await api.readCoversBatchAsBase64(paths);
-      // 将路径映射转换为 game_id 映射
-      const cache: Record<string, string> = {};
-      for (const [gameId, filePath] of Object.entries(coverPaths.value)) {
-        if (result[filePath]) {
-          cache[gameId] = result[filePath];
-        }
-      }
-      coverBase64Cache.value = cache;
+      return convertFileSrc(p);
     } catch (e) {
-      console.error("批量加载封面失败:", e);
-    } finally {
-      coversLoading.value = false;
+      console.error("转换封面路径失败:", gameId, e);
+      return null;
     }
   }
 
@@ -208,6 +215,7 @@ export const useGamesStore = defineStore("games", () => {
     try {
       await api.addGameManual(name, exePath);
       await loadGames();
+      checkAchievementsQuietly();
       fetchCovers().catch(() => {});
     } catch (e) {
       console.error("添加游戏失败:", e);
@@ -224,6 +232,7 @@ export const useGamesStore = defineStore("games", () => {
     if (selectedGame.value?.id === gameId) {
       selectedGame.value = updated;
     }
+    checkAchievementsQuietly();
     return updated;
   }
 
@@ -236,6 +245,7 @@ export const useGamesStore = defineStore("games", () => {
     if (selectedGame.value?.id === gameId) {
       selectedGame.value = updated;
     }
+    checkAchievementsQuietly();
     return updated;
   }
 
@@ -246,6 +256,7 @@ export const useGamesStore = defineStore("games", () => {
       coverFetchProgress.value = null;
       if (result.fetched > 0) {
         await loadGames();
+        checkAchievementsQuietly();
       }
       if (result.errors.length > 0) {
         console.warn("封面获取:", result.errors);
@@ -265,6 +276,7 @@ export const useGamesStore = defineStore("games", () => {
       gameInfoFetchProgress.value = null;
       if (result.fetched > 0) {
         await loadGames();
+        checkAchievementsQuietly();
       }
       if (result.errors.length > 0) {
         console.warn("游戏信息获取:", result.errors);
@@ -298,6 +310,7 @@ export const useGamesStore = defineStore("games", () => {
     try {
       await api.setGameCover(gameId, coverPath);
       await loadGames();
+      checkAchievementsQuietly();
     } catch (e) {
       console.error("设置封面失败:", e);
       throw e;
@@ -312,6 +325,7 @@ export const useGamesStore = defineStore("games", () => {
     try {
       await api.setGameCoverFromUrl(gameId, url);
       await loadGames();
+      checkAchievementsQuietly();
     } catch (e) {
       console.error("从 URL 设置封面失败:", e);
       throw e;
@@ -351,7 +365,6 @@ export const useGamesStore = defineStore("games", () => {
       }
       // 清理封面缓存
       delete coverPaths.value[gameId];
-      delete coverBase64Cache.value[gameId];
     } catch (e) {
       console.error("删除游戏失败:", e);
       throw e;  // 向上传播错误，让调用方可以提示用户
@@ -384,6 +397,7 @@ export const useGamesStore = defineStore("games", () => {
       if (selectedGame.value?.id === gameId) {
         selectedGame.value = updated;
       }
+      checkAchievementsQuietly();
       return updated;
     } catch (e) {
       console.error("更新可执行文件路径失败:", e);
@@ -401,6 +415,7 @@ export const useGamesStore = defineStore("games", () => {
       if (selectedGame.value?.id === gameId) {
         selectedGame.value.status = status;
       }
+      checkAchievementsQuietly();
     } catch (e) {
       console.error("设置游戏状态失败:", e);
       throw e;
@@ -418,13 +433,10 @@ export const useGamesStore = defineStore("games", () => {
     }
   }
 
-  /** 更新单个游戏的存档路径检查状态（当用户手动编辑存档路径后调用） */
+  /** 更新单个游戏的存档路径检查状态（仅检查该游戏，避免全量扫描） */
   async function updateSingleSavePathStatus(gameId: string) {
     try {
-      const allStatus = await api.checkSavePaths();
-      if (allStatus[gameId] !== undefined) {
-        savePathStatus.value[gameId] = allStatus[gameId];
-      }
+      savePathStatus.value[gameId] = await api.checkSavePathsForGame(gameId);
     } catch (e) {
       console.error("更新存档路径状态失败:", e);
     }
@@ -438,15 +450,26 @@ export const useGamesStore = defineStore("games", () => {
     selectedGame.value = null;
   }
 
+  /** 更新 store 中指定游戏的数据（避免组件直接操作 store 内部状态） */
+  function updateGameInStore(gameId: string, updatedGame: Game) {
+    const idx = games.value.findIndex((g) => g.id === gameId);
+    if (idx !== -1) {
+      games.value[idx] = updatedGame;
+    }
+    if (selectedGame.value?.id === gameId) {
+      selectedGame.value = updatedGame;
+    }
+  }
+
   return {
     games,
     loading,
+    error,
     searchQuery,
     selectedGame,
     activeGames,
     coverPaths,
-    coverBase64Cache,
-    coversLoading,
+    coverSrc,
     coverFetchProgress,
     gameInfoFetchProgress,
     statusFilter,
@@ -477,6 +500,7 @@ export const useGamesStore = defineStore("games", () => {
     updateSingleSavePathStatus,
     selectGame,
     clearSelection,
+    updateGameInStore,
     setupEventListeners,
     cleanupEventListeners,
   };

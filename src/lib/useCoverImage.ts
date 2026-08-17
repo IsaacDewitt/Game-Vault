@@ -4,12 +4,13 @@ import { useGamesStore } from "../stores/games";
 
 /**
  * 封面图片逻辑 composable
- * 从 store 的批量 base64 缓存中读取封面，避免单独 IPC 调用
+ * 通过 Tauri asset 协议（convertFileSrc）直接加载本地封面文件，
+ * 避免全量 base64 传输；文件不存在或加载失败时回退到占位符。
  */
 export function useCoverImage(game: Ref<Game>) {
   const store = useGamesStore();
 
-  // 标记图片渲染是否失败（base64 数据存在但无法渲染）
+  // 标记图片渲染是否失败（asset URL 存在但无法渲染）
   const renderFailed = ref(false);
 
   // 仅当 game.id 变化时重置渲染失败状态（避免在 computed 内修改 ref 导致死循环）
@@ -17,15 +18,15 @@ export function useCoverImage(game: Ref<Game>) {
     renderFailed.value = false;
   }, { immediate: true });
 
-  // 直接从 store 的 base64 缓存中获取封面
+  // 直接从 store 的封面路径映射生成 asset URL
   const coverImage = computed(() => {
-    return store.coverBase64Cache[game.value.id] || null;
+    return store.coverSrc(game.value.id);
   });
 
-  // 如果缓存中没有且有封面路径，说明加载失败或正在加载
+  // 如果配置了封面路径但没有可用的 asset URL，说明文件失效（删除/损坏）
   const imgFailed = computed(() => {
     const hasPath = store.coverPaths[game.value.id] || game.value.cover_local || game.value.cover_url;
-    return !!hasPath && !coverImage.value && !store.coversLoading;
+    return !!hasPath && !coverImage.value;
   });
 
   function handleImageError() {

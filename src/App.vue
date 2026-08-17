@@ -2,20 +2,22 @@
 import { ref, computed, onMounted, onUnmounted, defineAsyncComponent, h, type Component, watch, provide } from "vue";
 import { darkTheme, lightTheme, NConfigProvider, NLayout, NLayoutSider, NLayoutContent, NMenu, NIcon, NMessageProvider, NDialogProvider, createDiscreteApi } from "naive-ui";
 import type { MenuOption } from "naive-ui";
-import { HomeOutline, StatsChartOutline, SettingsOutline, GameControllerOutline, EllipsisVertical, SquareOutline, CopyOutline, RemoveOutline, CloseOutline } from "@vicons/ionicons5";
+import { HomeOutline, StatsChartOutline, SettingsOutline, GameControllerOutline, EllipsisVertical, SquareOutline, CopyOutline, RemoveOutline, CloseOutline, TrophyOutline } from "@vicons/ionicons5";
 import HomeView from "./views/HomeView.vue";
 import AboutModal from "./components/AboutModal.vue";
+import AchievementToast from "./components/AchievementToast.vue";
 import { useGamesStore } from "./stores/games";
 import * as api from "./lib/tauri";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { DEFAULT_ACCENT_COLOR } from "./lib/constants";
-import { lightenColor, darkenColor } from "./lib/color";
+import { lightenColor, darkenColor, isValidHexColor } from "./lib/color";
 
 // 懒加载非首屏视图，减少初始包体积（ECharts ~800KB 只在访问统计页时加载）
 const StatsView = defineAsyncComponent(() => import("./views/StatsView.vue"));
 const SettingsView = defineAsyncComponent(() => import("./views/SettingsView.vue"));
+const AchievementsView = defineAsyncComponent(() => import("./views/AchievementsView.vue"));
 
 const gamesStore = useGamesStore();
 const activeView = ref("home");
@@ -32,6 +34,7 @@ const showAbout = ref(false);
 const viewComponents: Record<string, Component> = {
   home: HomeView,
   stats: StatsView,
+  achievements: AchievementsView,
   settings: SettingsView,
 };
 
@@ -60,6 +63,8 @@ async function loadThemeSettings() {
 
 // 暴露给子组件调用
 function updateAccentColor(color: string) {
+  // 校验合法性，避免非法值（如输入一半的 "#63"）导致 NaN 颜色与 Naive UI 报错
+  if (!isValidHexColor(color)) return;
   accentColor.value = color;
 }
 
@@ -83,6 +88,11 @@ const menuOptions: MenuOption[] = [
     label: "游戏统计",
     key: "stats",
     icon: () => h(NIcon, null, { default: () => h(StatsChartOutline) }),
+  },
+  {
+    label: "成就",
+    key: "achievements",
+    icon: () => h(NIcon, null, { default: () => h(TrophyOutline) }),
   },
   {
     label: "设置",
@@ -268,6 +278,8 @@ onUnmounted(() => {
 
       <!-- 关于对话框 -->
       <AboutModal :show="showAbout" :version="appVersion" @close="showAbout = false" />
+      <!-- 成就解锁通知 -->
+      <AchievementToast />
     </n-config-provider>
     </n-dialog-provider>
   </n-message-provider>

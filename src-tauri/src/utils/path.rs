@@ -85,29 +85,29 @@ pub fn expand_env_vars(path: &str) -> String {
     }
 
     // 第一步：把 %%VARNAME%% 规范化为 %VARNAME%
-    // 用正则太重，手动解析：找到 %%...%% 结构，直接替换为 %...%
+    // 注意：必须按 str 切片处理而非逐字节，否则会破坏中文等多字节 UTF-8 字符
     {
         let mut normalized = String::with_capacity(result.len());
-        let bytes = result.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if i + 3 < bytes.len() && bytes[i] == b'%' && bytes[i + 1] == b'%' {
-                // 找到 %% 开头，看看后面有没有 %%
-                if let Some(end) = result[i + 2..].find("%%") {
-                    let var_name = &result[i + 2..i + 2 + end];
-                    // 确保变量名非空且不含 %（避免误匹配）
-                    if !var_name.is_empty() && !var_name.contains('%') {
-                        normalized.push('%');
-                        normalized.push_str(var_name);
-                        normalized.push('%');
-                        i = i + 2 + end + 2; // 跳过整个 %%VARNAME%%
-                        continue;
-                    }
+        let mut rest = result.as_str();
+        while let Some(pos) = rest.find("%%") {
+            normalized.push_str(&rest[..pos]);
+            let after = &rest[pos + 2..];
+            if let Some(end_rel) = after.find("%%") {
+                let var_name = &after[..end_rel];
+                // 确保变量名非空且不含 %（避免误匹配）
+                if !var_name.is_empty() && !var_name.contains('%') {
+                    normalized.push('%');
+                    normalized.push_str(var_name);
+                    normalized.push('%');
+                    rest = &after[end_rel + 2..]; // 跳过整个 %%VARNAME%%
+                    continue;
                 }
             }
-            normalized.push(bytes[i] as char);
-            i += 1;
+            // 未匹配到闭合 %%，原样保留 "%%"
+            normalized.push_str("%%");
+            rest = after;
         }
+        normalized.push_str(rest);
         result = normalized;
     }
 
@@ -286,8 +286,8 @@ fn find_version_resource(data: &[u8], base: usize, dir_file: usize, depth: u32) 
 /// 将 RVA 转换为文件偏移（遍历节表）
 fn rva_to_offset(data: &[u8], sections_start: usize, num_sections: usize, rva: usize) -> Option<usize> {
     for i in 0..num_sections {
-        let s = sections_start + i * 40;
-        if s + 40 > data.len() {
+        let s = sections_start.checked_add(i.checked_mul(40)?)?;
+        if s.checked_add(40)? > data.len() {
             break;
         }
         let va = read_u32(&data, s + 12)? as usize;

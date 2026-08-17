@@ -36,20 +36,12 @@ pub fn get_overview_stats(
     let game_count = db.get_game_count().map_err(|e| e.to_string())?;
     let total_play_time = db.get_total_play_time().map_err(|e| e.to_string())?;
 
-    // 使用本地时间计算今日日期和本月起始日期
-    let now = chrono::Local::now();
-    let today = now.format("%Y-%m-%d").to_string();
-    let month_start = now.format("%Y-%m-01").to_string();
+    // 本月时长：直接按本地时区的年月聚合（不依赖 30 天窗口的隐含假设）
+    let monthly_seconds = db.get_monthly_play_time().map_err(|e| e.to_string())?;
 
-    // 查询近30天的统计数据（用于概览和每日趋势）
+    // 今日时长：查询近 30 天数据中今天的记录
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let daily_stats = db.get_daily_stats(30).map_err(|e| e.to_string())?;
-
-    // 本月时长：过滤出本月的数据求和
-    let monthly_seconds: u64 = daily_stats.iter()
-        .filter(|s| s.date >= month_start)
-        .map(|s| s.total_seconds)
-        .sum();
-
     let today_seconds = daily_stats.iter()
         .find(|s| s.date == today)
         .map(|s| s.total_seconds)

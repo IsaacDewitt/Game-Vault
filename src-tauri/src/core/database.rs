@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Datelike;
 use rusqlite::{Connection, params};
 use std::path::Path;
 use crate::models::*;
@@ -74,6 +75,14 @@ impl Database {
                 value TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS achievement_unlocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                achievement_id TEXT NOT NULL,
+                game_id TEXT NOT NULL DEFAULT '',
+                unlocked_at TEXT NOT NULL,
+                UNIQUE(achievement_id, game_id)
+            );
+
             -- 插入默认设置
             INSERT OR IGNORE INTO settings (key, value) VALUES ('theme', 'dark');
             INSERT OR IGNORE INTO settings (key, value) VALUES ('language', 'zh-CN');
@@ -85,6 +94,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_games_name ON games(name);
             CREATE INDEX IF NOT EXISTS idx_play_sessions_game_id ON play_sessions(game_id);
             CREATE INDEX IF NOT EXISTS idx_play_sessions_start_time ON play_sessions(start_time);
+            CREATE INDEX IF NOT EXISTS idx_achievement_unlocks_game ON achievement_unlocks(game_id);
         ")?;
 
         // 迁移：为旧数据库添加 status 字段（必须在索引创建之前）
@@ -101,6 +111,9 @@ impl Database {
 
         // 迁移：为旧数据库添加 exe 文件元数据缓存字段
         self.migrate_add_exe_metadata_columns()?;
+
+        // 迁移：为旧数据库添加 abandoned_at 字段（弃坑重玩成就判定用）
+        self.migrate_add_abandoned_at_column()?;
 
         // 创建 status 索引（在列存在之后）
         self.conn.execute_batch(
@@ -129,7 +142,12 @@ impl Database {
     // ==================== 辅助函数 ====================
 
     /// 检查表中是否存在指定列
+    /// 注意：PRAGMA 不支持参数化查询，table/column 参数必须为内部硬编码值，不可来自用户输入
     fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        debug_assert!(table.chars().all(|c| c.is_alphanumeric() || c == '_'),
+            "table name must be alphanumeric: {}", table);
+        debug_assert!(column.chars().all(|c| c.is_alphanumeric() || c == '_'),
+            "column name must be alphanumeric: {}", column);
         let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({})", table))?;
         let columns = stmt.query_map([], |row| {
             Ok(row.get::<_, String>(1)?)
@@ -436,11 +454,20 @@ impl Database {
     }
 
     /// 更新游戏状态
+    /// 当状态变为 abandoned 时记录 abandoned_at（最近一次弃坑时间），供「弃坑后重玩」成就判定
     pub fn set_game_status(&self, id: &str, status: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE games SET status = ?1, updated_at = ?2 WHERE id = ?3",
-            params![status, chrono::Utc::now().to_rfc3339(), id],
-        )?;
+        let now = chrono::Utc::now().to_rfc3339();
+        if status == "abandoned" {
+            self.conn.execute(
+                "UPDATE games SET status = ?1, abandoned_at = ?2, updated_at = ?2 WHERE id = ?3",
+                params![status, now, id],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE games SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![status, now, id],
+            )?;
+        }
         Ok(())
     }
 
@@ -463,28 +490,53 @@ impl Database {
 
     /// 记录游戏会话（使用事务保证原子性）
     pub fn add_play_session(&self, game_id: &str, start_time: &str, duration_seconds: u64) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
         let now = chrono::Utc::now().to_rfc3339();
-
-        // 从 start_time + duration_seconds 计算真实的结束时间
         let end_time = chrono::DateTime::parse_from_rfc3339(start_time)
             .ok()
             .map(|start| (start + chrono::Duration::seconds(duration_seconds as i64)).to_rfc3339())
             .unwrap_or_else(|| now.clone());
 
+        let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO play_sessions (game_id, start_time, end_time, duration_seconds) VALUES (?1, ?2, ?3, ?4)",
             params![game_id, start_time, end_time, duration_seconds as i64],
         )?;
-
-        // 更新游戏总时长和启动次数
         tx.execute(
             "UPDATE games SET play_time_seconds = play_time_seconds + ?1, play_count = play_count + 1, last_played = ?2, updated_at = ?2 WHERE id = ?3",
             params![duration_seconds as i64, now, game_id],
         )?;
-
         tx.commit()?;
         Ok(())
+    }
+
+    /// 批量记录游戏会话（单个事务内完成，多个游戏同时退出时减少事务开销）
+    pub fn add_play_sessions_batch(
+        &self,
+        sessions: &[(String, String, u64)], // (game_id, start_time, duration_seconds)
+    ) -> Result<usize> {
+        if sessions.is_empty() {
+            return Ok(0);
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+        let mut saved = 0usize;
+        for (game_id, start_time, duration_seconds) in sessions {
+            let end_time = chrono::DateTime::parse_from_rfc3339(start_time)
+                .ok()
+                .map(|start| (start + chrono::Duration::seconds(*duration_seconds as i64)).to_rfc3339())
+                .unwrap_or_else(|| now.clone());
+            tx.execute(
+                "INSERT INTO play_sessions (game_id, start_time, end_time, duration_seconds) VALUES (?1, ?2, ?3, ?4)",
+                params![game_id, start_time, end_time, *duration_seconds as i64],
+            )?;
+            tx.execute(
+                "UPDATE games SET play_time_seconds = play_time_seconds + ?1, play_count = play_count + 1, last_played = ?2, updated_at = ?2 WHERE id = ?3",
+                params![*duration_seconds as i64, now, game_id],
+            )?;
+            saved += 1;
+        }
+        tx.commit()?;
+        Ok(saved)
     }
 
     /// 获取游戏时长排行榜
@@ -508,7 +560,7 @@ impl Database {
         Ok(stats)
     }
 
-    /// 获取每日游玩统计
+    /// 获取每日游玩统计（补零：无游玩记录的日期也返回 total_seconds=0，保证折线图连续）
     pub fn get_daily_stats(&self, days: u32) -> Result<Vec<DailyStats>> {
         // 获取本地时区偏移（秒），支持非整小时时区（如 UTC+5:30）
         let local_offset = chrono::Local::now().offset().local_minus_utc();
@@ -525,7 +577,7 @@ impl Database {
 
         let mut stmt = self.conn.prepare(&sql)?;
 
-        let stats = stmt.query_map(params![days], |row| {
+        let mut stats = stmt.query_map(params![days], |row| {
             Ok(DailyStats {
                 date: row.get(0)?,
                 total_seconds: row.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
@@ -533,7 +585,43 @@ impl Database {
             })
         })?.collect::<Result<Vec<_>, _>>()?;
 
-        Ok(stats)
+        // 补零：生成完整日期序列（本地时区的今天往前 days 天）
+        let today_local = chrono::Local::now().date_naive();
+        let start_date = today_local - chrono::Days::new(days.saturating_sub(1).max(1) as u64);
+        let mut by_date: std::collections::HashMap<String, DailyStats> = stats
+            .drain(..)
+            .map(|s| (s.date.clone(), s))
+            .collect();
+
+        let mut full: Vec<DailyStats> = Vec::with_capacity(days as usize);
+        let mut cursor = start_date;
+        while cursor <= today_local {
+            let key = cursor.format("%Y-%m-%d").to_string();
+            let entry = by_date.remove(&key).unwrap_or(DailyStats {
+                date: key.clone(),
+                total_seconds: 0,
+                sessions_count: 0,
+            });
+            full.push(entry);
+            cursor = cursor.checked_add_days(chrono::Days::new(1)).unwrap_or(cursor);
+        }
+        full.sort_by(|a, b| b.date.cmp(&a.date));
+        Ok(full)
+    }
+
+    /// 获取本月游玩时长（秒），直接按本地时区的年月聚合
+    pub fn get_monthly_play_time(&self) -> Result<u64> {
+        let local_offset = chrono::Local::now().offset().local_minus_utc();
+        let offset_str = format_offset_for_sqlite(local_offset);
+        let month_prefix = chrono::Local::now().format("%Y-%m").to_string();
+
+        let sql = format!(
+            "SELECT COALESCE(SUM(duration_seconds),0) FROM play_sessions \
+             WHERE strftime('%Y-%m', start_time, '{}') = ?1",
+            offset_str
+        );
+        let total: i64 = self.conn.query_row(&sql, params![month_prefix], |r| r.get(0))?;
+        Ok(total.max(0) as u64)
     }
 
     // ==================== 设置 ====================
@@ -795,6 +883,443 @@ impl Database {
         Ok(sessions)
     }
 
+    // ==================== 成就系统 ====================
+
+    /// 尝试解锁成就（INSERT OR IGNORE），返回是否为新解锁
+    /// 全局成就 game_id 传空字符串，单游戏成就传游戏 ID
+    pub fn try_unlock_achievement(&self, achievement_id: &str, game_id: &str, unlocked_at: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO achievement_unlocks (achievement_id, game_id, unlocked_at) VALUES (?1, ?2, ?3)",
+            params![achievement_id, game_id, unlocked_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// 获取全部成就解锁记录
+    pub fn get_achievement_unlocks(&self) -> Result<Vec<AchievementUnlock>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT achievement_id, game_id, unlocked_at FROM achievement_unlocks"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AchievementUnlock {
+                achievement_id: row.get(0)?,
+                game_id: row.get(1)?,
+                unlocked_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// LLM 补全元数据计数（成就 G-13 用）
+    pub fn get_llm_filled_count(&self) -> Result<u64> {
+        let value = self.get_setting("llm_filled_count")?.unwrap_or_default();
+        Ok(value.parse().unwrap_or(0))
+    }
+
+    /// LLM 补全计数 +1
+    pub fn increment_llm_filled_count(&self) -> Result<()> {
+        let count = self.get_llm_filled_count()? + 1;
+        self.set_setting("llm_filled_count", &count.to_string())
+    }
+
+    /// 计算日期列表中的最长连续天数（日期须为升序去重的 "%Y-%m-%d" 列表）
+    fn longest_streak(dates: &[&str]) -> u64 {
+        if dates.is_empty() {
+            return 0;
+        }
+        let mut max_streak = 1u64;
+        let mut current = 1u64;
+        for window in dates.windows(2) {
+            let prev = chrono::NaiveDate::parse_from_str(window[0], "%Y-%m-%d").ok();
+            let next = chrono::NaiveDate::parse_from_str(window[1], "%Y-%m-%d").ok();
+            if let (Some(p), Some(n)) = (prev, next) {
+                if n.signed_duration_since(p).num_days() == 1 {
+                    current += 1;
+                    max_streak = max_streak.max(current);
+                } else {
+                    current = 1;
+                }
+            }
+        }
+        max_streak
+    }
+
+    /// 聚合全局成就检测所需的统计
+    pub fn get_achievement_global_stats(&self) -> Result<AchievementGlobalStats> {
+        let local_offset = chrono::Local::now().offset().local_minus_utc();
+        let offset_str = format_offset_for_sqlite(local_offset);
+        let mut s = AchievementGlobalStats::default();
+
+        s.game_count = self.conn.query_row("SELECT COUNT(*) FROM games", [], |r| r.get::<_, i64>(0))? as u64;
+        s.total_play_time = self.conn.query_row(
+            "SELECT COALESCE(SUM(play_time_seconds),0) FROM games", [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.total_sessions = self.conn.query_row("SELECT COUNT(*) FROM play_sessions", [], |r| r.get::<_, i64>(0))? as u64;
+        s.completed_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM games WHERE status='completed'", [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.favorite_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM games WHERE is_favorite=1", [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.cover_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM games WHERE cover_local IS NOT NULL OR cover_url IS NOT NULL",
+            [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.save_paths_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM games WHERE save_paths IS NOT NULL AND save_paths != '' AND save_paths != '[]'",
+            [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.llm_filled_count = self.get_llm_filled_count()?;
+        s.max_session_duration = self.conn.query_row(
+            "SELECT COALESCE(MAX(duration_seconds),0) FROM play_sessions", [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.night_session = self.conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM play_sessions WHERE CAST(strftime('%H', start_time, '{}') AS INTEGER) BETWEEN 0 AND 4 LIMIT 1)", offset_str),
+            [], |r| r.get::<_, i64>(0),
+        )? != 0;
+        s.dawn_session = self.conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM play_sessions WHERE CAST(strftime('%H', start_time, '{}') AS INTEGER) BETWEEN 5 AND 7 LIMIT 1)", offset_str),
+            [], |r| r.get::<_, i64>(0),
+        )? != 0;
+        s.weekend_total = self.conn.query_row(
+            &format!("SELECT COALESCE(SUM(duration_seconds),0) FROM play_sessions WHERE CAST(strftime('%w', start_time, '{}') AS INTEGER) IN (0,6)", offset_str),
+            [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.hltb_completed_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM games WHERE hltb_completionist IS NOT NULL AND play_time_seconds >= hltb_completionist * 60",
+            [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        // 弃坑后重玩判定：以 abandoned_at（最近一次弃坑时间）为准，
+        // 不能用 updated_at——它会被任何无关操作刷新，且会话落库时与 last_played 同时写入导致恒等
+        s.abandoned_replayed = self.conn.query_row(
+            "SELECT COUNT(*) FROM games WHERE status='abandoned' AND last_played IS NOT NULL AND abandoned_at IS NOT NULL AND last_played > abandoned_at",
+            [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.max_distinct_games_per_day = self.conn.query_row(
+            &format!("SELECT COALESCE(MAX(cnt),0) FROM (SELECT COUNT(DISTINCT game_id) cnt FROM play_sessions GROUP BY DATE(start_time, '{}'))", offset_str),
+            [], |r| r.get::<_, i64>(0),
+        )? as u64;
+
+        // ===== 第二批成就新增统计 =====
+        s.unplayed_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM games WHERE play_time_seconds = 0", [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.played_under_1h_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM games WHERE play_time_seconds > 0 AND play_time_seconds < 3600", [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.over_main_not_completed_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM games WHERE hltb_main_story IS NOT NULL AND play_time_seconds >= hltb_main_story * 60 AND status != 'completed'", [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.total_exe_size_gb = self.conn.query_row(
+            "SELECT COALESCE(SUM(exe_file_size),0) FROM games", [], |r| r.get::<_, i64>(0),
+        )? as u64 / (1024 * 1024 * 1024);
+        s.games_over_100h_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM games WHERE play_time_seconds >= 360000", [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.max_day_seconds = self.conn.query_row(
+            &format!("SELECT COALESCE(MAX(total),0) FROM (SELECT SUM(duration_seconds) total FROM play_sessions GROUP BY DATE(start_time, '{}'))", offset_str),
+            [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.max_weekend_total = self.conn.query_row(
+            &format!("SELECT COALESCE(MAX(total),0) FROM (SELECT SUM(duration_seconds) total FROM play_sessions WHERE CAST(strftime('%w', start_time, '{}') AS INTEGER) IN (0,6) GROUP BY DATE(start_time, '{}'))", offset_str, offset_str),
+            [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.max_distinct_games_per_week = self.conn.query_row(
+            &format!("SELECT COALESCE(MAX(cnt),0) FROM (SELECT COUNT(DISTINCT game_id) cnt FROM play_sessions GROUP BY strftime('%Y-%W', start_time, '{}'))", offset_str),
+            [], |r| r.get::<_, i64>(0),
+        )? as u64;
+        s.day_night_same_day = self.conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM (\
+                 SELECT DATE(start_time, '{}') d, \
+                 MAX(CASE WHEN CAST(strftime('%H', start_time, '{}') AS INTEGER) BETWEEN 0 AND 4 THEN 1 ELSE 0 END) night, \
+                 MAX(CASE WHEN CAST(strftime('%H', start_time, '{}') AS INTEGER) BETWEEN 9 AND 17 THEN 1 ELSE 0 END) day \
+                 FROM play_sessions GROUP BY d) WHERE night = 1 AND day = 1)",
+                offset_str, offset_str, offset_str
+            ),
+            [], |r| r.get::<_, i64>(0),
+        )? != 0;
+        s.has_full_week = self.conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM (SELECT strftime('%Y-%W', start_time, '{}') wk, COUNT(DISTINCT DATE(start_time, '{}')) dcnt FROM play_sessions GROUP BY wk) WHERE dcnt >= 7)", offset_str, offset_str),
+            [], |r| r.get::<_, i64>(0),
+        )? != 0;
+
+        // 老游戏计数（release_date 取年份，≤ 当前年份 - 20）
+        {
+            let current_year = chrono::Utc::now().year();
+            let mut old_count = 0u64;
+            let mut stmt = self.conn.prepare("SELECT release_date FROM games WHERE release_date IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if let Ok(rd) = row {
+                    if let Some(y) = rd.split('-').next().and_then(|s| s.trim().parse::<i32>().ok()) {
+                        if y > 0 && y <= current_year - 20 {
+                            old_count += 1;
+                        }
+                    }
+                }
+            }
+            s.old_game_count = old_count;
+        }
+
+        // 去重游戏类型数
+        {
+            let mut genre_set = std::collections::HashSet::new();
+            let mut stmt = self.conn.prepare("SELECT genres FROM games")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if let Ok(g) = row {
+                    let genres: Vec<String> = serde_json::from_str(&g).unwrap_or_default();
+                    for genre in genres {
+                        if !genre.is_empty() {
+                            genre_set.insert(genre);
+                        }
+                    }
+                }
+            }
+            s.distinct_genre_count = genre_set.len() as u64;
+        }
+
+        // 同一开发商最多游戏数
+        {
+            let mut dev_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            let mut stmt = self.conn.prepare("SELECT developer FROM games WHERE developer IS NOT NULL AND developer != ''")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if let Ok(d) = row {
+                    *dev_map.entry(d).or_insert(0) += 1;
+                }
+            }
+            s.max_dev_count = dev_map.values().copied().max().unwrap_or(0);
+        }
+
+        // 入库超 1 年才首次启动的游戏数（首玩日期 - 入库日期 ≥ 365 天）
+        {
+            let mut late = 0u64;
+            let mut stmt = self.conn.prepare(
+                "SELECT g.added_at, MIN(ps.start_time) FROM games g \
+                 JOIN play_sessions ps ON ps.game_id = g.id WHERE g.play_count > 0 GROUP BY g.id",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            for row in rows {
+                if let Ok((added, first)) = row {
+                    if let (Ok(a), Ok(f)) = (
+                        chrono::DateTime::parse_from_rfc3339(&added),
+                        chrono::DateTime::parse_from_rfc3339(&first),
+                    ) {
+                        if (f - a).num_days() >= 365 {
+                            late += 1;
+                        }
+                    }
+                }
+            }
+            s.late_bloomer_count = late;
+        }
+
+        // 连续凌晨（0–5 点）游玩天数
+        {
+            let mut night_dates: Vec<String> = Vec::new();
+            let mut stmt = self.conn.prepare(
+                &format!("SELECT DISTINCT DATE(start_time, '{}') FROM play_sessions WHERE CAST(strftime('%H', start_time, '{}') AS INTEGER) BETWEEN 0 AND 4", offset_str, offset_str),
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if let Ok(d) = row {
+                    night_dates.push(d);
+                }
+            }
+            night_dates.sort();
+            let refs: Vec<&str> = night_dates.iter().map(|s| s.as_str()).collect();
+            s.night_streak = Self::longest_streak(&refs);
+        }
+
+        // 某游戏间隔 ≥ 180 天后重玩
+        {
+            let mut long_gap = false;
+            let mut stmt = self.conn.prepare(
+                &format!("SELECT game_id, DATE(start_time, '{}') d FROM play_sessions GROUP BY game_id, d", offset_str),
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            let mut per_game: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+            for row in rows {
+                if let Ok((gid, d)) = row {
+                    per_game.entry(gid).or_default().push(d);
+                }
+            }
+            'outer: for (_, mut dates) in per_game {
+                dates.sort();
+                for w in dates.windows(2) {
+                    if let (Ok(a), Ok(b)) = (
+                        chrono::NaiveDate::parse_from_str(&w[0], "%Y-%m-%d"),
+                        chrono::NaiveDate::parse_from_str(&w[1], "%Y-%m-%d"),
+                    ) {
+                        if (b - a).num_days() >= 180 {
+                            long_gap = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            s.long_gap_replay = long_gap;
+        }
+
+        // 库龄（首款入库）与距最后一次游玩的天数
+        {
+            let now = chrono::Utc::now();
+            let first_add: Option<String> = self.conn.query_row(
+                "SELECT MIN(added_at) FROM games", [], |r| r.get(0),
+            )?;
+            s.days_since_first_add = first_add
+                .and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok())
+                .map(|t| (now - t.with_timezone(&chrono::Utc)).num_days().max(0) as u64)
+                .unwrap_or(0);
+            let last_play: Option<String> = self.conn.query_row(
+                "SELECT MAX(start_time) FROM play_sessions", [], |r| r.get(0),
+            )?;
+            s.days_since_last_play = last_play
+                .and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok())
+                .map(|t| (now - t.with_timezone(&chrono::Utc)).num_days().max(0) as u64)
+                .unwrap_or(0);
+        }
+
+        // 全局最长连续游玩天数（所有游戏日期的并集）
+        let mut dates: Vec<String> = Vec::new();
+        let mut stmt = self.conn.prepare(
+            &format!("SELECT DISTINCT DATE(start_time, '{}') FROM play_sessions", offset_str),
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            if let Ok(d) = row {
+                dates.push(d);
+            }
+        }
+        dates.sort();
+        let refs: Vec<&str> = dates.iter().map(|s| s.as_str()).collect();
+        s.longest_streak = Self::longest_streak(&refs);
+
+        Ok(s)
+    }
+
+    /// 聚合每个游戏的成就检测统计
+    pub fn get_per_game_achievement_stats(&self) -> Result<Vec<PerGameStats>> {
+        let local_offset = chrono::Local::now().offset().local_minus_utc();
+        let offset_str = format_offset_for_sqlite(local_offset);
+
+        // 1. 游戏基本信息
+        let mut stats_map: std::collections::HashMap<String, PerGameStats> = std::collections::HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, name, status, play_time_seconds, play_count, hltb_main_story, hltb_completionist, abandoned_at, last_played FROM games",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
+                    row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+                    row.get::<_, Option<i64>>(5)?.map(|v| v.max(0) as u64),
+                    row.get::<_, Option<i64>>(6)?.map(|v| v.max(0) as u64),
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, name, status, play_time, play_count, hltb_main, hltb_comp, abandoned_at, last_played) = row?;
+                // RFC3339 同格式字符串可直接比较（弃坑后是否有新游玩）
+                // 以 abandoned_at（最近一次弃坑时间）为准；不能用 updated_at（会被无关操作刷新）
+                let replayed = status == "abandoned"
+                    && last_played.is_some()
+                    && abandoned_at.is_some()
+                    && last_played.as_deref() > abandoned_at.as_deref();
+                stats_map.insert(id.clone(), PerGameStats {
+                    game_id: id,
+                    game_name: name,
+                    status,
+                    play_time_seconds: play_time,
+                    play_count,
+                    hltb_main_story: hltb_main,
+                    hltb_completionist: hltb_comp,
+                    replayed_after_abandon: replayed,
+                    ..Default::default()
+                });
+            }
+        }
+
+        // 2. 会话聚合：启动次数、单次最长
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT game_id, COUNT(*), COALESCE(MAX(duration_seconds),0) FROM play_sessions GROUP BY game_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
+                    row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                ))
+            })?;
+            for row in rows {
+                let (gid, count, max_dur) = row?;
+                if let Some(stats) = stats_map.get_mut(&gid) {
+                    stats.sessions_count = count;
+                    stats.max_session_duration = max_dur;
+                }
+            }
+        }
+
+        // 3. 每日聚合：不同游玩日期、单日最长、最长连续
+        {
+            let sql = format!(
+                "SELECT game_id, DATE(start_time, '{}') as day, SUM(duration_seconds) as total \
+                 FROM play_sessions GROUP BY game_id, day",
+                offset_str
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                ))
+            })?;
+            let mut day_map: std::collections::HashMap<String, Vec<(String, u64)>> = std::collections::HashMap::new();
+            for row in rows {
+                let (gid, day, total) = row?;
+                day_map.entry(gid).or_default().push((day, total));
+            }
+            for (gid, mut days) in day_map {
+                if let Some(stats) = stats_map.get_mut(&gid) {
+                    days.sort();
+                    stats.distinct_days = days.len() as u64;
+                    stats.max_day_seconds = days.iter().map(|(_, t)| *t).max().unwrap_or(0);
+                    let refs: Vec<&str> = days.iter().map(|(d, _)| d.as_str()).collect();
+                    stats.longest_streak = Self::longest_streak(&refs);
+                }
+            }
+        }
+
+        // 4. 凌晨会话（0:00-4:59）游戏集合
+        {
+            let sql = format!(
+                "SELECT DISTINCT game_id FROM play_sessions WHERE CAST(strftime('%H', start_time, '{}') AS INTEGER) BETWEEN 0 AND 4",
+                offset_str
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if let Ok(gid) = row {
+                    if let Some(stats) = stats_map.get_mut(&gid) {
+                        stats.night_session = true;
+                    }
+                }
+            }
+        }
+
+        let mut result: Vec<PerGameStats> = stats_map.into_values().collect();
+        result.sort_by(|a, b| a.game_id.cmp(&b.game_id));
+        Ok(result)
+    }
+
     /// 迁移：添加 HLTB 字段到旧数据库
     fn migrate_add_hltb_columns(&self) -> Result<()> {
         let columns_to_add = [
@@ -842,6 +1367,20 @@ impl Database {
             tracing::info!("已添加 exe_version 字段到 games 表");
         }
 
+        Ok(())
+    }
+
+    /// 迁移：添加 abandoned_at 字段到旧数据库
+    /// 记录最近一次被标记为「弃坑」的时间，用于判断弃坑后是否重新游玩
+    fn migrate_add_abandoned_at_column(&self) -> Result<()> {
+        if !self.has_column("games", "abandoned_at")? {
+            tracing::info!("abandoned_at 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE games ADD COLUMN abandoned_at TEXT",
+                [],
+            )?;
+            tracing::info!("已添加 abandoned_at 字段到 games 表");
+        }
         Ok(())
     }
 

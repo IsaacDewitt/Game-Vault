@@ -2,6 +2,11 @@
  * 颜色工具函数
  */
 
+/** 校验是否为合法的 #RRGGBB 十六进制颜色 */
+export function isValidHexColor(hex: string): boolean {
+  return /^#[0-9a-fA-F]{6}$/.test(hex.trim());
+}
+
 /** 将颜色变亮指定百分比 */
 export function lightenColor(hex: string, percent: number): string {
   const num = parseInt(hex.replace("#", ""), 16);
