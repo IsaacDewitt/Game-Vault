@@ -2,6 +2,7 @@ pub mod games;
 pub mod stats;
 pub mod settings;
 pub mod achievements;
+pub mod reviews;
 
 use std::sync::{Arc, Mutex};
 

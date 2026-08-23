@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, defineAsyncComponent, h, type Component, watch, provide } from "vue";
 import { darkTheme, lightTheme, NConfigProvider, NLayout, NLayoutSider, NLayoutContent, NMenu, NIcon, NMessageProvider, NDialogProvider, createDiscreteApi } from "naive-ui";
 import type { MenuOption } from "naive-ui";
-import { HomeOutline, StatsChartOutline, SettingsOutline, GameControllerOutline, EllipsisVertical, SquareOutline, CopyOutline, RemoveOutline, CloseOutline, TrophyOutline } from "@vicons/ionicons5";
+import { HomeOutline, StatsChartOutline, SettingsOutline, GameControllerOutline, EllipsisVertical, SquareOutline, CopyOutline, RemoveOutline, CloseOutline, TrophyOutline, StarOutline } from "@vicons/ionicons5";
 import HomeView from "./views/HomeView.vue";
 import AboutModal from "./components/AboutModal.vue";
 import AchievementToast from "./components/AchievementToast.vue";
@@ -18,6 +18,7 @@ import { lightenColor, darkenColor, isValidHexColor } from "./lib/color";
 const StatsView = defineAsyncComponent(() => import("./views/StatsView.vue"));
 const SettingsView = defineAsyncComponent(() => import("./views/SettingsView.vue"));
 const AchievementsView = defineAsyncComponent(() => import("./views/AchievementsView.vue"));
+const ReviewsView = defineAsyncComponent(() => import("./views/ReviewsView.vue"));
 
 const gamesStore = useGamesStore();
 const activeView = ref("home");
@@ -35,6 +36,7 @@ const viewComponents: Record<string, Component> = {
   home: HomeView,
   stats: StatsView,
   achievements: AchievementsView,
+  reviews: ReviewsView,
   settings: SettingsView,
 };
 
@@ -93,6 +95,11 @@ const menuOptions: MenuOption[] = [
     label: "成就",
     key: "achievements",
     icon: () => h(NIcon, null, { default: () => h(TrophyOutline) }),
+  },
+  {
+    label: "游戏手账",
+    key: "reviews",
+    icon: () => h(NIcon, null, { default: () => h(StarOutline) }),
   },
   {
     label: "设置",

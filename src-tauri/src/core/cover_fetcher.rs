@@ -96,6 +96,32 @@ impl CoverFetcher {
         Ok(None)
     }
 
+    /// 获取封面（供鉴赏等无安装路径的条目使用）
+    /// 流程：检查缓存 → SteamGridDB 按名字搜索 → 下载，不涉及本地游戏目录
+    pub async fn fetch_cover_for_id(&self, id: &str, name: &str) -> Result<Option<String>> {
+        // 1. 检查缓存（与游戏封面共用 covers 目录，id 为 uuid 无冲突）
+        if let Some(cache_path) = self.find_cached_cover(id) {
+            return Ok(Some(cache_path.to_string_lossy().to_string()));
+        }
+
+        // 2. 尝试 SteamGridDB（按名字搜索）
+        if !self.steamgriddb_api_key.is_empty() {
+            let cache_path = self.get_cache_path(id);
+            match self.search_steamgriddb(name).await {
+                Ok(Some(cover_url)) => {
+                    if let Ok(actual_path) = self.download_image(&cover_url, &cache_path).await {
+                        return Ok(Some(actual_path.to_string_lossy().to_string()));
+                    }
+                }
+                Err(e) => return Err(e),
+                _ => {}
+            }
+        }
+
+        // 3. 返回 None（使用默认封面）
+        Ok(None)
+    }
+
     /// 查找已缓存的封面（兼容 jpg/png/webp 扩展名），文件有效则返回路径
     /// 历史缓存可能存为任意扩展名（早期固定 .jpg），此处统一遍历
     fn find_cached_cover(&self, game_id: &str) -> Option<PathBuf> {

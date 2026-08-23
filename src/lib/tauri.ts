@@ -387,3 +387,102 @@ export async function setAutostartEnabled(enabled: boolean): Promise<void> {
 export async function setWindowSize(width: number, height: number): Promise<void> {
   return invoke("set_window_size", { width, height });
 }
+
+// ==================== 游戏手账 ====================
+
+export interface Review {
+  id: string;
+  name: string;
+  /** 本地封面缓存文件路径 */
+  cover_local: string | null;
+  cover_url: string | null;
+  description: string | null;
+  developer: string | null;
+  publisher: string | null;
+  release_date: string | null;
+  genres: string[];
+  /** HLTB 主线时长（分钟） */
+  hltb_main_story: number | null;
+  /** HLTB 主线+支线时长（分钟） */
+  hltb_main_extra: number | null;
+  /** HLTB 完美通关时长（分钟） */
+  hltb_completionist: number | null;
+  /** 我的评分（0-10 分制，null 表示未评分） */
+  rating: number | null;
+  /** 我的评价 */
+  review: string | null;
+  /** 状态: "wishlist" | "playing" | "completed" | "abandoned" */
+  status: string;
+  added_at: string;
+  updated_at: string | null;
+}
+
+export interface ReviewFilter {
+  search?: string;
+  status?: string;
+  genre?: string;
+  sort_by?: string;
+  sort_order?: string;
+}
+
+export async function getReviews(filter?: ReviewFilter): Promise<Review[]> {
+  return invoke("get_reviews", { filter });
+}
+
+export async function getReviewDetail(reviewId: string): Promise<Review | null> {
+  return invoke("get_review_detail", { reviewId });
+}
+
+export async function addReview(name: string): Promise<Review> {
+  return invoke("add_review", { name });
+}
+
+/** 刷新手账条目：LLM 拉元数据 + SteamGridDB 拉封面 */
+export async function refreshReviewInfo(reviewId: string): Promise<Review> {
+  return invoke("refresh_review_info", { reviewId });
+}
+
+export interface ReviewMetaInput {
+  name?: string | null;
+  description?: string | null;
+  developer?: string | null;
+  publisher?: string | null;
+  release_date?: string | null;
+  genres?: string[] | null;
+  hltb_main_story?: number | null;
+  hltb_main_extra?: number | null;
+  hltb_completionist?: number | null;
+}
+
+export async function updateReviewMeta(reviewId: string, meta: ReviewMetaInput): Promise<Review> {
+  return invoke("update_review_meta", { reviewId, meta });
+}
+
+export async function setReviewRating(reviewId: string, rating: number | null): Promise<Review> {
+  return invoke("set_review_rating", { reviewId, rating });
+}
+
+export async function setReviewReview(reviewId: string, reviewText: string | null): Promise<Review> {
+  return invoke("set_review_review", { reviewId, reviewText });
+}
+
+export async function setReviewStatus(reviewId: string, status: string): Promise<Review> {
+  return invoke("set_review_status", { reviewId, status });
+}
+
+export async function deleteReview(reviewId: string): Promise<void> {
+  return invoke("delete_review", { reviewId });
+}
+
+export async function fetchReviewCoverOptions(reviewId: string): Promise<CoverOption[]> {
+  return invoke("fetch_review_cover_options", { reviewId });
+}
+
+export async function setReviewCoverFromUrl(reviewId: string, url: string): Promise<void> {
+  return invoke("set_review_cover_from_url", { reviewId, url });
+}
+
+/** 从游戏库导入到游戏手账 */
+export async function importReviewFromGame(gameId: string): Promise<Review> {
+  return invoke("import_review_from_game", { gameId });
+}

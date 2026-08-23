@@ -83,6 +83,27 @@ impl Database {
                 UNIQUE(achievement_id, game_id)
             );
 
+            -- 手账条目表（与游戏库完全隔离的独立模块）
+            CREATE TABLE IF NOT EXISTS reviews (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                cover_local TEXT,
+                cover_url TEXT,
+                description TEXT,
+                developer TEXT,
+                publisher TEXT,
+                release_date TEXT,
+                genres TEXT DEFAULT '[]',
+                hltb_main_story INTEGER,
+                hltb_main_extra INTEGER,
+                hltb_completionist INTEGER,
+                rating INTEGER,
+                review TEXT,
+                status TEXT DEFAULT 'wishlist',
+                added_at TEXT NOT NULL,
+                updated_at TEXT
+            );
+
             -- 插入默认设置
             INSERT OR IGNORE INTO settings (key, value) VALUES ('theme', 'dark');
             INSERT OR IGNORE INTO settings (key, value) VALUES ('language', 'zh-CN');
@@ -95,6 +116,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_play_sessions_game_id ON play_sessions(game_id);
             CREATE INDEX IF NOT EXISTS idx_play_sessions_start_time ON play_sessions(start_time);
             CREATE INDEX IF NOT EXISTS idx_achievement_unlocks_game ON achievement_unlocks(game_id);
+            CREATE INDEX IF NOT EXISTS idx_reviews_name ON reviews(name);
+            CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status);
         ")?;
 
         // 迁移：为旧数据库添加 status 字段（必须在索引创建之前）
@@ -449,6 +472,221 @@ impl Database {
                 game.exe_file_size,
                 game.id,
             ],
+        )?;
+        Ok(())
+    }
+
+    // ==================== 手账条目 CRUD ====================
+
+    /// 从数据库行构建 Review 对象
+    /// 列顺序必须与 REVIEW_COLUMNS 完全一致：
+    /// 0:id 1:name 2:cover_local 3:cover_url 4:description 5:developer
+    /// 6:publisher 7:release_date 8:genres 9:hltb_main_story 10:hltb_main_extra
+    /// 11:hltb_completionist 12:rating 13:review 14:status 15:added_at 16:updated_at
+    fn row_to_review(row: &rusqlite::Row) -> rusqlite::Result<Review> {
+        let genres_str: String = row.get(8)?;
+        let genres: Vec<String> = serde_json::from_str(&genres_str).unwrap_or_default();
+
+        Ok(Review {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            cover_local: row.get(2)?,
+            cover_url: row.get(3)?,
+            description: row.get(4)?,
+            developer: row.get(5)?,
+            publisher: row.get(6)?,
+            release_date: row.get(7)?,
+            genres,
+            hltb_main_story: row.get::<_, Option<i64>>(9)?.map(|v| v.max(0) as u32),
+            hltb_main_extra: row.get::<_, Option<i64>>(10)?.map(|v| v.max(0) as u32),
+            hltb_completionist: row.get::<_, Option<i64>>(11)?.map(|v| v.max(0) as u32),
+            rating: row.get::<_, Option<i64>>(12)?.map(|v| v.max(0) as u32),
+            review: row.get(13)?,
+            status: row.get(14)?,
+            added_at: row.get(15)?,
+            updated_at: row.get(16)?,
+        })
+    }
+
+    const REVIEW_COLUMNS: &'static str = "
+        id, name, cover_local, cover_url, description, developer,
+        publisher, release_date, genres, hltb_main_story, hltb_main_extra,
+        hltb_completionist, rating, review, status, added_at, updated_at
+    ";
+
+    /// 插入手账条目
+    pub fn insert_review(&self, review: &Review) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO reviews (
+                id, name, cover_local, cover_url, description, developer,
+                publisher, release_date, genres, hltb_main_story, hltb_main_extra,
+                hltb_completionist, rating, review, status, added_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+            )",
+            params![
+                review.id,
+                review.name,
+                review.cover_local,
+                review.cover_url,
+                review.description,
+                review.developer,
+                review.publisher,
+                review.release_date,
+                serde_json::to_string(&review.genres)?,
+                review.hltb_main_story.map(|v| v as i64),
+                review.hltb_main_extra.map(|v| v as i64),
+                review.hltb_completionist.map(|v| v as i64),
+                review.rating.map(|v| v as i64),
+                review.review,
+                review.status,
+                review.added_at,
+                review.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 全量更新手账条目（不含封面字段，封面走专用函数避免误覆盖）
+    pub fn update_review(&self, review: &Review) -> Result<()> {
+        self.conn.execute(
+            "UPDATE reviews SET
+                name = ?1, description = ?2,
+                developer = ?3, publisher = ?4, release_date = ?5,
+                genres = ?6, hltb_main_story = ?7, hltb_main_extra = ?8,
+                hltb_completionist = ?9, rating = ?10, review = ?11,
+                status = ?12, updated_at = ?13
+             WHERE id = ?14",
+            params![
+                review.name,
+                review.description,
+                review.developer,
+                review.publisher,
+                review.release_date,
+                serde_json::to_string(&review.genres)?,
+                review.hltb_main_story.map(|v| v as i64),
+                review.hltb_main_extra.map(|v| v as i64),
+                review.hltb_completionist.map(|v| v as i64),
+                review.rating.map(|v| v as i64),
+                review.review,
+                review.status,
+                chrono::Utc::now().to_rfc3339(),
+                review.id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 获取手账条目列表
+    pub fn get_reviews(&self, filter: &ReviewFilter) -> Result<Vec<Review>> {
+        let mut sql = format!("SELECT {} FROM reviews WHERE 1=1", Self::REVIEW_COLUMNS);
+
+        let mut bind_values: Vec<String> = Vec::new();
+
+        if let Some(ref search) = filter.search {
+            sql.push_str(&format!(" AND name LIKE ?{}", bind_values.len() + 1));
+            bind_values.push(format!("%{}%", search));
+        }
+        if let Some(ref status) = filter.status {
+            if !status.is_empty() {
+                sql.push_str(&format!(" AND status = ?{}", bind_values.len() + 1));
+                bind_values.push(status.clone());
+            }
+        }
+        if let Some(ref genre) = filter.genre {
+            if !genre.is_empty() {
+                sql.push_str(&format!(" AND genres LIKE ?{}", bind_values.len() + 1));
+                bind_values.push(format!("%{}%", genre));
+            }
+        }
+
+        // 排序（白名单校验防止注入）
+        let sort_column = match filter.sort_by.as_str() {
+            "name" => "name",
+            "rating" => "rating",
+            "updated_at" => "updated_at",
+            _ => "added_at",
+        };
+        let sort_order = match filter.sort_order.as_str() {
+            "asc" => "ASC",
+            _ => "DESC",
+        };
+        // 评分排序时未评分的排最后
+        if filter.sort_by == "rating" {
+            sql.push_str(&format!(" ORDER BY rating IS NULL, {} {}", sort_column, sort_order));
+        } else {
+            sql.push_str(&format!(" ORDER BY {} {}", sort_column, sort_order));
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        let reviews = if bind_values.is_empty() {
+            stmt.query_map([], Self::row_to_review)?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let params: Vec<&dyn rusqlite::types::ToSql> = bind_values
+                .iter()
+                .map(|v| v as &dyn rusqlite::types::ToSql)
+                .collect();
+            stmt.query_map(params.as_slice(), Self::row_to_review)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        Ok(reviews)
+    }
+
+    /// 根据 ID 获取手账条目
+    pub fn get_review_by_id(&self, id: &str) -> Result<Option<Review>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM reviews WHERE id = ?1",
+            Self::REVIEW_COLUMNS
+        ))?;
+
+        let mut reviews = stmt.query_map(params![id], Self::row_to_review)?;
+
+        match reviews.next() {
+            Some(Ok(review)) => Ok(Some(review)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// 根据名称查找手账条目（用于添加/导入时去重）
+    pub fn find_review_by_name(&self, name: &str) -> Result<Option<Review>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM reviews WHERE name = ?1",
+            Self::REVIEW_COLUMNS
+        ))?;
+
+        let mut reviews = stmt.query_map(params![name], Self::row_to_review)?;
+
+        match reviews.next() {
+            Some(Ok(review)) => Ok(Some(review)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// 删除手账条目
+    pub fn delete_review(&self, id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM reviews WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// 更新手账条目封面（本地文件路径）
+    pub fn update_review_cover(&self, id: &str, cover_local: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE reviews SET cover_local = ?1, cover_url = ?1, updated_at = ?2 WHERE id = ?3",
+            params![cover_local, chrono::Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
+    /// 清除手账条目封面
+    pub fn remove_review_cover(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE reviews SET cover_local = NULL, cover_url = NULL, updated_at = ?1 WHERE id = ?2",
+            params![chrono::Utc::now().to_rfc3339(), id],
         )?;
         Ok(())
     }
