@@ -49,3 +49,20 @@ pub const SEARCH_RESULT_LIMIT: usize = 5;
 /// 读取 EXE 版本号时的最大读取字节数（1MB）
 /// PE 头 + 节表 + 资源目录通常在前几百 KB 内
 pub const EXE_VERSION_READ_LIMIT: u64 = 1024 * 1024;
+
+// ==================== 游玩会话记录 ====================
+
+/// 会话独立成条的最短时长（秒）
+/// 低于此值不生成明细行、不计入 play_count，仅把时长累加到总时长与日汇总
+pub const SESSION_MIN_DURATION_SECS: u64 = 600;
+
+/// 会话合并窗口（秒）
+/// 短会话距「同一游戏上一条会话结束」不超过此值时，并入上一条而非丢弃
+pub const SESSION_MERGE_WINDOW_SECS: i64 = 300;
+
+/// 明细保留期（天）：超过此天数的 play_sessions 行会被清理
+/// 统计已改由 play_stats_daily / play_stats_hourly 供数，删明细不影响历史统计
+pub const SESSION_RETENTION_DAYS: i64 = 365;
+
+/// 启动后延迟执行明细清理的秒数（避开启动高峰，避免拖慢首屏）
+pub const SESSION_CLEANUP_DELAY_SECS: u64 = 30;

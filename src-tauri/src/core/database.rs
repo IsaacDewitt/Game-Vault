@@ -1,8 +1,9 @@
 use anyhow::Result;
-use chrono::Datelike;
+use chrono::{Datelike, Timelike};
 use rusqlite::{Connection, params};
 use std::path::Path;
 use crate::models::*;
+use crate::utils::constants::{SESSION_MERGE_WINDOW_SECS, SESSION_MIN_DURATION_SECS};
 
 /// 将时区偏移（秒）格式化为 SQLite 的 strftime 修饰符
 /// 支持非整小时时区（如 UTC+5:30 → "+5.5 hours"，UTC+5:45 → "+5.75 hours"）
@@ -138,6 +139,17 @@ impl Database {
         // 迁移：为旧数据库添加 abandoned_at 字段（弃坑重玩成就判定用）
         self.migrate_add_abandoned_at_column()?;
 
+        // 迁移：启用 WAL（读写并发，批量清理明细时不再阻塞前台查询）
+        self.migrate_enable_wal()?;
+
+        // 迁移：创建游玩时长预聚合表（日粒度 + 时段粒度）
+        self.migrate_create_play_stats_tables()?;
+
+        // 一次性迁移：历史明细按现行合并/丢弃规则重分级（仅执行一次）
+        self.migrate_regrade_historical_sessions()?;
+
+        // 回填：首次建表后从明细全量重算预聚合（表非空则跳过）
+        self.rebuild_play_stats_if_empty()?;
         // 创建 status 索引（在列存在之后）
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_games_status ON games(status);"
@@ -726,28 +738,25 @@ impl Database {
 
     // ==================== 游戏会话 ====================
 
-    /// 记录游戏会话（使用事务保证原子性）
+    /// 记录游戏会话（单条，内部复用批量路径以保证行为完全一致）
     pub fn add_play_session(&self, game_id: &str, start_time: &str, duration_seconds: u64) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let end_time = chrono::DateTime::parse_from_rfc3339(start_time)
-            .ok()
-            .map(|start| (start + chrono::Duration::seconds(duration_seconds as i64)).to_rfc3339())
-            .unwrap_or_else(|| now.clone());
-
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO play_sessions (game_id, start_time, end_time, duration_seconds) VALUES (?1, ?2, ?3, ?4)",
-            params![game_id, start_time, end_time, duration_seconds as i64],
-        )?;
-        tx.execute(
-            "UPDATE games SET play_time_seconds = play_time_seconds + ?1, play_count = play_count + 1, last_played = ?2, updated_at = ?2 WHERE id = ?3",
-            params![duration_seconds as i64, now, game_id],
-        )?;
-        tx.commit()?;
+        self.add_play_sessions_batch(&[(
+            game_id.to_string(),
+            start_time.to_string(),
+            duration_seconds,
+        )])?;
         Ok(())
     }
 
     /// 批量记录游戏会话（单个事务内完成，多个游戏同时退出时减少事务开销）
+    ///
+    /// 会话分级规则：
+    /// - 时长 ≥ SESSION_MIN_DURATION_SECS：独立成条，play_count +1
+    /// - 时长不足且距同游戏上一条结束 ≤ SESSION_MERGE_WINDOW_SECS：并入上一条，不计次数
+    /// - 其余：不写明细行、不计次数
+    /// 三种情况都会把时长累加进 games.play_time_seconds，避免真实游玩时间流失
+    ///
+    /// 返回独立成条的会话数（合并与丢弃不计入）
     pub fn add_play_sessions_batch(
         &self,
         sessions: &[(String, String, u64)], // (game_id, start_time, duration_seconds)
@@ -757,24 +766,99 @@ impl Database {
         }
         let now = chrono::Utc::now().to_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
-        let mut saved = 0usize;
+        let mut recorded = 0usize;
+
         for (game_id, start_time, duration_seconds) in sessions {
+            let dur = *duration_seconds;
             let end_time = chrono::DateTime::parse_from_rfc3339(start_time)
                 .ok()
-                .map(|start| (start + chrono::Duration::seconds(*duration_seconds as i64)).to_rfc3339())
+                .map(|s| (s + chrono::Duration::seconds(dur as i64)).to_rfc3339())
                 .unwrap_or_else(|| now.clone());
+            let buckets = SessionBuckets::from_rfc3339(start_time);
+
+            // ===== 情况一：时长达标，独立成条 =====
+            if dur >= SESSION_MIN_DURATION_SECS {
+                tx.execute(
+                    "INSERT INTO play_sessions (game_id, start_time, end_time, duration_seconds) VALUES (?1, ?2, ?3, ?4)",
+                    params![game_id, start_time, end_time, dur as i64],
+                )?;
+                tx.execute(
+                    "UPDATE games SET play_time_seconds = play_time_seconds + ?1, play_count = play_count + 1, last_played = ?2, updated_at = ?2 WHERE id = ?3",
+                    params![dur as i64, now, game_id],
+                )?;
+                if let Some(b) = &buckets {
+                    Self::apply_to_daily(
+                        &tx, &b.day, game_id, dur, 0, 1, dur, start_time, &end_time,
+                    )?;
+                    Self::apply_to_hourly(&tx, game_id, b.hour, b.weekday, dur)?;
+                }
+                recorded += 1;
+                continue;
+            }
+
+            // ===== 情况二/三：短会话，先尝试并入同游戏最近一条 =====
+            let prev: Option<(i64, String, i64)> = tx
+                .query_row(
+                    "SELECT id, end_time, duration_seconds FROM play_sessions \
+                     WHERE game_id = ?1 ORDER BY start_time DESC, id DESC LIMIT 1",
+                    params![game_id],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
+                )
+                .ok();
+
+            let merged_total = match &prev {
+                Some((prev_id, prev_end, prev_dur)) => {
+                    let gap = chrono::DateTime::parse_from_rfc3339(start_time)
+                        .ok()
+                        .and_then(|s| {
+                            chrono::DateTime::parse_from_rfc3339(prev_end)
+                                .ok()
+                                .map(|e| (s - e).num_seconds())
+                        })
+                        // 解析失败或时间倒挂时按「不可合并」处理
+                        .unwrap_or(i64::MAX);
+                    if (0..=SESSION_MERGE_WINDOW_SECS).contains(&gap) {
+                        let new_total = (*prev_dur).max(0) as u64 + dur;
+                        tx.execute(
+                            "UPDATE play_sessions SET duration_seconds = ?1, end_time = ?2 WHERE id = ?3",
+                            params![new_total as i64, end_time, prev_id],
+                        )?;
+                        Some(new_total)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+
+            // 时长照常累计：合并与丢弃都不计 play_count
             tx.execute(
-                "INSERT INTO play_sessions (game_id, start_time, end_time, duration_seconds) VALUES (?1, ?2, ?3, ?4)",
-                params![game_id, start_time, end_time, *duration_seconds as i64],
+                "UPDATE games SET play_time_seconds = play_time_seconds + ?1, last_played = ?2, updated_at = ?2 WHERE id = ?3",
+                params![dur as i64, now, game_id],
             )?;
-            tx.execute(
-                "UPDATE games SET play_time_seconds = play_time_seconds + ?1, play_count = play_count + 1, last_played = ?2, updated_at = ?2 WHERE id = ?3",
-                params![*duration_seconds as i64, now, game_id],
-            )?;
-            saved += 1;
+
+            if let Some(b) = &buckets {
+                // 合并：会话数不变，但单次最长要按合并后的总时长刷新
+                // 丢弃：会话数与单次最长均不变（max 传 0，MAX 聚合自然忽略）
+                let max_dur = merged_total.unwrap_or(0);
+                Self::apply_to_daily(
+                    &tx, &b.day, game_id, dur, dur, 0, max_dur, start_time, &end_time,
+                )?;
+                Self::apply_to_hourly(&tx, game_id, b.hour, b.weekday, dur)?;
+            }
+
+            match merged_total {
+                Some(total) => tracing::info!(
+                    "短会话 {} 秒已并入上一条会话（游戏 {}，合并后 {} 秒）", dur, game_id, total
+                ),
+                None => tracing::info!(
+                    "短会话 {} 秒未达记录阈值，仅累计时长（游戏 {}）", dur, game_id
+                ),
+            }
         }
+
         tx.commit()?;
-        Ok(saved)
+        Ok(recorded)
     }
 
     /// 获取游戏时长排行榜
@@ -804,13 +888,14 @@ impl Database {
         let local_offset = chrono::Local::now().offset().local_minus_utc();
         let offset_str = format_offset_for_sqlite(local_offset);
 
+        // 日汇总表的 day 已按本地时区固化，与 DATE('now', 偏移) 同口径，可直接比较
         let sql = format!(
-            "SELECT DATE(start_time, '{}') as date, SUM(duration_seconds) as total, COUNT(*) as sessions
-             FROM play_sessions
-             WHERE start_time >= DATE('now', '{}', '-' || ?1 || ' days')
-             GROUP BY DATE(start_time, '{}')
-             ORDER BY date DESC",
-            offset_str, offset_str, offset_str
+            "SELECT day, SUM(total_seconds) as total, SUM(session_count) as sessions
+             FROM play_stats_daily
+             WHERE day >= DATE('now', '{}', '-' || ?1 || ' days')
+             GROUP BY day
+             ORDER BY day DESC",
+            offset_str
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -847,18 +932,24 @@ impl Database {
         Ok(full)
     }
 
-    /// 获取本月游玩时长（秒），直接按本地时区的年月聚合
+    /// 获取本月游玩时长（秒），按本地时区的日历月聚合
     pub fn get_monthly_play_time(&self) -> Result<u64> {
-        let local_offset = chrono::Local::now().offset().local_minus_utc();
-        let offset_str = format_offset_for_sqlite(local_offset);
-        let month_prefix = chrono::Local::now().format("%Y-%m").to_string();
+        let today = chrono::Local::now().date_naive();
+        let month_start = format!("{:04}-{:02}-01", today.year(), today.month());
+        // 下个月 1 号作为开区间上界，避免对 day 列套字符串函数（否则索引失效）
+        let (ny, nm) = if today.month() == 12 {
+            (today.year() + 1, 1)
+        } else {
+            (today.year(), today.month() + 1)
+        };
+        let next_month_start = format!("{:04}-{:02}-01", ny, nm);
 
-        let sql = format!(
-            "SELECT COALESCE(SUM(duration_seconds),0) FROM play_sessions \
-             WHERE strftime('%Y-%m', start_time, '{}') = ?1",
-            offset_str
-        );
-        let total: i64 = self.conn.query_row(&sql, params![month_prefix], |r| r.get(0))?;
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(total_seconds),0) FROM play_stats_daily \
+             WHERE day >= ?1 AND day < ?2",
+            params![month_start, next_month_start],
+            |r| r.get(0),
+        )?;
         Ok(total.max(0) as u64)
     }
 
@@ -951,12 +1042,12 @@ impl Database {
         let offset_str = format_offset_for_sqlite(local_offset);
 
         let sql = format!(
-            "SELECT DATE(start_time, '{}') as date, SUM(duration_seconds) as total
-             FROM play_sessions
-             WHERE start_time >= DATE('now', '{}', '-' || ?1 || ' days')
-             GROUP BY DATE(start_time, '{}')
-             ORDER BY date",
-            offset_str, offset_str, offset_str
+            "SELECT day, SUM(total_seconds) as total
+             FROM play_stats_daily
+             WHERE day >= DATE('now', '{}', '-' || ?1 || ' days')
+             GROUP BY day
+             ORDER BY day",
+            offset_str
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -973,22 +1064,13 @@ impl Database {
 
     /// 获取游玩时段分布（24小时 x 7天）
     pub fn get_hourly_stats(&self) -> Result<Vec<HourlyStats>> {
-        // 获取本地时区偏移（秒），支持非整小时时区
-        let local_offset = chrono::Local::now().offset().local_minus_utc();
-        let offset_str = format_offset_for_sqlite(local_offset);
-
-        let sql = format!(
-            "SELECT
-                CAST(strftime('%H', start_time, '{}') AS INTEGER) as hour,
-                CAST(strftime('%w', start_time, '{}') AS INTEGER) as weekday,
-                SUM(duration_seconds) as total
-             FROM play_sessions
+        // hour / weekday 已在写入时按本地时区归好桶，无需再套 strftime
+        let mut stmt = self.conn.prepare(
+            "SELECT hour, weekday, SUM(total_seconds) as total
+             FROM play_stats_hourly
              GROUP BY hour, weekday
              ORDER BY weekday, hour",
-            offset_str, offset_str
-        );
-
-        let mut stmt = self.conn.prepare(&sql)?;
+        )?;
 
         let stats = stmt.query_map([], |row| {
             let weekday_raw: u32 = row.get(1)?;
@@ -1184,15 +1266,16 @@ impl Database {
 
     /// 聚合全局成就检测所需的统计
     pub fn get_achievement_global_stats(&self) -> Result<AchievementGlobalStats> {
-        let local_offset = chrono::Local::now().offset().local_minus_utc();
-        let offset_str = format_offset_for_sqlite(local_offset);
         let mut s = AchievementGlobalStats::default();
 
         s.game_count = self.conn.query_row("SELECT COUNT(*) FROM games", [], |r| r.get::<_, i64>(0))? as u64;
         s.total_play_time = self.conn.query_row(
             "SELECT COALESCE(SUM(play_time_seconds),0) FROM games", [], |r| r.get::<_, i64>(0),
         )? as u64;
-        s.total_sessions = self.conn.query_row("SELECT COUNT(*) FROM play_sessions", [], |r| r.get::<_, i64>(0))? as u64;
+        // 会话数取日汇总累加值：短会话按规则不独立成条，不计入
+        s.total_sessions = self.conn.query_row(
+            "SELECT COALESCE(SUM(session_count),0) FROM play_stats_daily", [], |r| r.get::<_, i64>(0),
+        )? as u64;
         s.completed_count = self.conn.query_row(
             "SELECT COUNT(*) FROM games WHERE status='completed'", [], |r| r.get::<_, i64>(0),
         )? as u64;
@@ -1209,18 +1292,19 @@ impl Database {
         )? as u64;
         s.llm_filled_count = self.get_llm_filled_count()?;
         s.max_session_duration = self.conn.query_row(
-            "SELECT COALESCE(MAX(duration_seconds),0) FROM play_sessions", [], |r| r.get::<_, i64>(0),
+            "SELECT COALESCE(MAX(max_duration),0) FROM play_stats_daily", [], |r| r.get::<_, i64>(0),
         )? as u64;
         s.night_session = self.conn.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM play_sessions WHERE CAST(strftime('%H', start_time, '{}') AS INTEGER) BETWEEN 0 AND 4 LIMIT 1)", offset_str),
+            "SELECT EXISTS(SELECT 1 FROM play_stats_daily WHERE night_seconds > 0 LIMIT 1)",
             [], |r| r.get::<_, i64>(0),
         )? != 0;
         s.dawn_session = self.conn.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM play_sessions WHERE CAST(strftime('%H', start_time, '{}') AS INTEGER) BETWEEN 5 AND 7 LIMIT 1)", offset_str),
+            "SELECT EXISTS(SELECT 1 FROM play_stats_daily WHERE dawn_seconds > 0 LIMIT 1)",
             [], |r| r.get::<_, i64>(0),
         )? != 0;
+        // day 为本地日期纯文本，strftime 对其无时区歧义；日汇总表行数很小，开销可忽略
         s.weekend_total = self.conn.query_row(
-            &format!("SELECT COALESCE(SUM(duration_seconds),0) FROM play_sessions WHERE CAST(strftime('%w', start_time, '{}') AS INTEGER) IN (0,6)", offset_str),
+            "SELECT COALESCE(SUM(total_seconds),0) FROM play_stats_daily WHERE strftime('%w', day) IN ('0','6')",
             [], |r| r.get::<_, i64>(0),
         )? as u64;
         s.hltb_completed_count = self.conn.query_row(
@@ -1233,8 +1317,9 @@ impl Database {
             "SELECT COUNT(*) FROM games WHERE status='abandoned' AND last_played IS NOT NULL AND abandoned_at IS NOT NULL AND last_played > abandoned_at",
             [], |r| r.get::<_, i64>(0),
         )? as u64;
+        // 日汇总主键为 (day, game_id)，每游戏每天至多一行，COUNT(*) 即当天不同游戏数
         s.max_distinct_games_per_day = self.conn.query_row(
-            &format!("SELECT COALESCE(MAX(cnt),0) FROM (SELECT COUNT(DISTINCT game_id) cnt FROM play_sessions GROUP BY DATE(start_time, '{}'))", offset_str),
+            "SELECT COALESCE(MAX(cnt),0) FROM (SELECT COUNT(*) cnt FROM play_stats_daily GROUP BY day)",
             [], |r| r.get::<_, i64>(0),
         )? as u64;
 
@@ -1255,30 +1340,28 @@ impl Database {
             "SELECT COUNT(*) FROM games WHERE play_time_seconds >= 360000", [], |r| r.get::<_, i64>(0),
         )? as u64;
         s.max_day_seconds = self.conn.query_row(
-            &format!("SELECT COALESCE(MAX(total),0) FROM (SELECT SUM(duration_seconds) total FROM play_sessions GROUP BY DATE(start_time, '{}'))", offset_str),
+            "SELECT COALESCE(MAX(total),0) FROM (SELECT SUM(total_seconds) total FROM play_stats_daily GROUP BY day)",
             [], |r| r.get::<_, i64>(0),
         )? as u64;
         s.max_weekend_total = self.conn.query_row(
-            &format!("SELECT COALESCE(MAX(total),0) FROM (SELECT SUM(duration_seconds) total FROM play_sessions WHERE CAST(strftime('%w', start_time, '{}') AS INTEGER) IN (0,6) GROUP BY DATE(start_time, '{}'))", offset_str, offset_str),
+            "SELECT COALESCE(MAX(total),0) FROM (SELECT SUM(total_seconds) total FROM play_stats_daily \
+             WHERE strftime('%w', day) IN ('0','6') GROUP BY day)",
             [], |r| r.get::<_, i64>(0),
         )? as u64;
         s.max_distinct_games_per_week = self.conn.query_row(
-            &format!("SELECT COALESCE(MAX(cnt),0) FROM (SELECT COUNT(DISTINCT game_id) cnt FROM play_sessions GROUP BY strftime('%Y-%W', start_time, '{}'))", offset_str),
+            "SELECT COALESCE(MAX(cnt),0) FROM (SELECT COUNT(DISTINCT game_id) cnt FROM play_stats_daily \
+             GROUP BY strftime('%Y-%W', day))",
             [], |r| r.get::<_, i64>(0),
         )? as u64;
         s.day_night_same_day = self.conn.query_row(
-            &format!(
-                "SELECT EXISTS(SELECT 1 FROM (\
-                 SELECT DATE(start_time, '{}') d, \
-                 MAX(CASE WHEN CAST(strftime('%H', start_time, '{}') AS INTEGER) BETWEEN 0 AND 4 THEN 1 ELSE 0 END) night, \
-                 MAX(CASE WHEN CAST(strftime('%H', start_time, '{}') AS INTEGER) BETWEEN 9 AND 17 THEN 1 ELSE 0 END) day \
-                 FROM play_sessions GROUP BY d) WHERE night = 1 AND day = 1)",
-                offset_str, offset_str, offset_str
-            ),
+            "SELECT EXISTS(SELECT 1 FROM (\
+             SELECT day, MAX(night_seconds) n, MAX(daytime_seconds) d \
+             FROM play_stats_daily GROUP BY day) WHERE n > 0 AND d > 0)",
             [], |r| r.get::<_, i64>(0),
         )? != 0;
         s.has_full_week = self.conn.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM (SELECT strftime('%Y-%W', start_time, '{}') wk, COUNT(DISTINCT DATE(start_time, '{}')) dcnt FROM play_sessions GROUP BY wk) WHERE dcnt >= 7)", offset_str, offset_str),
+            "SELECT EXISTS(SELECT 1 FROM (SELECT strftime('%Y-%W', day) wk, COUNT(DISTINCT day) dcnt \
+             FROM play_stats_daily GROUP BY wk) WHERE dcnt >= 7)",
             [], |r| r.get::<_, i64>(0),
         )? != 0;
 
@@ -1335,8 +1418,8 @@ impl Database {
         {
             let mut late = 0u64;
             let mut stmt = self.conn.prepare(
-                "SELECT g.added_at, MIN(ps.start_time) FROM games g \
-                 JOIN play_sessions ps ON ps.game_id = g.id WHERE g.play_count > 0 GROUP BY g.id",
+                "SELECT g.added_at, MIN(d.first_start) FROM games g \
+                 JOIN play_stats_daily d ON d.game_id = g.id WHERE g.play_count > 0 GROUP BY g.id",
             )?;
             let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
             for row in rows {
@@ -1358,7 +1441,7 @@ impl Database {
         {
             let mut night_dates: Vec<String> = Vec::new();
             let mut stmt = self.conn.prepare(
-                &format!("SELECT DISTINCT DATE(start_time, '{}') FROM play_sessions WHERE CAST(strftime('%H', start_time, '{}') AS INTEGER) BETWEEN 0 AND 4", offset_str, offset_str),
+                "SELECT DISTINCT day FROM play_stats_daily WHERE night_seconds > 0",
             )?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             for row in rows {
@@ -1374,9 +1457,8 @@ impl Database {
         // 某游戏间隔 ≥ 180 天后重玩
         {
             let mut long_gap = false;
-            let mut stmt = self.conn.prepare(
-                &format!("SELECT game_id, DATE(start_time, '{}') d FROM play_sessions GROUP BY game_id, d", offset_str),
-            )?;
+            // 主键 (day, game_id) 已保证「游戏 × 日期」唯一，无需再 GROUP BY
+            let mut stmt = self.conn.prepare("SELECT game_id, day FROM play_stats_daily")?;
             let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
             let mut per_game: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
             for row in rows {
@@ -1411,8 +1493,9 @@ impl Database {
                 .and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok())
                 .map(|t| (now - t.with_timezone(&chrono::Utc)).num_days().max(0) as u64)
                 .unwrap_or(0);
+            // 取汇总表最近一次「会话结束」时刻，比开始时刻更能代表真正的最后游玩时间
             let last_play: Option<String> = self.conn.query_row(
-                "SELECT MAX(start_time) FROM play_sessions", [], |r| r.get(0),
+                "SELECT MAX(last_end) FROM play_stats_daily", [], |r| r.get(0),
             )?;
             s.days_since_last_play = last_play
                 .and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok())
@@ -1422,9 +1505,7 @@ impl Database {
 
         // 全局最长连续游玩天数（所有游戏日期的并集）
         let mut dates: Vec<String> = Vec::new();
-        let mut stmt = self.conn.prepare(
-            &format!("SELECT DISTINCT DATE(start_time, '{}') FROM play_sessions", offset_str),
-        )?;
+        let mut stmt = self.conn.prepare("SELECT DISTINCT day FROM play_stats_daily")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         for row in rows {
             if let Ok(d) = row {
@@ -1440,9 +1521,6 @@ impl Database {
 
     /// 聚合每个游戏的成就检测统计
     pub fn get_per_game_achievement_stats(&self) -> Result<Vec<PerGameStats>> {
-        let local_offset = chrono::Local::now().offset().local_minus_utc();
-        let offset_str = format_offset_for_sqlite(local_offset);
-
         // 1. 游戏基本信息
         let mut stats_map: std::collections::HashMap<String, PerGameStats> = std::collections::HashMap::new();
         {
@@ -1484,10 +1562,11 @@ impl Database {
             }
         }
 
-        // 2. 会话聚合：启动次数、单次最长
+        // 2. 会话聚合：启动次数、单次最长（日汇总的 session_count/max_duration）
         {
             let mut stmt = self.conn.prepare(
-                "SELECT game_id, COUNT(*), COALESCE(MAX(duration_seconds),0) FROM play_sessions GROUP BY game_id",
+                "SELECT game_id, COALESCE(SUM(session_count),0), COALESCE(MAX(max_duration),0) \
+                 FROM play_stats_daily GROUP BY game_id",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -1507,12 +1586,10 @@ impl Database {
 
         // 3. 每日聚合：不同游玩日期、单日最长、最长连续
         {
-            let sql = format!(
-                "SELECT game_id, DATE(start_time, '{}') as day, SUM(duration_seconds) as total \
-                 FROM play_sessions GROUP BY game_id, day",
-                offset_str
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
+            let mut stmt = self.conn.prepare(
+                "SELECT game_id, day, SUM(total_seconds) as total \
+                 FROM play_stats_daily GROUP BY game_id, day",
+            )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1536,13 +1613,11 @@ impl Database {
             }
         }
 
-        // 4. 凌晨会话（0:00-4:59）游戏集合
+        // 4. 凌晨会话（0:00-4:59）游戏集合（night_seconds > 0 即当日存在凌晨游玩）
         {
-            let sql = format!(
-                "SELECT DISTINCT game_id FROM play_sessions WHERE CAST(strftime('%H', start_time, '{}') AS INTEGER) BETWEEN 0 AND 4",
-                offset_str
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT game_id FROM play_stats_daily WHERE night_seconds > 0",
+            )?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             for row in rows {
                 if let Ok(gid) = row {
@@ -1643,5 +1718,340 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    /// 迁移：启用 WAL 日志模式
+    /// journal_mode 是数据库的持久属性（写入文件头），重复执行无副作用。
+    /// 意义：清理过期明细等批量写操作不再独占写锁阻塞前台统计查询。
+    fn migrate_enable_wal(&self) -> Result<()> {
+        let mode: String = self.conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        tracing::info!("数据库日志模式: {}", mode);
+        // NORMAL：崩溃时最多丢失最后一个 checkpoint 之后的写入，
+        // 但免去每次提交 fsync，写入频繁时明显更快（游玩时长不值得用 fsync 换）
+        let _ = self.conn.execute("PRAGMA synchronous = NORMAL", [])?;
+        Ok(())
+    }
+
+    /// 迁移：创建游玩时长预聚合表
+    /// - play_stats_daily：日粒度，统计页 / 热力图 / 成就的历史底座，永久保留
+    /// - play_stats_hourly：时段粒度（游戏 × 小时 × 星期），供时段热力图与深夜类成就
+    /// 两张表均按「会话开始时刻」整段归入对应桶，与原有 DATE(start_time) 口径完全一致
+    fn migrate_create_play_stats_tables(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS play_stats_daily (
+                day             TEXT NOT NULL,
+                game_id         TEXT NOT NULL,
+                total_seconds   INTEGER NOT NULL DEFAULT 0,
+                dropped_seconds INTEGER NOT NULL DEFAULT 0,
+                session_count   INTEGER NOT NULL DEFAULT 0,
+                max_duration    INTEGER NOT NULL DEFAULT 0,
+                night_seconds   INTEGER NOT NULL DEFAULT 0,
+                dawn_seconds    INTEGER NOT NULL DEFAULT 0,
+                daytime_seconds INTEGER NOT NULL DEFAULT 0,
+                first_start     TEXT,
+                last_end        TEXT,
+                PRIMARY KEY (day, game_id)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS play_stats_hourly (
+                game_id       TEXT NOT NULL,
+                hour          INTEGER NOT NULL,
+                weekday       INTEGER NOT NULL,
+                total_seconds INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (game_id, hour, weekday)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_play_stats_daily_day ON play_stats_daily(day);
+            CREATE INDEX IF NOT EXISTS idx_play_stats_hourly_slot ON play_stats_hourly(hour, weekday);",
+        )?;
+        Ok(())
+    }
+
+    /// 一次性迁移：历史明细按现行规则重分级（短会话合并或清除）
+    ///
+    /// 规则落地前的旧数据里短会话都是独立成行的，会污染 play_count 与统计。
+    /// 本迁移按时间正序重放全部明细：
+    /// - 时长 ≥ 阈值：保留
+    /// - 时长不足且距保留列表中同游戏最近一条结束 ≤ 合并窗口：并入该条，删除自身
+    /// - 其余：删除自身
+    /// 被并入/删除的时长仍累计进日汇总（dropped_seconds），保证
+    /// SUM(play_stats_daily.total_seconds) 与 SUM(games.play_time_seconds) 恒等。
+    /// 通过 settings 表标记，只执行一次；之后新写入的数据本就走新规则。
+    fn migrate_regrade_historical_sessions(&self) -> Result<()> {
+        const FLAG_KEY: &str = "session_regrade_v1_done";
+        if self.get_setting(FLAG_KEY)?.is_some() {
+            return Ok(());
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch("DELETE FROM play_stats_daily; DELETE FROM play_stats_hourly;")?;
+
+        // 拉取全部明细按时间正序，重放合并/丢弃判定
+        let mut stmt = tx.prepare(
+            "SELECT id, game_id, start_time, end_time, duration_seconds \
+             FROM play_sessions ORDER BY start_time ASC, id ASC",
+        )?;
+        let rows: Vec<(i64, String, String, Option<String>, i64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        // 保留列表中同游戏最近一条：id、end_time、duration（合并时累加并更新）
+        let mut kept: std::collections::HashMap<String, (i64, String, u64)> =
+            std::collections::HashMap::new();
+
+        for (row_id, game_id, start_time, end_time, duration) in rows {
+            let dur = duration.max(0) as u64;
+            let end = end_time.unwrap_or_else(|| start_time.clone());
+            let buckets = SessionBuckets::from_rfc3339(&start_time);
+
+            if dur >= SESSION_MIN_DURATION_SECS {
+                // 达标会话：原样保留并计入汇总
+                if let Some(b) = &buckets {
+                    Self::apply_to_daily(&tx, &b.day, &game_id, dur, 0, 1, dur, &start_time, &end)?;
+                    Self::apply_to_hourly(&tx, &game_id, b.hour, b.weekday, dur)?;
+                }
+                kept.insert(game_id, (row_id, end, dur));
+                continue;
+            }
+
+            // 短会话：尝试并入同游戏最近一条已保留会话
+            let mut merged = false;
+            if let Some((kept_id, kept_end, kept_dur)) = kept.get(&game_id) {
+                let gap = chrono::DateTime::parse_from_rfc3339(&start_time)
+                    .ok()
+                    .and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(kept_end)
+                            .ok()
+                            .map(|e| (s - e).num_seconds())
+                    })
+                    .unwrap_or(i64::MAX);
+                if (0..=SESSION_MERGE_WINDOW_SECS).contains(&gap) {
+                    let new_total = *kept_dur + dur;
+                    tx.execute(
+                        "UPDATE play_sessions SET duration_seconds = ?1, end_time = ?2 WHERE id = ?3",
+                        params![new_total as i64, end, kept_id],
+                    )?;
+                    // 汇总：时长并入（dropped 标记），单次最长按合并后总时长刷新
+                    if let Some(b) = &buckets {
+                        Self::apply_to_daily(
+                            &tx, &b.day, &game_id, dur, dur, 0, new_total, &start_time, &end,
+                        )?;
+                        Self::apply_to_hourly(&tx, &game_id, b.hour, b.weekday, dur)?;
+                    }
+                    kept.insert(game_id.clone(), (*kept_id, end.clone(), new_total));
+                    merged = true;
+                }
+            }
+
+            if !merged {
+                // 无法并入：清除明细，但时长仍计入当日汇总（dropped）
+                if let Some(b) = &buckets {
+                    Self::apply_to_daily(
+                        &tx, &b.day, &game_id, dur, dur, 0, 0, &start_time, &end,
+                    )?;
+                    Self::apply_to_hourly(&tx, &game_id, b.hour, b.weekday, dur)?;
+                }
+            }
+            tx.execute("DELETE FROM play_sessions WHERE id = ?1", params![row_id])?;
+        }
+
+        // play_count 与保留明细行数对齐（历史每行都曾 +1，删行后需同步回减）
+        tx.execute_batch(
+            "UPDATE games SET play_count = (SELECT COUNT(*) FROM play_sessions \
+             WHERE play_sessions.game_id = games.id)",
+        )?;
+
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, '1') ON CONFLICT(key) DO UPDATE SET value = '1'",
+            params![FLAG_KEY],
+        )?;
+        tx.commit()?;
+        tracing::info!("历史游玩明细已按现行规则重分级（合并/清除短会话）");
+        Ok(())
+    }
+
+    /// 预聚合表为空时从明细全量回填（建表后的首次初始化）
+    /// 失败只记日志、不阻断启动——预聚合表损坏不影响主流程，可用 rebuild_play_stats 重来
+    fn rebuild_play_stats_if_empty(&self) -> Result<()> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM play_stats_daily", [], |r| r.get(0),
+        )?;
+        if count == 0 {
+            match self.rebuild_play_stats() {
+                Ok(()) => tracing::info!("预聚合表已从历史明细初始化"),
+                Err(e) => tracing::error!("预聚合表初始化失败（不影响启动）: {}", e),
+            }
+        }
+        Ok(())
+    }
+
+    /// 从 play_sessions 全量重算预聚合表
+    /// 注意：明细被保留策略清理后，超出保留期的历史无法再由此重算
+    pub fn rebuild_play_stats(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch("DELETE FROM play_stats_daily; DELETE FROM play_stats_hourly;")?;
+
+        let mut stmt = tx.prepare(
+            "SELECT game_id, start_time, end_time, duration_seconds FROM play_sessions ORDER BY start_time",
+        )?;
+        let rows: Vec<(String, String, Option<String>, i64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        for (game_id, start_time, end_time, duration) in rows {
+            let dur = duration.max(0) as u64;
+            if let Some(b) = SessionBuckets::from_rfc3339(&start_time) {
+                let end = end_time.unwrap_or_else(|| start_time.clone());
+                // 回填时全部视为独立会话：历史数据无法还原哪些短会话曾被合并
+                Self::apply_to_daily(
+                    &tx, &b.day, &game_id, dur, 0, 1, dur, &start_time, &end,
+                )?;
+                Self::apply_to_hourly(&tx, &game_id, b.hour, b.weekday, dur)?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 把一次会话累加进日粒度汇总表
+    /// total 含被合并/丢弃的短会话时长，session_count 只记独立成条的会话，
+    /// dropped 记录未独立成条的时长，用于核对 total 与 games.play_time_seconds 的一致性
+    #[allow(clippy::too_many_arguments)]
+    fn apply_to_daily(
+        conn: &Connection,
+        day: &str,
+        game_id: &str,
+        total: u64,
+        dropped: u64,
+        sessions: u32,
+        max_duration: u64,
+        start_time: &str,
+        end_time: &str,
+    ) -> rusqlite::Result<()> {
+        // 会话整段归入开始时刻所处时段，与原有成就判定口径一致
+        let (night, dawn, daytime) = match SessionBuckets::from_rfc3339(start_time) {
+            Some(b) => (
+                if b.is_night { total } else { 0 },
+                if b.is_dawn { total } else { 0 },
+                if b.is_daytime { total } else { 0 },
+            ),
+            None => (0, 0, 0),
+        };
+        conn.execute(
+            "INSERT INTO play_stats_daily \
+             (day, game_id, total_seconds, dropped_seconds, session_count, max_duration, \
+              night_seconds, dawn_seconds, daytime_seconds, first_start, last_end) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             ON CONFLICT(day, game_id) DO UPDATE SET \
+               total_seconds   = total_seconds + excluded.total_seconds, \
+               dropped_seconds = dropped_seconds + excluded.dropped_seconds, \
+               session_count   = session_count + excluded.session_count, \
+               max_duration    = MAX(max_duration, excluded.max_duration), \
+               night_seconds   = night_seconds + excluded.night_seconds, \
+               dawn_seconds    = dawn_seconds + excluded.dawn_seconds, \
+               daytime_seconds = daytime_seconds + excluded.daytime_seconds, \
+               first_start     = COALESCE(MIN(first_start, excluded.first_start), excluded.first_start), \
+               last_end        = COALESCE(MAX(last_end, excluded.last_end), excluded.last_end)",
+            params![
+                day,
+                game_id,
+                total as i64,
+                dropped as i64,
+                sessions as i64,
+                max_duration as i64,
+                night as i64,
+                dawn as i64,
+                daytime as i64,
+                start_time,
+                end_time,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 把一次会话累加进时段粒度汇总表
+    fn apply_to_hourly(
+        conn: &Connection,
+        game_id: &str,
+        hour: u32,
+        weekday: u32,
+        total: u64,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO play_stats_hourly (game_id, hour, weekday, total_seconds) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(game_id, hour, weekday) DO UPDATE SET \
+               total_seconds = total_seconds + excluded.total_seconds",
+            params![game_id, hour as i64, weekday as i64, total as i64],
+        )?;
+        Ok(())
+    }
+
+    /// 清理超过保留期的会话明细
+    /// 只删 play_sessions 行；日/时段汇总表与 games 聚合字段均不受影响
+    pub fn cleanup_expired_sessions(&self, retention_days: i64) -> Result<usize> {
+        if retention_days <= 0 {
+            return Ok(0);
+        }
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
+        let deleted = self.conn.execute(
+            "DELETE FROM play_sessions WHERE start_time < ?1",
+            params![cutoff],
+        )?;
+        if deleted > 0 {
+            tracing::info!("已清理 {} 条超过 {} 天的游玩明细", deleted, retention_days);
+        }
+        Ok(deleted)
+    }
+}
+
+/// 会话在各统计维度上的归属（本地时区；口径与原有 strftime 系列 SQL 一致）
+pub struct SessionBuckets {
+    /// 本地日期 YYYY-MM-DD
+    pub day: String,
+    /// 本地小时 0-23
+    pub hour: u32,
+    /// 0=周日 … 6=周六（与 SQLite strftime('%w') 一致）
+    pub weekday: u32,
+    /// 深夜：0-4 点
+    pub is_night: bool,
+    /// 清晨：5-7 点
+    pub is_dawn: bool,
+    /// 白天：9-17 点
+    pub is_daytime: bool,
+}
+
+impl SessionBuckets {
+    /// 从 RFC3339 时间戳解析；解析失败返回 None，调用方应跳过统计而非写入脏数据
+    pub fn from_rfc3339(start_time: &str) -> Option<Self> {
+        let dt = chrono::DateTime::parse_from_rfc3339(start_time).ok()?;
+        let local = dt.with_timezone(&chrono::Local);
+        let hour = local.hour();
+        Some(Self {
+            day: local.format("%Y-%m-%d").to_string(),
+            hour,
+            weekday: local.weekday().num_days_from_sunday(),
+            is_night: hour <= 4,
+            is_dawn: (5..=7).contains(&hour),
+            is_daytime: (9..=17).contains(&hour),
+        })
     }
 }

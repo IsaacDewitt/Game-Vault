@@ -140,6 +140,29 @@ pub fn run() {
             let running = Arc::new(AtomicBool::new(true));
             let running_clone = running.clone();
 
+            // 启动后延迟清理过期游玩明细（一次性后台任务，不阻塞启动）
+            // 清理只删明细行，日/时段汇总表与 games 聚合字段不受影响
+            {
+                let cleanup_db = db.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(
+                        utils::constants::SESSION_CLEANUP_DELAY_SECS,
+                    ));
+                    if let Ok(db_guard) = cleanup_db.lock() {
+                        match db_guard.cleanup_expired_sessions(
+                            utils::constants::SESSION_RETENTION_DAYS,
+                        ) {
+                            Ok(n) => {
+                                if n > 0 {
+                                    tracing::info!("已清理 {} 条超过保留期的游玩明细", n);
+                                }
+                            }
+                            Err(e) => tracing::error!("清理过期游玩明细失败: {}", e),
+                        }
+                    }
+                });
+            }
+
             // 预先克隆 Arc 引用，避免线程内每 10 秒查找一次 state
             let tracker_arc: Arc<Mutex<core::PlayTimeTracker>> = app.state::<Arc<Mutex<core::PlayTimeTracker>>>().inner().clone();
             let db_arc: Arc<Mutex<core::Database>> = app.state::<Arc<Mutex<core::Database>>>().inner().clone();

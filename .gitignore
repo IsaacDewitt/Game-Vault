@@ -26,3 +26,6 @@ dist-ssr
 # Misc
 *.md
 !README.md
+
+# 项目内务数据（会话记忆、数据库备份等，不进版本库）
+.workbuddy

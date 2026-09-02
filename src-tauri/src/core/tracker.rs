@@ -309,8 +309,13 @@ impl PlayTimeTracker {
             .map(|s| (s.game_id.clone(), s.start_time.clone(), s.duration_seconds))
             .collect();
         match db.add_play_sessions_batch(&batch) {
-            Ok(saved) => {
-                tracing::info!("已批量保存 {} 条游戏会话", saved);
+            Ok(recorded) => {
+                // recorded 只统计独立成条的会话；合并与不足时长的短会话不生成新行
+                tracing::info!(
+                    "结算 {} 条结束会话：{} 条独立记录，其余为合并或短会话",
+                    sessions.len(),
+                    recorded
+                );
             }
             Err(e) => {
                 // 批量失败时回退到逐条保存，尽量不丢数据
