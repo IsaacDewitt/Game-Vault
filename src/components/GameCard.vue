@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, toRef } from "vue";
 import { NIcon, NEllipsis } from "naive-ui";
-import { HeartOutline, Heart, PlayOutline, FolderOutline } from "@vicons/ionicons5";
+import { HeartOutline, Heart, PlayOutline, FolderOutline, ImagesOutline } from "@vicons/ionicons5";
 import type { Game } from "../lib/tauri";
 import { formatPlayTime } from "../lib/format";
 import { useCoverImage } from "../lib/useCoverImage";
@@ -25,6 +25,7 @@ const emit = defineEmits<{
   editInfo: [];
   removeCover: [];
   toggleCompleted: [];
+  openScreenshots: [];
 }>();
 
 const showContextMenu = ref(false);
@@ -126,6 +127,13 @@ function handleContextMenu(e: MouseEvent) {
           title="收藏"
         >
           <n-icon :component="game.is_favorite ? Heart : HeartOutline" />
+        </button>
+        <button
+          class="action-btn screenshot-btn"
+          @click.stop="emit('openScreenshots')"
+          title="打开截图文件夹"
+        >
+          <n-icon :component="ImagesOutline" />
         </button>
       </div>
 
@@ -259,6 +267,15 @@ function handleContextMenu(e: MouseEvent) {
 .fav-btn {
   background: rgba(0, 0, 0, 0.6);
   color: white;
+}
+
+.screenshot-btn {
+  background: rgba(0, 0, 0, 0.6);
+  color: white;
+}
+
+.screenshot-btn:hover {
+  color: var(--accent-color, #6366f1);
 }
 
 .fav-btn.favorited {

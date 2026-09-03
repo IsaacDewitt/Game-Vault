@@ -99,6 +99,10 @@ export interface Settings {
   accent_color: string;
   window_width: number;
   window_height: number;
+  /** 截图保存目录（默认 %USERPROFILE%\Videos，与 NVIDIA App 一致） */
+  screenshot_dir: string;
+  /** 截图快捷键（默认 F12，与 Steam 一致） */
+  screenshot_hotkey: string;
 }
 
 // ==================== 成就系统 ====================
@@ -386,6 +390,32 @@ export async function setAutostartEnabled(enabled: boolean): Promise<void> {
 
 export async function setWindowSize(width: number, height: number): Promise<void> {
   return invoke("set_window_size", { width, height });
+}
+
+// ==================== 截图 ====================
+
+/** 截图触发结果（后端事件 screenshot-taken 的 payload） */
+export type ScreenshotOutcome =
+  | {
+      outcome: "captured";
+      path: string;
+      process_name: string;
+      width: number;
+      height: number;
+      tone_map_path: string;
+    }
+  | { outcome: "no_active_game" }
+  | { outcome: "foreground_mismatch" }
+  | { outcome: "failed"; message: string };
+
+/** 打开某个游戏的截图文件夹（在文件管理器中） */
+export async function openScreenshotDir(gameId: string): Promise<void> {
+  return invoke("open_screenshot_dir", { gameId });
+}
+
+/** 查询截图热键注册状态：null=注册成功，字符串=注册失败原因 */
+export async function getScreenshotHotkeyStatus(): Promise<string | null> {
+  return invoke("get_screenshot_hotkey_status");
 }
 
 // ==================== 游戏手账 ====================

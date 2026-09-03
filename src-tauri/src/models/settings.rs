@@ -35,6 +35,12 @@ pub struct Settings {
     /// 窗口高度
     #[serde(default = "default_window_height")]
     pub window_height: u32,
+    /// 截图保存目录（默认 %USERPROFILE%\Videos，与 NVIDIA App 一致）
+    #[serde(default = "default_screenshot_dir")]
+    pub screenshot_dir: String,
+    /// 截图快捷键（默认 "F12"，与 Steam 一致）
+    #[serde(default = "default_screenshot_hotkey")]
+    pub screenshot_hotkey: String,
 }
 
 fn default_accent_color() -> String {
@@ -53,6 +59,18 @@ fn default_window_height() -> u32 {
     900
 }
 
+pub fn default_screenshot_dir() -> String {
+    // 与 NVIDIA App / GeForce Experience 默认截图目录保持一致：
+    // %USERPROFILE%\Videos（Windows 保留的英文物理目录名，中文系统下同样有效）
+    dirs::home_dir()
+        .map(|p| p.join("Videos").to_string_lossy().to_string())
+        .unwrap_or_else(|| "%USERPROFILE%\\Videos".to_string())
+}
+
+fn default_screenshot_hotkey() -> String {
+    "F12".to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -67,6 +85,8 @@ impl Default for Settings {
             accent_color: default_accent_color(),
             window_width: default_window_width(),
             window_height: default_window_height(),
+            screenshot_dir: default_screenshot_dir(),
+            screenshot_hotkey: default_screenshot_hotkey(),
         }
     }
 }
@@ -94,6 +114,8 @@ impl Settings {
             window_height: get("window_height", &default_window_height().to_string())?
                 .parse()
                 .unwrap_or(default_window_height()),
+            screenshot_dir: get("screenshot_dir", &default_screenshot_dir())?,
+            screenshot_hotkey: get("screenshot_hotkey", &default_screenshot_hotkey())?,
         })
     }
 
@@ -110,6 +132,8 @@ impl Settings {
         db.set_setting("accent_color", &self.accent_color)?;
         db.set_setting("window_width", &self.window_width.to_string())?;
         db.set_setting("window_height", &self.window_height.to_string())?;
+        db.set_setting("screenshot_dir", &self.screenshot_dir)?;
+        db.set_setting("screenshot_hotkey", &self.screenshot_hotkey)?;
         Ok(())
     }
 }

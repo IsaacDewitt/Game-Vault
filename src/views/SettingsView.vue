@@ -36,6 +36,8 @@ const settings = ref<Settings>({
   accent_color: DEFAULT_ACCENT_COLOR,
   window_width: 1400,
   window_height: 900,
+  screenshot_dir: "",
+  screenshot_hotkey: "F12",
 });
 
 // 窗口大小预设选项
@@ -101,6 +103,27 @@ function autoSaveThemeSettings() {
       await api.saveSettings(settings.value);
     } catch (e) {
       console.error("自动保存外观设置失败:", e);
+    }
+  }, DEBOUNCE_MS);
+}
+
+// 截图目录修改后防抖自动保存（立即生效，无需手动点保存）
+watch(() => settings.value.screenshot_dir, () => {
+  if (!loading.value) {
+    autoSaveScreenshotDir();
+  }
+});
+
+let screenshotDirSaveTimer: ReturnType<typeof setTimeout> | null = null;
+function autoSaveScreenshotDir() {
+  if (screenshotDirSaveTimer) clearTimeout(screenshotDirSaveTimer);
+  screenshotDirSaveTimer = setTimeout(async () => {
+    try {
+      await api.saveSettings(settings.value);
+      message.success("截图目录已保存");
+    } catch (e) {
+      console.error("保存截图目录失败:", e);
+      message.error("保存截图目录失败");
     }
   }, DEBOUNCE_MS);
 }
@@ -250,16 +273,154 @@ async function toggleAutostart(enabled: boolean) {
   }
 }
 
+async function handleChooseScreenshotDir() {
+  try {
+    const selected = await open({
+      multiple: false,
+      directory: true,
+      title: "选择截图保存目录",
+    });
+    if (selected) {
+      settings.value.screenshot_dir = selected as string;
+    }
+  } catch (e) {
+    console.error("选择截图目录失败:", e);
+  }
+}
+
+// ==================== 截图快捷键录制 ====================
+const recordingHotkey = ref(false);
+
+function startRecordingHotkey() {
+  recordingHotkey.value = true;
+}
+
+function cancelRecordingHotkey() {
+  recordingHotkey.value = false;
+}
+
+// 把 KeyboardEvent.key 转成 global-hotkey 能解析的键名（与后端 parse_key 约定一致）
+function normalizeHotkeyKey(key: string): string | null {
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(key)) return key; // F1-F24
+  if (/^[a-zA-Z]$/.test(key)) return key.toUpperCase();
+  if (/^[0-9]$/.test(key)) return key;
+  const arrowMap: Record<string, string> = {
+    ArrowUp: "Up",
+    ArrowDown: "Down",
+    ArrowLeft: "Left",
+    ArrowRight: "Right",
+  };
+  if (arrowMap[key]) return arrowMap[key];
+  if (key === " ") return "Space";
+  const specialMap: Record<string, string> = {
+    Escape: "Esc",
+    Enter: "Enter",
+    Backspace: "Backspace",
+    Delete: "Delete",
+    Tab: "Tab",
+    Home: "Home",
+    End: "End",
+    PageUp: "PageUp",
+    PageDown: "PageDown",
+    Insert: "Insert",
+    PrintScreen: "PrintScreen",
+    ScrollLock: "ScrollLock",
+    Pause: "Pause",
+    CapsLock: "CapsLock",
+    NumLock: "NumLock",
+    "-": "Minus",
+    "=": "Equal",
+    "[": "BracketLeft",
+    "]": "BracketRight",
+    "\\": "Backslash",
+    ";": "Semicolon",
+    "'": "Quote",
+    ",": "Comma",
+    ".": "Period",
+    "/": "Slash",
+    "`": "Backquote",
+  };
+  if (specialMap[key]) return specialMap[key];
+  return null;
+}
+
+function onGlobalHotkeyKeydown(e: KeyboardEvent) {
+  if (!recordingHotkey.value) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  // Esc 取消录制
+  if (e.key === "Escape") {
+    recordingHotkey.value = false;
+    return;
+  }
+  // Backspace / Delete 清空快捷键
+  if (e.key === "Backspace" || e.key === "Delete") {
+    settings.value.screenshot_hotkey = "";
+    recordingHotkey.value = false;
+    void applyHotkeyChange();
+    return;
+  }
+  // 纯修饰键：等待主键
+  if (e.key === "Control" || e.key === "Shift" || e.key === "Alt" || e.key === "Meta") {
+    return;
+  }
+
+  const key = normalizeHotkeyKey(e.key);
+  if (!key) {
+    recordingHotkey.value = false;
+    return;
+  }
+
+  const mods: string[] = [];
+  if (e.ctrlKey) mods.push("Ctrl");
+  if (e.shiftKey) mods.push("Shift");
+  if (e.altKey) mods.push("Alt");
+  if (e.metaKey) mods.push("Super"); // Windows 上 metaKey = Win 键
+
+  settings.value.screenshot_hotkey = [...mods, key].join("+");
+  recordingHotkey.value = false;
+  void applyHotkeyChange();
+}
+
+// 快捷键变更后立即保存并重新注册全局热键，同时检测冲突
+async function applyHotkeyChange() {
+  try {
+    await api.saveSettings(settings.value);
+    message.success(
+      settings.value.screenshot_hotkey
+        ? `截图快捷键已设为 ${settings.value.screenshot_hotkey}`
+        : "已清空截图快捷键"
+    );
+    const err = await api.getScreenshotHotkeyStatus();
+    if (err) {
+      message.error(
+        `该快捷键注册失败：${err}。可能被其他程序（如 Steam）占用，请换一个。`,
+        { duration: 8000 }
+      );
+    }
+  } catch (e) {
+    console.error("保存快捷键失败:", e);
+    message.error("保存快捷键失败");
+  }
+}
+
 onMounted(() => {
+  window.addEventListener("keydown", onGlobalHotkeyKeydown);
   loadSettings();
   loadAutostartState();
 });
 
-// 组件卸载时清理定时器
+// 组件卸载时清理定时器与按键监听
 onUnmounted(() => {
+  window.removeEventListener("keydown", onGlobalHotkeyKeydown);
   if (autoSaveTimer) {
     clearTimeout(autoSaveTimer);
     autoSaveTimer = null;
+  }
+  if (screenshotDirSaveTimer) {
+    clearTimeout(screenshotDirSaveTimer);
+    screenshotDirSaveTimer = null;
   }
 });
 
@@ -438,6 +599,56 @@ async function handleImportSaves() {
               应用
             </n-button>
           </n-space>
+        </n-form-item>
+      </n-form>
+    </n-card>
+
+    <!-- 截图设置 -->
+    <n-card title="截图设置" style="margin-bottom: 16px">
+      <n-form label-placement="left" label-width="140">
+        <n-form-item label="保存目录">
+          <n-space align="center" style="width: 100%">
+            <n-input
+              v-model:value="settings.screenshot_dir"
+              placeholder="%USERPROFILE%\Videos"
+              style="flex: 1; min-width: 320px"
+            />
+            <n-button size="small" @click="handleChooseScreenshotDir">
+              浏览
+            </n-button>
+          </n-space>
+        </n-form-item>
+        <n-form-item label="截图快捷键">
+          <n-space align="center">
+            <n-input
+              :value="settings.screenshot_hotkey"
+              readonly
+              :placeholder="recordingHotkey ? '请按下快捷键…' : 'F12'"
+              :status="recordingHotkey ? 'warning' : undefined"
+              style="width: 220px"
+              @click="startRecordingHotkey"
+              @blur="cancelRecordingHotkey"
+            />
+            <span
+              :style="{
+                fontSize: '12px',
+                color: recordingHotkey ? '#f0a020' : '#888',
+                lineHeight: '1.6',
+              }"
+            >
+              {{
+                recordingHotkey
+                  ? '按下要设置的键（Esc 取消，Backspace 清空）'
+                  : '点击输入框后直接按键即可录制'
+              }}
+            </span>
+          </n-space>
+        </n-form-item>
+        <n-form-item label=" ">
+          <span style="font-size: 12px; color: #888; line-height: 1.6">
+            保存目录与快捷键修改后立即生效。截图仅对「从本库启动且正在前台运行」的游戏生效；
+            文件按「进程名\进程名_日期_时间.png」归档到保存目录下对应游戏文件夹
+          </span>
         </n-form-item>
       </n-form>
     </n-card>

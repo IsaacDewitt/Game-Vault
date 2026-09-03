@@ -29,3 +29,6 @@ dist-ssr
 
 # 项目内务数据（会话记忆、数据库备份等，不进版本库）
 .workbuddy
+
+# hook-dll（injection 分支的注入实验工程，master 不收录）
+src-tauri/hook-dll/

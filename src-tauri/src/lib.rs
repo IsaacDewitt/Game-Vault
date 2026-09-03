@@ -102,6 +102,7 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             // 初始化数据库
             let db_path = utils::path::get_database_path();
@@ -120,7 +121,7 @@ pub fn run() {
 
             // 注册状态
             app.manage(db.clone());
-            app.manage(tracker);
+            app.manage(tracker.clone());
 
             // 成就系统：启动时立即结算存量数据（静默，不弹通知）
             {
@@ -256,6 +257,34 @@ pub fn run() {
                 }
             }
 
+            // 注册全局截图热键（默认 F12，与 Steam 一致；仅从本库启动的游戏运行时生效）
+            {
+                let hotkey = {
+                    let db_guard = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    models::settings::Settings::load_from_db(&db_guard)
+                        .map(|s| s.screenshot_hotkey)
+                        .unwrap_or_else(|_| "F12".to_string())
+                };
+
+                // 记录当前热键（供设置修改时重新注册）
+                let hotkey_state = Arc::new(Mutex::new(hotkey.clone()));
+                app.manage(hotkey_state);
+
+                // 记录热键注册错误（None=成功；Some(err)=失败原因，供前端启动时检测提示）
+                let hotkey_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+                app.manage(hotkey_error.clone());
+
+                if let Err(e) = commands::screenshots::register_screenshot_hotkey(
+                    app.handle(),
+                    &hotkey,
+                    db.clone(),
+                    tracker.clone(),
+                ) {
+                    tracing::error!("注册全局截图热键失败: {e}");
+                    *hotkey_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                }
+            }
+
             // 创建系统托盘
             let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -371,6 +400,9 @@ pub fn run() {
             commands::settings::get_autostart_enabled,
             commands::settings::set_autostart_enabled,
             commands::settings::set_window_size,
+            // 截图相关
+            commands::screenshots::open_screenshot_dir,
+            commands::screenshots::get_screenshot_hotkey_status,
             // 应用
             quit_app,
         ])

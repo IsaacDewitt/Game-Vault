@@ -15,8 +15,9 @@ import {
 } from "naive-ui";
 import { SearchOutline, CloudDownloadOutline, AddOutline, DocumentTextOutline, FolderOutline } from "@vicons/ionicons5";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ref, computed } from "vue";
+import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useDebounceFn } from "@vueuse/core";
+import { listen } from "@tauri-apps/api/event";
 import { useGamesStore } from "../stores/games";
 import * as api from "../lib/tauri";
 import { DEBOUNCE_MS } from "../lib/constants";
@@ -30,6 +31,46 @@ import { formatPlayTime } from "../lib/format";
 const store = useGamesStore();
 const message = useMessage();
 const dialog = useDialog();
+
+// 监听截图结果事件（全局热键触发截图后由后端推送）
+let unlistenScreenshot: (() => void) | null = null;
+onMounted(async () => {
+  try {
+    unlistenScreenshot = await listen<api.ScreenshotOutcome>("screenshot-taken", (event) => {
+      const o = event.payload;
+      if (o.outcome === "captured") {
+        message.success(`截图已保存到「${o.process_name}」文件夹`);
+      } else if (o.outcome === "failed") {
+        message.error(`截图失败: ${o.message}`);
+      } else if (o.outcome === "no_active_game") {
+        message.warning("当前没有从本库启动的游戏在运行，未截图");
+      } else if (o.outcome === "foreground_mismatch") {
+        message.warning("前台窗口不是从本库启动的游戏，未截图");
+      }
+    });
+  } catch (e) {
+    console.error("监听截图事件失败:", e);
+  }
+
+  // 检测截图热键是否注册成功（如 F12 被 Steam 等程序占用，启动时提示换键）
+  try {
+    const hotkeyError = await api.getScreenshotHotkeyStatus();
+    if (hotkeyError) {
+      message.error(
+        `截图快捷键注册失败：${hotkeyError}。该快捷键可能被其他程序（如 Steam）占用，请到「设置 → 截图设置」更换。`,
+        { duration: 8000 }
+      );
+    }
+  } catch (e) {
+    console.error("检测截图热键状态失败:", e);
+  }
+});
+onUnmounted(() => {
+  if (unlistenScreenshot) {
+    unlistenScreenshot();
+    unlistenScreenshot = null;
+  }
+});
 
 // 添加游戏弹窗状态
 const showNameModal = ref(false);
@@ -208,6 +249,15 @@ async function handleLaunchGame(gameId: string) {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     message.error(`启动「${gameName}」失败: ${msg}`);
+  }
+}
+
+async function handleOpenScreenshots(gameId: string) {
+  try {
+    await api.openScreenshotDir(gameId);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    message.error(`打开截图文件夹失败: ${msg}`);
   }
 }
 
@@ -529,6 +579,7 @@ function handleDeleteGame(gameId: string) {
           @edit-info="handleEditInfo(game.id)"
           @remove-cover="handleRemoveCover(game.id)"
           @toggle-completed="handleToggleCompleted(game.id)"
+          @open-screenshots="handleOpenScreenshots(game.id)"
         />
       </div>
     </div>

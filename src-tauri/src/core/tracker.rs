@@ -294,6 +294,16 @@ impl PlayTimeTracker {
         self.active_sessions.contains_key(game_id)
     }
 
+    /// 根据进程名（exe 文件名，忽略大小写）查找活跃游戏，返回 game_id。
+    /// 用于截图时把前台窗口进程反查回游戏库条目。
+    pub fn find_active_game_by_exe(&self, exe_name: &str) -> Option<String> {
+        let needle = exe_name.to_lowercase();
+        self.active_sessions
+            .iter()
+            .find(|(_, s)| s.exe_name.to_lowercase() == needle)
+            .map(|(id, _)| id.clone())
+    }
+
     /// 持久化已结束的会话到数据库（在 Tracker 锁释放后调用）
     /// 一次性获取锁并批量插入（单事务），避免逐条获取/释放锁与逐条事务的开销
     pub fn persist_finished_sessions(
