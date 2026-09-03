@@ -63,19 +63,9 @@ half = "2"
 png = "0.17"
 tauri-plugin-global-shortcut = "2"
 
-# 截图方案 C：进程注入 + 命名管道（Win32 API）
+# 提示音播放（PlaySoundW，截图快门/完成/错误音）
 windows = { version = "0.62", features = [
     "Win32_Foundation",
-    "Win32_System_Threading",
-    "Win32_System_Memory",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Pipes",
-    "Win32_System_SystemServices",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_System_IO",
-    "Win32_Storage_FileSystem",
-    "Win32_Security",
-    "Win32_UI_WindowsAndMessaging",
     "Win32_Media_Audio",
 ] }
 
