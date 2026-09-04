@@ -165,6 +165,13 @@ pub async fn refresh_review_info(
 
     // 阶段 4：重新取锁保存
     let db_guard = lock_or_recover(&db);
+    // 封面必须走专用函数落库：update_review 有意不含封面字段（见其注释），
+    // 若只调 update_review，这里拉到的封面只存在于返回值中——前端当时显示正常，
+    // 但 DB 里仍是 NULL，任何一次"读-改-写"（切状态/评分）都会让封面在界面上消失。
+    if let Some(cover) = review.cover_local.as_ref() {
+        db_guard.update_review_cover(&review.id, cover)
+            .map_err(|e| e.to_string())?;
+    }
     db_guard.update_review(&review).map_err(|e| e.to_string())?;
     Ok(review)
 }
