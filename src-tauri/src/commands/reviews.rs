@@ -337,8 +337,9 @@ pub fn import_review_from_game(
     }
 
     let mut review = Review::new(game.name.clone());
-    // 复用游戏库的封面缓存文件（covers 目录共享，路径直接引用）
-    if let Some(ref cover) = game.cover_url {
+    // 复用游戏库的封面缓存文件（covers 目录共享，路径直接引用）。
+    // cover_local 优先（手动设置的封面只写 cover_local），cover_url 兜底，与 get_all_covers 同口径
+    if let Some(cover) = game.cover_local.as_ref().or(game.cover_url.as_ref()) {
         review.cover_local = Some(cover.clone());
         review.cover_url = Some(cover.clone());
     }

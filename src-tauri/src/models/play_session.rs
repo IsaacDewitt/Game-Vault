@@ -11,10 +11,9 @@ pub struct PlaySessionDetail {
     pub duration_seconds: u64,
 }
 
-/// 活跃的游戏会话（内存中）
+/// 活跃的游戏会话（内存中；game_id 即 HashMap 的 key，不重复存字段）
 #[derive(Debug, Clone)]
 pub struct ActiveSession {
-    pub game_id: String,
     pub exe_name: String,
     /// 游戏可执行文件的完整路径，用于精确匹配进程
     pub exe_path: Option<String>,

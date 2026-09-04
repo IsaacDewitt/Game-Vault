@@ -15,7 +15,8 @@ pub struct FinishedSession {
 /// 游戏时长追踪器
 pub struct PlayTimeTracker {
     active_sessions: HashMap<String, ActiveSession>,
-    /// 复用 sysinfo System 实例，避免每10秒全量扫描
+    /// 复用 sysinfo System 实例，避免每10秒全量扫描。
+    /// 用空实例 + 每次 check 时 refresh_processes 即可，无需启动时全量拉取（new_all 更重）
     sys: System,
 }
 
@@ -23,7 +24,7 @@ impl PlayTimeTracker {
     pub fn new() -> Self {
         Self {
             active_sessions: HashMap::new(),
-            sys: System::new_all(),
+            sys: System::new(),
         }
     }
 
@@ -46,7 +47,6 @@ impl PlayTimeTracker {
         self.active_sessions.insert(
             game_id.to_string(),
             ActiveSession {
-                game_id: game_id.to_string(),
                 exe_name: exe_name.to_string(),
                 exe_path: exe_path.map(|s| s.to_string()),
                 spawned_pid,
@@ -60,11 +60,6 @@ impl PlayTimeTracker {
             game_id, exe_name, exe_path, spawned_pid, install_path
         );
         finished
-    }
-
-    /// 停止追踪游戏，返回结束的会话数据
-    pub fn stop_tracking(&mut self, game_id: &str) -> Option<FinishedSession> {
-        self.stop_tracking_internal(game_id)
     }
 
     /// 内部停止追踪，仅从 HashMap 中移除并返回数据，不获取 DB 锁
@@ -287,11 +282,6 @@ impl PlayTimeTracker {
     /// 获取当前活跃的游戏
     pub fn get_active_games(&self) -> Vec<String> {
         self.active_sessions.keys().cloned().collect()
-    }
-
-    /// 检查某个游戏是否正在运行
-    pub fn is_game_running(&self, game_id: &str) -> bool {
-        self.active_sessions.contains_key(game_id)
     }
 
     /// 根据进程名（exe 文件名，忽略大小写）查找活跃游戏，返回 game_id。

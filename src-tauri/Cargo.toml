@@ -43,9 +43,6 @@ uuid = { version = "1", features = ["v4"] }
 # URL 编码
 urlencoding = "2"
 
-# Base64 编码（封面图 data URL）
-base64 = "0.22"
-
 # ZIP 压缩（存档备份）
 zip = "0.6"
 

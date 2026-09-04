@@ -21,6 +21,19 @@ fn format_offset_for_sqlite(offset_secs: i32) -> String {
     }
 }
 
+/// LIKE 通配符转义：配合 `ESCAPE '\'` 使用，让搜索词中的 % _ \ 按字面匹配，
+/// 防止用户输入 "%" 时变成全表通配
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if c == '\\' || c == '%' || c == '_' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// SQLite 数据库管理
 pub struct Database {
     conn: Connection,
@@ -342,8 +355,8 @@ impl Database {
         let mut bind_values: Vec<String> = Vec::new();
 
         if let Some(ref search) = filter.search {
-            sql.push_str(&format!(" AND name LIKE ?{}", bind_values.len() + 1));
-            bind_values.push(format!("%{}%", search));
+            sql.push_str(&format!(" AND name LIKE ?{} ESCAPE '\\'", bind_values.len() + 1));
+            bind_values.push(format!("%{}%", escape_like(search)));
         }
         if filter.favorites_only {
             sql.push_str(" AND is_favorite = 1");
@@ -356,8 +369,9 @@ impl Database {
         }
         if let Some(ref genre) = filter.genre {
             if !genre.is_empty() {
-                sql.push_str(&format!(" AND genres LIKE ?{}", bind_values.len() + 1));
-                bind_values.push(format!("%{}%", genre));
+                // JSON 数组元素匹配：模式带引号 `"genre`，避免 "RPG" 误匹配 "JRPG"
+                sql.push_str(&format!(" AND genres LIKE ?{} ESCAPE '\\'", bind_values.len() + 1));
+                bind_values.push(format!("%\"{}%", escape_like(genre)));
             }
         }
 
@@ -400,22 +414,6 @@ impl Database {
         ))?;
 
         let mut games = stmt.query_map(params![id], Self::row_to_game)?;
-
-        match games.next() {
-            Some(Ok(game)) => Ok(Some(game)),
-            Some(Err(e)) => Err(e.into()),
-            None => Ok(None),
-        }
-    }
-
-    /// 根据 exe_path 查找游戏（用于去重）
-    pub fn find_game_by_exe_path(&self, exe_path: &str) -> Result<Option<Game>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {} FROM games WHERE exe_path = ?1",
-            Self::GAME_COLUMNS
-        ))?;
-
-        let mut games = stmt.query_map(params![exe_path], Self::row_to_game)?;
 
         match games.next() {
             Some(Ok(game)) => Ok(Some(game)),
@@ -596,8 +594,8 @@ impl Database {
         let mut bind_values: Vec<String> = Vec::new();
 
         if let Some(ref search) = filter.search {
-            sql.push_str(&format!(" AND name LIKE ?{}", bind_values.len() + 1));
-            bind_values.push(format!("%{}%", search));
+            sql.push_str(&format!(" AND name LIKE ?{} ESCAPE '\\'", bind_values.len() + 1));
+            bind_values.push(format!("%{}%", escape_like(search)));
         }
         if let Some(ref status) = filter.status {
             if !status.is_empty() {
@@ -607,8 +605,9 @@ impl Database {
         }
         if let Some(ref genre) = filter.genre {
             if !genre.is_empty() {
-                sql.push_str(&format!(" AND genres LIKE ?{}", bind_values.len() + 1));
-                bind_values.push(format!("%{}%", genre));
+                // JSON 数组元素匹配：模式带引号 `"genre`，避免 "RPG" 误匹配 "JRPG"
+                sql.push_str(&format!(" AND genres LIKE ?{} ESCAPE '\\'", bind_values.len() + 1));
+                bind_values.push(format!("%\"{}%", escape_like(genre)));
             }
         }
 
@@ -694,22 +693,17 @@ impl Database {
         Ok(())
     }
 
-    /// 清除手账条目封面
-    pub fn remove_review_cover(&self, id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE reviews SET cover_local = NULL, cover_url = NULL, updated_at = ?1 WHERE id = ?2",
-            params![chrono::Utc::now().to_rfc3339(), id],
-        )?;
-        Ok(())
-    }
-
     /// 更新游戏状态
-    /// 当状态变为 abandoned 时记录 abandoned_at（最近一次弃坑时间），供「弃坑后重玩」成就判定
+    /// 当状态变为 abandoned 时记录 abandoned_at（最近一次弃坑时间），供「弃坑后重玩」成就判定。
+    /// 已是 abandoned 时重复设置不刷新 abandoned_at——避免无意义重标把
+    /// 「弃坑 → 重玩」的既成事实抹掉。
     pub fn set_game_status(&self, id: &str, status: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         if status == "abandoned" {
             self.conn.execute(
-                "UPDATE games SET status = ?1, abandoned_at = ?2, updated_at = ?2 WHERE id = ?3",
+                "UPDATE games SET status = ?1, \
+                 abandoned_at = CASE WHEN status = 'abandoned' THEN abandoned_at ELSE ?2 END, \
+                 updated_at = ?2 WHERE id = ?3",
                 params![status, now, id],
             )?;
         } else {
@@ -788,7 +782,7 @@ impl Database {
                 )?;
                 if let Some(b) = &buckets {
                     Self::apply_to_daily(
-                        &tx, &b.day, game_id, dur, 0, 1, dur, start_time, &end_time,
+                        &tx, b, &b.day, game_id, dur, 0, 1, dur, start_time, &end_time,
                     )?;
                     Self::apply_to_hourly(&tx, game_id, b.hour, b.weekday, dur)?;
                 }
@@ -842,7 +836,7 @@ impl Database {
                 // 丢弃：会话数与单次最长均不变（max 传 0，MAX 聚合自然忽略）
                 let max_dur = merged_total.unwrap_or(0);
                 Self::apply_to_daily(
-                    &tx, &b.day, game_id, dur, dur, 0, max_dur, start_time, &end_time,
+                    &tx, b, &b.day, game_id, dur, dur, 0, max_dur, start_time, &end_time,
                 )?;
                 Self::apply_to_hourly(&tx, game_id, b.hour, b.weekday, dur)?;
             }
@@ -909,8 +903,9 @@ impl Database {
         })?.collect::<Result<Vec<_>, _>>()?;
 
         // 补零：生成完整日期序列（本地时区的今天往前 days 天）
+        // days=1 → 起点=今天，只返回 1 条；saturating_sub 防 days=0 时回退负数天
         let today_local = chrono::Local::now().date_naive();
-        let start_date = today_local - chrono::Days::new(days.saturating_sub(1).max(1) as u64);
+        let start_date = today_local - chrono::Days::new(days.saturating_sub(1) as u64);
         let mut by_date: std::collections::HashMap<String, DailyStats> = stats
             .drain(..)
             .map(|s| (s.date.clone(), s))
@@ -948,6 +943,16 @@ impl Database {
             "SELECT COALESCE(SUM(total_seconds),0) FROM play_stats_daily \
              WHERE day >= ?1 AND day < ?2",
             params![month_start, next_month_start],
+            |r| r.get(0),
+        )?;
+        Ok(total.max(0) as u64)
+    }
+
+    /// 获取指定本地日期（YYYY-MM-DD）的游玩总秒数
+    pub fn get_day_play_time(&self, day: &str) -> Result<u64> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(total_seconds),0) FROM play_stats_daily WHERE day = ?1",
+            params![day],
             |r| r.get(0),
         )?;
         Ok(total.max(0) as u64)
@@ -1333,9 +1338,6 @@ impl Database {
         s.over_main_not_completed_count = self.conn.query_row(
             "SELECT COUNT(*) FROM games WHERE hltb_main_story IS NOT NULL AND play_time_seconds >= hltb_main_story * 60 AND status != 'completed'", [], |r| r.get::<_, i64>(0),
         )? as u64;
-        s.total_exe_size_gb = self.conn.query_row(
-            "SELECT COALESCE(SUM(exe_file_size),0) FROM games", [], |r| r.get::<_, i64>(0),
-        )? as u64 / (1024 * 1024 * 1024);
         s.games_over_100h_count = self.conn.query_row(
             "SELECT COUNT(*) FROM games WHERE play_time_seconds >= 360000", [], |r| r.get::<_, i64>(0),
         )? as u64;
@@ -1414,74 +1416,30 @@ impl Database {
             s.max_dev_count = dev_map.values().copied().max().unwrap_or(0);
         }
 
-        // 入库超 1 年才首次启动的游戏数（首玩日期 - 入库日期 ≥ 365 天）
-        {
-            let mut late = 0u64;
-            let mut stmt = self.conn.prepare(
-                "SELECT g.added_at, MIN(d.first_start) FROM games g \
-                 JOIN play_stats_daily d ON d.game_id = g.id WHERE g.play_count > 0 GROUP BY g.id",
-            )?;
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-            for row in rows {
-                if let Ok((added, first)) = row {
-                    if let (Ok(a), Ok(f)) = (
-                        chrono::DateTime::parse_from_rfc3339(&added),
-                        chrono::DateTime::parse_from_rfc3339(&first),
-                    ) {
-                        if (f - a).num_days() >= 365 {
-                            late += 1;
-                        }
-                    }
-                }
-            }
-            s.late_bloomer_count = late;
-        }
+        // 手账评价计数（成就 G-40 用）：review 字段非空且非空串
+        s.review_written_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM reviews WHERE review IS NOT NULL AND review != ''",
+            [], |r| r.get::<_, i64>(0),
+        )? as u64;
 
-        // 连续凌晨（0–5 点）游玩天数
-        {
-            let mut night_dates: Vec<String> = Vec::new();
-            let mut stmt = self.conn.prepare(
-                "SELECT DISTINCT day FROM play_stats_daily WHERE night_seconds > 0",
-            )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                if let Ok(d) = row {
-                    night_dates.push(d);
-                }
-            }
-            night_dates.sort();
-            let refs: Vec<&str> = night_dates.iter().map(|s| s.as_str()).collect();
-            s.night_streak = Self::longest_streak(&refs);
-        }
+        // 连续凌晨（0–5 点）游玩天数：窗口函数下推，
+        // julianday(day) - ROW_NUMBER() 在连续日期段内恒等，按段计数取最大即最长连续天数
+        s.night_streak = self.conn.query_row(
+            "WITH d AS (SELECT DISTINCT day FROM play_stats_daily WHERE night_seconds > 0), \
+             g AS (SELECT julianday(day) - ROW_NUMBER() OVER (ORDER BY day) AS grp FROM d), \
+             c AS (SELECT COUNT(*) AS cnt FROM g GROUP BY grp) \
+             SELECT COALESCE(MAX(cnt), 0) FROM c",
+            [], |r| r.get::<_, i64>(0),
+        )? as u64;
 
-        // 某游戏间隔 ≥ 180 天后重玩
-        {
-            let mut long_gap = false;
-            // 主键 (day, game_id) 已保证「游戏 × 日期」唯一，无需再 GROUP BY
-            let mut stmt = self.conn.prepare("SELECT game_id, day FROM play_stats_daily")?;
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-            let mut per_game: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-            for row in rows {
-                if let Ok((gid, d)) = row {
-                    per_game.entry(gid).or_default().push(d);
-                }
-            }
-            'outer: for (_, mut dates) in per_game {
-                dates.sort();
-                for w in dates.windows(2) {
-                    if let (Ok(a), Ok(b)) = (
-                        chrono::NaiveDate::parse_from_str(&w[0], "%Y-%m-%d"),
-                        chrono::NaiveDate::parse_from_str(&w[1], "%Y-%m-%d"),
-                    ) {
-                        if (b - a).num_days() >= 180 {
-                            long_gap = true;
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-            s.long_gap_replay = long_gap;
-        }
+        // 某游戏间隔 ≥ 180 天后重玩：相邻两次游玩日期差由 LAG 窗口直接在 SQL 判定
+        s.long_gap_replay = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM (\
+               SELECT LAG(day) OVER (PARTITION BY game_id ORDER BY day) AS prev, day \
+               FROM play_stats_daily) \
+             WHERE prev IS NOT NULL AND julianday(day) - julianday(prev) >= 180)",
+            [], |r| r.get::<_, i64>(0),
+        )? != 0;
 
         // 库龄（首款入库）与距最后一次游玩的天数
         {
@@ -1503,18 +1461,14 @@ impl Database {
                 .unwrap_or(0);
         }
 
-        // 全局最长连续游玩天数（所有游戏日期的并集）
-        let mut dates: Vec<String> = Vec::new();
-        let mut stmt = self.conn.prepare("SELECT DISTINCT day FROM play_stats_daily")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        for row in rows {
-            if let Ok(d) = row {
-                dates.push(d);
-            }
-        }
-        dates.sort();
-        let refs: Vec<&str> = dates.iter().map(|s| s.as_str()).collect();
-        s.longest_streak = Self::longest_streak(&refs);
+        // 全局最长连续游玩天数（所有游戏日期的并集）：与 night_streak 同款的窗口函数下推
+        s.longest_streak = self.conn.query_row(
+            "WITH d AS (SELECT DISTINCT day FROM play_stats_daily), \
+             g AS (SELECT julianday(day) - ROW_NUMBER() OVER (ORDER BY day) AS grp FROM d), \
+             c AS (SELECT COUNT(*) AS cnt FROM g GROUP BY grp) \
+             SELECT COALESCE(MAX(cnt), 0) FROM c",
+            [], |r| r.get::<_, i64>(0),
+        )? as u64;
 
         Ok(s)
     }
@@ -1816,7 +1770,7 @@ impl Database {
             if dur >= SESSION_MIN_DURATION_SECS {
                 // 达标会话：原样保留并计入汇总
                 if let Some(b) = &buckets {
-                    Self::apply_to_daily(&tx, &b.day, &game_id, dur, 0, 1, dur, &start_time, &end)?;
+                    Self::apply_to_daily(&tx, b, &b.day, &game_id, dur, 0, 1, dur, &start_time, &end)?;
                     Self::apply_to_hourly(&tx, &game_id, b.hour, b.weekday, dur)?;
                 }
                 kept.insert(game_id, (row_id, end, dur));
@@ -1843,7 +1797,7 @@ impl Database {
                     // 汇总：时长并入（dropped 标记），单次最长按合并后总时长刷新
                     if let Some(b) = &buckets {
                         Self::apply_to_daily(
-                            &tx, &b.day, &game_id, dur, dur, 0, new_total, &start_time, &end,
+                            &tx, b, &b.day, &game_id, dur, dur, 0, new_total, &start_time, &end,
                         )?;
                         Self::apply_to_hourly(&tx, &game_id, b.hour, b.weekday, dur)?;
                     }
@@ -1856,7 +1810,7 @@ impl Database {
                 // 无法并入：清除明细，但时长仍计入当日汇总（dropped）
                 if let Some(b) = &buckets {
                     Self::apply_to_daily(
-                        &tx, &b.day, &game_id, dur, dur, 0, 0, &start_time, &end,
+                        &tx, b, &b.day, &game_id, dur, dur, 0, 0, &start_time, &end,
                     )?;
                     Self::apply_to_hourly(&tx, &game_id, b.hour, b.weekday, dur)?;
                 }
@@ -1921,7 +1875,7 @@ impl Database {
                 let end = end_time.unwrap_or_else(|| start_time.clone());
                 // 回填时全部视为独立会话：历史数据无法还原哪些短会话曾被合并
                 Self::apply_to_daily(
-                    &tx, &b.day, &game_id, dur, 0, 1, dur, &start_time, &end,
+                    &tx, &b, &b.day, &game_id, dur, 0, 1, dur, &start_time, &end,
                 )?;
                 Self::apply_to_hourly(&tx, &game_id, b.hour, b.weekday, dur)?;
             }
@@ -1933,10 +1887,12 @@ impl Database {
 
     /// 把一次会话累加进日粒度汇总表
     /// total 含被合并/丢弃的短会话时长，session_count 只记独立成条的会话，
-    /// dropped 记录未独立成条的时长，用于核对 total 与 games.play_time_seconds 的一致性
+    /// dropped 记录未独立成条的时长，用于核对 total 与 games.play_time_seconds 的一致性。
+    /// bucket 由调用方解析好传入（调用方同时还要用它决定是否跳过写汇总），避免重复解析时间。
     #[allow(clippy::too_many_arguments)]
     fn apply_to_daily(
         conn: &Connection,
+        bucket: &SessionBuckets,
         day: &str,
         game_id: &str,
         total: u64,
@@ -1947,14 +1903,11 @@ impl Database {
         end_time: &str,
     ) -> rusqlite::Result<()> {
         // 会话整段归入开始时刻所处时段，与原有成就判定口径一致
-        let (night, dawn, daytime) = match SessionBuckets::from_rfc3339(start_time) {
-            Some(b) => (
-                if b.is_night { total } else { 0 },
-                if b.is_dawn { total } else { 0 },
-                if b.is_daytime { total } else { 0 },
-            ),
-            None => (0, 0, 0),
-        };
+        let (night, dawn, daytime) = (
+            if bucket.is_night { total } else { 0 },
+            if bucket.is_dawn { total } else { 0 },
+            if bucket.is_daytime { total } else { 0 },
+        );
         conn.execute(
             "INSERT INTO play_stats_daily \
              (day, game_id, total_seconds, dropped_seconds, session_count, max_duration, \

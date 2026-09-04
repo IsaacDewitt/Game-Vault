@@ -105,8 +105,6 @@ pub struct AchievementGlobalStats {
     pub unplayed_count: u64,
     /// 玩过但不足 1 小时的游戏数
     pub played_under_1h_count: u64,
-    /// 入库超 1 年才首次启动的游戏数
-    pub late_bloomer_count: u64,
     /// 超 HLTB 主线时长却仍标「未通关」的游戏数
     pub over_main_not_completed_count: u64,
     /// 发行于 20 年前的老游戏数
@@ -115,8 +113,8 @@ pub struct AchievementGlobalStats {
     pub distinct_genre_count: u64,
     /// 同一开发商拥有的最多游戏数
     pub max_dev_count: u64,
-    /// 游戏 exe 文件总大小（GiB）
-    pub total_exe_size_gb: u64,
+    /// 手账中写下评价（review 非空）的游戏数
+    pub review_written_count: u64,
     /// 全库单日最长游玩（秒）
     pub max_day_seconds: u64,
     /// 累计 100 小时以上的游戏数

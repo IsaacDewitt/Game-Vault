@@ -1,9 +1,12 @@
-//! 色调映射：把 WGC / 注入拿到的 HDR 原始帧压回 SDR sRGB。
+//! 色调映射：把 WGC 拿到的 HDR 原始帧压回 SDR sRGB。
 //!
 //! 这是本功能画质的胜负手。核心结论（源自调研）：
 //! - windows-capture 的 `save_as_image` 对 `Rgba16F` 直接拒绝，本模块就是补上这一步。
 //! - 拿到线性 HDR 后先做三级判定，只对真正需要压缩的高光动手，把偏差压缩到最小。
 //! - Reinhard 走亮度域（而非逐通道），超 sRGB 高光去饱和（而非压暗）。
+//!
+//! 注入方案用的 PQ 解码 / R10G10B10A2 解码 / 线性帧入口同样存于 injection 分支
+//! （且其 PQ 值域与三级判定的 SDR 白语义不一致，恢复前需先修正），master 不保留。
 
 use half::f16;
 
@@ -231,136 +234,6 @@ pub fn encode_png(srgb_rgba8: &[u8], width: u32, height: u32, path: &std::path::
     Ok(())
 }
 
-/// PQ（SMPTE ST 2084）EOTF 逆运算：把 PQ 编码的 10bit 值转回线性亮度。
-/// 用于注入方案拿到 R10G10B10A2 + PQ 的 HDR 后台缓冲（HDR10 标准曲线）。
-/// 输出归一化到 [0,1]（1.0 = 10000 nits 峰值）。
-pub fn pq_to_linear(value_10bit: u16) -> f32 {
-    const M1: f64 = 2610.0 / 16384.0;
-    const M2: f64 = 2523.0 / 32.0;
-    const C1: f64 = 3424.0 / 4096.0;
-    const C2: f64 = 2413.0 / 128.0;
-    const C3: f64 = 2392.0 / 128.0;
-
-    let n = (value_10bit.min(1023) as f64) / 1023.0;
-    // EOTF：L = (max(N^(1/m2) - c1, 0) / (c2 - c3·N^(1/m2)))^(1/m1)
-    let n_pow = n.powf(1.0 / M2);
-    let numerator = (n_pow - C1).max(0.0);
-    let denominator = (C2 - C3 * n_pow).max(1e-9);
-    let linear = (numerator / denominator).powf(1.0 / M1);
-    linear as f32
-}
-
-/// 解码 R10G10B10A2_UNORM + PQ 的 HDR 帧为线性 RGBA f32。
-///
-/// 每像素 4 字节（32bit）：R=低10位、G=中10位、B=高10位、A=最高2位。
-/// 三通道走 PQ 逆运算到线性域；A 按 2bit UNORM 归一化（0~3 → 0~1）。
-pub fn decode_r10g10b10a2_pq(src: &[u8], width: u32, height: u32) -> Vec<f32> {
-    let pixel_count = (width as usize) * (height as usize);
-    let mut out: Vec<f32> = Vec::with_capacity(pixel_count * 4);
-
-    for px in src.chunks_exact(4) {
-        let packed = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
-        let r10 = (packed & 0x3FF) as u16;
-        let g10 = ((packed >> 10) & 0x3FF) as u16;
-        let b10 = ((packed >> 20) & 0x3FF) as u16;
-        let a2 = ((packed >> 30) & 0x3) as u16;
-
-        out.push(pq_to_linear(r10));
-        out.push(pq_to_linear(g10));
-        out.push(pq_to_linear(b10));
-        out.push(a2 as f32 / 3.0);
-    }
-
-    out
-}
-
-/// 解码 R16G16B16A16_FLOAT（scRGB HDR）帧为线性 RGBA f32。
-///
-/// 每像素 8 字节（RGBA 各 2 字节 f16）。scRGB 是线性域，1.0 = SDR 白
-/// （80 nits），与 WGC 的 Rgba16F 路径同构，直接复用 tonemap 主流程。
-pub fn decode_r16g16b16a16_scrgb(src: &[u8], width: u32, height: u32) -> Vec<f32> {
-    let pixel_count = (width as usize) * (height as usize);
-    let mut out: Vec<f32> = Vec::with_capacity(pixel_count * 4);
-
-    for px in src.chunks_exact(8) {
-        for i in 0..4 {
-            let bits = u16::from_le_bytes([px[i * 2], px[i * 2 + 1]]);
-            out.push(f16::from_bits(bits).to_f32());
-        }
-    }
-    let _ = width;
-    let _ = height;
-    out
-}
-
-/// 把「已解码为线性 RGBA f32」的帧继续走 tonemap 得到 sRGB。
-/// 与 `tonemap_rgba16f_to_srgb` 共享三级判定 + Reinhard + 色域收敛逻辑。
-pub fn tonemap_linear_rgba_to_srgb(
-    linear: &[f32],
-    white_level_scale: f32,
-    exposure: f32,
-) -> (Vec<u8>, ToneMapPath) {
-    let stats = LuminanceStats::from_frame(linear);
-    let ws = if white_level_scale > 0.0 { white_level_scale } else { 1.0 };
-    let expo = if exposure > 0.0 { exposure } else { 1.0 };
-
-    let path = if stats.max <= 1.0 {
-        ToneMapPath::DirectSrgb
-    } else if stats.max / ws <= 1.0 {
-        ToneMapPath::DivideWhiteLevel
-    } else {
-        ToneMapPath::Reinhard
-    };
-
-    let auto_exposure = if path == ToneMapPath::Reinhard && stats.p999 > 0.0 {
-        (1.0 / stats.p999.max(1.0)).clamp(0.5, 1.5)
-    } else {
-        1.0
-    };
-
-    let parsed = linear.len() / 4;
-    let mut out: Vec<u8> = Vec::with_capacity(parsed * 4);
-
-    for px in linear.chunks_exact(4) {
-        let (mut r, mut g, mut b, a) = (px[0], px[1], px[2], px[3]);
-
-        match path {
-            ToneMapPath::DirectSrgb => {}
-            ToneMapPath::DivideWhiteLevel => {
-                r /= ws;
-                g /= ws;
-                b /= ws;
-            }
-            ToneMapPath::Reinhard => {
-                r = r / ws * auto_exposure * expo;
-                g = g / ws * auto_exposure * expo;
-                b = b / ws * auto_exposure * expo;
-                let l = luminance(r, g, b);
-                let l_tm = l / (1.0 + l);
-                let scale = if l > 1e-6 { l_tm / l } else { 1.0 };
-                r *= scale;
-                g *= scale;
-                b *= scale;
-                let (dr, dg, db) = desaturate(r, g, b);
-                r = dr;
-                g = dg;
-                b = db;
-            }
-        }
-
-        let enc = |c: f32| -> u8 {
-            let s = linear_to_srgb(c.clamp(0.0, 1.0));
-            (s * 255.0).round().clamp(0.0, 255.0) as u8
-        };
-        out.push(enc(r));
-        out.push(enc(g));
-        out.push(enc(b));
-        out.push((a.clamp(0.0, 1.0) * 255.0).round().clamp(0.0, 255.0) as u8);
-    }
-
-    (out, path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,27 +269,5 @@ mod tests {
         assert_eq!(out.len(), 4, "1x1 帧应输出 4 字节 RGBA");
     }
 
-    /// PQ 逆运算：单调递增，端点合理
-    #[test]
-    fn test_pq_to_linear_monotonic() {
-        let low = pq_to_linear(0);
-        let mid = pq_to_linear(512);
-        let high = pq_to_linear(1023);
-        assert!(low < 0.001, "PQ(0) 应接近 0，实际 {low}");
-        assert!(low < mid && mid < high, "PQ 应单调递增");
-    }
-
-    /// R10G10B10A2 解码：低 10 位 R、中 10 位 G、高 10 位 B、最高 2 位 A
-    #[test]
-    fn test_decode_r10g10b10a2() {
-        // R=1023(全亮), G=0, B=0, A=3
-        let packed: u32 = (3u32 << 30) | (0u32 << 20) | (0u32 << 10) | 1023u32;
-        let bytes = packed.to_le_bytes();
-        let out = decode_r10g10b10a2_pq(&bytes, 1, 1);
-        assert_eq!(out.len(), 4);
-        assert!(out[0] > 0.0, "R 通道应为亮值");
-        assert!(out[1] < 0.001, "G 通道应接近 0");
-        assert!(out[2] < 0.001, "B 通道应接近 0");
-        assert!((out[3] - 1.0).abs() < 1e-6, "A 通道应为 1.0");
-    }
+    // PQ 逆运算测试与 R10G10B10A2 解码测试随注入路径一并移至 injection 分支
 }

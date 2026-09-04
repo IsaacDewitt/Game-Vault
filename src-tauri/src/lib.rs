@@ -184,19 +184,13 @@ pub fn run() {
                     }
 
                     // 阶段 1：检查活跃会话，收集已结束的会话数据，然后释放 Tracker 锁
-                    let (finished, active) = {
+                    let finished = {
                         match tracker_arc.lock() {
-                            Ok(mut tracker) => {
-                                let finished = tracker.check_active_sessions();
-                                let active = tracker.get_active_games();
-                                (finished, active)
-                            }
+                            Ok(mut tracker) => tracker.check_active_sessions(),
                             Err(poisoned) => {
                                 // Mutex 中毒：恢复锁而非放弃
                                 let mut tracker = poisoned.into_inner();
-                                let finished = tracker.check_active_sessions();
-                                let active = tracker.get_active_games();
-                                (finished, active)
+                                tracker.check_active_sessions()
                             }
                         }
                     };
@@ -223,10 +217,6 @@ pub fn run() {
                     for session in &finished {
                         let _ = app_handle.emit("game-stopped", &session.game_id);
                     }
-
-                    if !active.is_empty() {
-                        let _ = app_handle.emit("active-games-updated", &active);
-                    }
                 }
             });
 
@@ -241,19 +231,25 @@ pub fn run() {
                 drop(db_guard);
 
                 if let Some(window) = app.get_webview_window("main") {
-                    // 边界检查：保存的窗口尺寸可能来自更大的显示器，防止窗口超出屏幕
+                    // 边界检查：保存的窗口尺寸可能来自更大的显示器，防止窗口超出屏幕。
+                    // 尺寸语义为逻辑像素（与设置页/tauri.conf.json 同口径），
+                    // work_area 是物理像素，需除以显示器缩放比再 clamp。
                     let clamped = match window.current_monitor() {
                         Ok(Some(monitor)) => {
-                            let wa = monitor.work_area();
-                            let w = (settings.window_width as i32)
-                                .clamp(900, wa.size.width.max(900) as i32) as u32;
-                            let h = (settings.window_height as i32)
-                                .clamp(600, wa.size.height.max(600) as i32) as u32;
-                            tauri::PhysicalSize::new(w, h)
+                            let sf = monitor.scale_factor();
+                            let wa = monitor.work_area().size;
+                            let max_w = ((wa.width as f64) / sf) as i32;
+                            let max_h = ((wa.height as f64) / sf) as i32;
+                            let w = (settings.window_width as i32).clamp(900, max_w.max(900)) as f64;
+                            let h = (settings.window_height as i32).clamp(600, max_h.max(600)) as f64;
+                            tauri::LogicalSize::new(w, h)
                         }
-                        _ => tauri::PhysicalSize::new(settings.window_width, settings.window_height),
+                        _ => tauri::LogicalSize::new(
+                            settings.window_width as f64,
+                            settings.window_height as f64,
+                        ),
                     };
-                    let _ = window.set_size(tauri::Size::Physical(clamped));
+                    let _ = window.set_size(tauri::Size::Logical(clamped));
                 }
             }
 
@@ -354,8 +350,6 @@ pub fn run() {
             commands::games::fetch_cover_options,
             commands::games::set_game_cover_from_url,
             commands::games::fetch_game_info_llm,
-            commands::games::read_cover_as_base64,
-            commands::games::read_covers_batch_as_base64,
             commands::games::rename_game,
             commands::games::update_exe_path,
             commands::games::export_game_data,

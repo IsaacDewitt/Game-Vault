@@ -40,8 +40,9 @@ export const useGamesStore = defineStore("games", () => {
       if (idx !== -1) {
         activeGames.value.splice(idx, 1);
       }
-      // 刷新游戏数据以更新时长
-      loadGames();
+      // 刷新游戏数据以更新时长。
+      // 轻量模式：游戏退出不会增删游戏/封面/类型，跳过全量封面与类型重扫
+      loadGames({ light: true });
     });
 
     // 监听封面获取进度事件
@@ -119,7 +120,8 @@ export const useGamesStore = defineStore("games", () => {
   // 方法
   let loadGamesLock = false;
   let pendingRefresh = false;
-  async function loadGames() {
+  /** 拉取游戏列表。light=true 时跳过封面/类型全量重扫（仅时长等字段变化时用） */
+  async function loadGames(opts?: { light?: boolean }) {
     if (loadGamesLock) {
       pendingRefresh = true;
       return;
@@ -132,8 +134,10 @@ export const useGamesStore = defineStore("games", () => {
         sort_by: "last_played",
         sort_order: "desc",
       });
-      await loadAllCovers();
-      await loadAllGenres();
+      if (!opts?.light) {
+        await loadAllCovers();
+        await loadAllGenres();
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       error.value = `加载游戏列表失败: ${msg}`;

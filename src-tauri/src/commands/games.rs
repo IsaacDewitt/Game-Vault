@@ -89,6 +89,11 @@ pub fn toggle_favorite(
 }
 
 /// 删除游戏
+///
+/// 语义拍板（2026-09-04）：删除只表示「从库中移除条目」，play_stats_daily/hourly
+/// 的历史汇总**有意保留**（通关后移除条目、历史统计留念）。因此删除后
+/// SUM(play_stats_daily) >= SUM(games.play_time_seconds)，差额即已删游戏的历史时长——
+/// 这是有意设计，不是数据错误，后续维护时不要"修复"这个差值。
 #[tauri::command]
 pub fn delete_game(
     db: State<'_, Arc<Mutex<Database>>>,
@@ -681,42 +686,6 @@ pub fn update_game_meta(
     Ok(game)
 }
 
-/// 根据文件扩展名检测图片 MIME 类型
-fn detect_image_mime(path: &std::path::Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref() {
-        Some("png") => "image/png",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("svg") => "image/svg+xml",
-        _ => "image/jpeg", // 默认 jpeg（包括 .jpg）
-    }
-}
-
-/// 读取本地图片文件并返回 base64 data URL（绕过 asset protocol）
-/// 仅允许读取 covers 目录下的文件，防止路径遍历攻击
-#[tauri::command]
-pub fn read_cover_as_base64(path: String) -> Result<String, String> {
-    use base64::Engine as _;
-
-    let file_path = std::path::Path::new(&path);
-
-    // 安全检查：验证路径在 covers 目录下（防止路径遍历）
-    let covers_dir = utils::path::get_covers_dir();
-    let canonical_covers = covers_dir.canonicalize()
-        .unwrap_or(covers_dir.clone());
-    let canonical_file = file_path.canonicalize()
-        .map_err(|_| format!("文件不存在: {}", path))?;
-
-    if !canonical_file.starts_with(&canonical_covers) {
-        return Err("不允许读取 covers 目录之外的文件".to_string());
-    }
-
-    let bytes = std::fs::read(&canonical_file).map_err(|e| format!("读取文件失败: {}", e))?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let mime = detect_image_mime(&canonical_file);
-    Ok(format!("data:{};base64,{}", mime, b64))
-}
-
 /// 重命名游戏
 #[tauri::command]
 pub fn rename_game(
@@ -909,41 +878,6 @@ pub fn get_all_genres(
     db.get_all_genres().map_err(|e| e.to_string())
 }
 
-/// 批量读取封面图片为 base64 data URL（减少 IPC 调用次数）
-/// 仅允许读取 covers 目录下的文件
-#[tauri::command]
-pub fn read_covers_batch_as_base64(paths: Vec<String>) -> Result<std::collections::HashMap<String, String>, String> {
-    use base64::Engine as _;
-
-    let covers_dir = utils::path::get_covers_dir();
-    let canonical_covers = covers_dir.canonicalize()
-        .unwrap_or(covers_dir.clone());
-
-    let mut result = std::collections::HashMap::new();
-
-    for path in paths {
-        let file_path = std::path::Path::new(&path);
-
-        // 安全检查
-        let canonical_file = match file_path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => continue, // 文件不存在，跳过
-        };
-
-        if !canonical_file.starts_with(&canonical_covers) {
-            continue; // 不在 covers 目录下，跳过
-        }
-
-        if let Ok(bytes) = std::fs::read(&canonical_file) {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            let mime = detect_image_mime(&canonical_file);
-            result.insert(path, format!("data:{};base64,{}", mime, b64));
-        }
-    }
-
-    Ok(result)
-}
-
 /// 打开存档路径（在文件管理器中）
 /// 如果精确路径不存在，自动向上查找存在的游戏级父文件夹并打开
 #[tauri::command]
@@ -1122,7 +1056,8 @@ fn add_path_to_zip(
         };
 
         let options = FileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+            .compression_method(zip::CompressionMethod::Deflated)
+            .large_file(true); // 存档目录常有 >4GB 文件，必须启用 zip64
         zip.start_file(&zip_path, options)
             .map_err(|e| format!("创建 ZIP 文件条目失败: {}", e))?;
         let mut file = std::fs::File::open(current_path)
@@ -1153,7 +1088,18 @@ pub async fn export_saves_backup(
         db_guard.get_games(&filter).map_err(|e| e.to_string())?
     };
 
-    let file = std::fs::File::create(&export_path)
+    // ZIP 打包是大文件密集 I/O，放阻塞线程池执行，避免长时间占死 async 运行时线程
+    tauri::async_runtime::spawn_blocking(move || export_saves_backup_sync(&games, &export_path))
+        .await
+        .map_err(|e| format!("导出任务执行失败: {}", e))?
+}
+
+/// 导出存档备份的同步实现（在阻塞线程池中运行）
+fn export_saves_backup_sync(
+    games: &[Game],
+    export_path: &str,
+) -> Result<serde_json::Value, String> {
+    let file = std::fs::File::create(export_path)
         .map_err(|e| format!("创建 ZIP 文件失败: {}", e))?;
     let buf_writer = std::io::BufWriter::new(file);
     let mut zip = zip::ZipWriter::new(buf_writer);
@@ -1162,7 +1108,7 @@ pub async fn export_saves_backup(
     let mut exported_count = 0u32;
     let mut errors: Vec<String> = Vec::new();
 
-    for game in &games {
+    for game in games {
         if game.save_paths.is_empty() {
             continue;
         }
@@ -1208,7 +1154,7 @@ pub async fn export_saves_backup(
     // 写入 manifest.json
     use std::io::Write;
     use zip::write::FileOptions;
-    let options = FileOptions::default();
+    let options = FileOptions::default().large_file(true);
     zip.start_file("manifest.json", options)
         .map_err(|e| format!("创建 manifest 失败: {}", e))?;
     let manifest_json = serde_json::to_string_pretty(&manifest)
@@ -1229,7 +1175,15 @@ pub async fn export_saves_backup(
 pub async fn import_saves_backup(
     zip_path: String,
 ) -> Result<serde_json::Value, String> {
-    let file = std::fs::File::open(&zip_path)
+    // 解压同样是文件密集 I/O，放阻塞线程池执行
+    tauri::async_runtime::spawn_blocking(move || import_saves_backup_sync(&zip_path))
+        .await
+        .map_err(|e| format!("导入任务执行失败: {}", e))?
+}
+
+/// 导入存档备份的同步实现（在阻塞线程池中运行）
+fn import_saves_backup_sync(zip_path: &str) -> Result<serde_json::Value, String> {
+    let file = std::fs::File::open(zip_path)
         .map_err(|e| format!("打开 ZIP 文件失败: {}", e))?;
     let buf_reader = std::io::BufReader::new(file);
     let mut archive = zip::ZipArchive::new(buf_reader)

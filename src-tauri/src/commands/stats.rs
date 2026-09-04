@@ -39,13 +39,9 @@ pub fn get_overview_stats(
     // 本月时长：直接按本地时区的年月聚合（不依赖 30 天窗口的隐含假设）
     let monthly_seconds = db.get_monthly_play_time().map_err(|e| e.to_string())?;
 
-    // 今日时长：查询近 30 天数据中今天的记录
+    // 今日时长：直接按本地日期查日汇总（不再为取一条数据拉全 30 天）
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let daily_stats = db.get_daily_stats(30).map_err(|e| e.to_string())?;
-    let today_seconds = daily_stats.iter()
-        .find(|s| s.date == today)
-        .map(|s| s.total_seconds)
-        .unwrap_or(0);
+    let today_seconds = db.get_day_play_time(&today).unwrap_or(0);
 
     Ok(serde_json::json!({
         "game_count": game_count,

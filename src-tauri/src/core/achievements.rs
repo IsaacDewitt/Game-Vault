@@ -78,12 +78,10 @@ impl AchievementEngine {
         defs.extend(Self::single("G-20", "出去走走", "global", "fun", "连续 30 天没打开任何游戏（世界很精彩）", "🚪", 30));
         defs.extend(Self::single("G-21", "积灰如山", "global", "fun", "库中 20 款游戏从未启动（Backlog of Shame）", "🕸️", 20));
         defs.extend(Self::single("G-22", "三分钟热度", "global", "fun", "5 款游戏都玩过、但每款不足 1 小时", "🔥", 5));
-        defs.extend(Self::single("G-23", "万年迟到", "global", "fun", "启动一款入库超 1 年却从未玩过的游戏", "⏰", 1));
         defs.extend(Self::single("G-24", "摸鱼大师", "global", "fun", "某款游戏时长已超 HLTB 主线参考，却仍标「未通关」", "🐟", 1));
         defs.extend(Self::single("G-25", "博古通今", "global", "collect", "库中 5 款发行于 20 年前的老游戏", "🏺", 5));
         defs.extend(Self::single("G-26", "类型图鉴", "global", "collect", "覆盖 10 种不同游戏类型", "🧩", 10));
         defs.extend(Self::single("G-27", "厂商死忠", "global", "collect", "同一开发商拥有 5 款游戏", "🏭", 5));
-        defs.extend(Self::tiered("G-28", "硬盘终结者", "global", "collect", "游戏 exe 文件总大小达 10 / 50 / 100 GB", "💽", &[10, 50, 100]));
         defs.extend(Self::single("G-29", "全员启动", "global", "challenge", "库中每款游戏都启动过至少一次", "🎯", 1));
         defs.extend(Self::single("G-30", "肝帝一日", "global", "challenge", "单日游玩达 12 小时", "🌋", 43200));
         defs.extend(Self::single("G-31", "百小时俱乐部", "global", "challenge", "3 款游戏各累计 100 小时以上", "💯", 3));
@@ -95,6 +93,7 @@ impl AchievementEngine {
         defs.extend(Self::single("G-37", "全勤奖", "global", "fun", "一周 7 天，天天都有游玩记录", "📅", 1));
         defs.extend(Self::single("G-38", "久别重逢", "global", "fun", "重玩一款超过 180 天没启动的游戏", "🤝", 1));
         defs.extend(Self::single("G-39", "养老玩家", "global", "progress", "游戏库建立满 1 年", "🧓", 365));
+        defs.extend(Self::tiered("G-40", "手账作家", "global", "collect", "为 5 / 15 / 30 款游戏写下评价（游戏手账）", "✍️", &[5, 15, 30]));
 
         // ==================== 单游戏成就（每款游戏独立结算） ====================
         defs.extend(Self::single("P-01", "破冰", "pergame", "progress", "首次启动这款游戏", "🧊", 1));
@@ -139,12 +138,10 @@ impl AchievementEngine {
             "G-20" => (s.days_since_last_play, s.total_sessions > 0 && s.days_since_last_play >= def.target),
             "G-21" => (s.unplayed_count, s.unplayed_count >= def.target),
             "G-22" => (s.played_under_1h_count, s.played_under_1h_count >= def.target),
-            "G-23" => (s.late_bloomer_count, s.late_bloomer_count >= def.target),
             "G-24" => (s.over_main_not_completed_count, s.over_main_not_completed_count >= def.target),
             "G-25" => (s.old_game_count, s.old_game_count >= def.target),
             "G-26" => (s.distinct_genre_count, s.distinct_genre_count >= def.target),
             "G-27" => (s.max_dev_count, s.max_dev_count >= def.target),
-            "G-28" => (s.total_exe_size_gb, s.total_exe_size_gb >= def.target),
             "G-29" => {
                 let done = s.game_count > 0 && s.unplayed_count == 0;
                 (done as u64, done)
@@ -159,6 +156,7 @@ impl AchievementEngine {
             "G-37" => (s.has_full_week as u64, s.has_full_week),
             "G-38" => (s.long_gap_replay as u64, s.long_gap_replay),
             "G-39" => (s.days_since_first_add, s.days_since_first_add >= def.target),
+            "G-40" => (s.review_written_count, s.review_written_count >= def.target),
             _ => (0, false),
         };
         (progress, satisfied)
@@ -202,10 +200,21 @@ impl AchievementEngine {
         let now = chrono::Utc::now().to_rfc3339();
         let mut events = Vec::new();
 
+        // 先取已解锁集合做内存过滤：绝大多数成就早已解锁，
+        // 避免每次评估对 73 + 16×N 条目逐条发 INSERT OR IGNORE（每条都是一个写事务）
+        let unlocked_set: std::collections::HashSet<(String, String)> = db
+            .get_achievement_unlocks()?
+            .into_iter()
+            .map(|u| (u.achievement_id, u.game_id))
+            .collect();
+
         // 全局成就
         for def in defs.iter().filter(|d| d.scope == "global") {
             let (_, satisfied) = Self::eval_global(def, &global_stats);
-            if satisfied && db.try_unlock_achievement(&def.id, "", &now)? {
+            if satisfied
+                && !unlocked_set.contains(&(def.id.clone(), String::new()))
+                && db.try_unlock_achievement(&def.id, "", &now)?
+            {
                 events.push(UnlockEvent {
                     def: def.clone(),
                     game_id: None,
@@ -217,7 +226,10 @@ impl AchievementEngine {
         for gs in &per_game_stats {
             for def in defs.iter().filter(|d| d.scope == "pergame") {
                 let (_, satisfied) = Self::eval_per_game(def, gs);
-                if satisfied && db.try_unlock_achievement(&def.id, &gs.game_id, &now)? {
+                if satisfied
+                    && !unlocked_set.contains(&(def.id.clone(), gs.game_id.clone()))
+                    && db.try_unlock_achievement(&def.id, &gs.game_id, &now)?
+                {
                     events.push(UnlockEvent {
                         def: def.clone(),
                         game_id: Some(gs.game_id.clone()),
@@ -322,13 +334,13 @@ mod tests {
                 "成就 {} 的目标值无效", def.base_id);
         }
 
-        // 数量与设计一致：全局 39 条基础 + 单游戏 16 条基础
+        // 数量与设计一致：全局 38 条基础 + 单游戏 16 条基础
         let global_bases: std::collections::HashSet<&str> =
             defs.iter().filter(|d| d.scope == "global").map(|d| d.base_id.as_str()).collect();
         let pergame_bases: std::collections::HashSet<&str> =
             defs.iter().filter(|d| d.scope == "pergame").map(|d| d.base_id.as_str()).collect();
-        assert_eq!(global_bases.len(), 39, "全局成就基础数应为 39");
+        assert_eq!(global_bases.len(), 38, "全局成就基础数应为 38");
         assert_eq!(pergame_bases.len(), 16, "单游戏成就基础数应为 16");
-        assert_eq!(defs.len(), 73, "展平后成就记录总数应为 73");
+        assert_eq!(defs.len(), 72, "展平后成就记录总数应为 72");
     }
 }

@@ -97,10 +97,12 @@ pub fn set_window_size(
     width: u32,
     height: u32,
 ) -> Result<(), String> {
-    // 调整窗口大小
+    // 调整窗口大小。
+    // 用逻辑尺寸：前端输入的是逻辑像素（与 tauri.conf.json 的 width/height 同口径），
+    // 直接当物理像素用会在高 DPI 缩放屏上得到比预期小的窗口。
     if let Some(window) = app.get_webview_window("main") {
-        let size = tauri::PhysicalSize::new(width, height);
-        window.set_size(tauri::Size::Physical(size)).map_err(|e| e.to_string())?;
+        let size = tauri::LogicalSize::new(width as f64, height as f64);
+        window.set_size(tauri::Size::Logical(size)).map_err(|e| e.to_string())?;
     }
 
     // 持久化到数据库

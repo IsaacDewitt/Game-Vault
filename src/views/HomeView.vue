@@ -366,7 +366,11 @@ async function handleToggleCompleted(gameId: string) {
   const game = store.games.find((g) => g.id === gameId);
   if (!game) return;
 
-  const newStatus = game.status === "completed" ? "unplayed" : "completed";
+  // 取消通关时按游玩时长还原状态：玩过 → 游玩中，没玩过 → 未游玩
+  // （与统计页「有时长即视为游玩中」的推导口径一致，避免一律退回未游玩）
+  const newStatus = game.status === "completed"
+    ? (game.play_time_seconds > 0 ? "playing" : "unplayed")
+    : "completed";
   try {
     await store.setGameStatus(gameId, newStatus);
     message.success(newStatus === "completed" ? "已标记为通关" : "已取消通关状态");
