@@ -6,6 +6,7 @@ pub mod llm_fetcher;
 pub mod achievements;
 pub mod capture;
 pub mod tonemap;
+pub mod sdr_white;
 pub mod screenshot;
 
 pub use database::Database;

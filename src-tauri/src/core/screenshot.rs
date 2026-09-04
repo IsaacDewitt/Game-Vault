@@ -92,21 +92,24 @@ pub fn capture_and_save(
     screenshot_dir: &str,
 ) -> anyhow::Result<ScreenshotResult> {
     let frame = crate::core::capture::capture_window_fp16(hwnd)?;
+
+    // 查询窗口所在显示器的真实 SDR 白电平（HDR 滑块 80~480nits，默认 80）。
+    // 硬编码 1.0 会在滑块偏离默认时截图偏暗（<80nits）或误判为 HDR 压灰（>80nits）。
+    let white_level_scale = crate::core::sdr_white::sdr_white_scale_for_window(hwnd);
+
     tracing::info!(
-        "WGC 抓到帧 {}x{} ({} bytes Rgba16F)",
+        "WGC 抓到帧 {}x{} ({} bytes Rgba16F, sdr_white={:.3})",
         frame.width,
         frame.height,
-        frame.rgba16f.len()
+        frame.rgba16f.len(),
+        white_level_scale
     );
 
-    let white_level_scale = 1.0f32;
-    let exposure = 1.0f32;
     let (srgb, tone_path) = tonemap::tonemap_rgba16f_to_srgb(
         &frame.rgba16f,
         frame.width,
         frame.height,
         white_level_scale,
-        exposure,
     );
 
     save_srgb_png(&srgb, frame.width, frame.height, process_name, screenshot_dir, tone_path)

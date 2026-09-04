@@ -60,9 +60,11 @@ half = "2"
 png = "0.17"
 tauri-plugin-global-shortcut = "2"
 
-# 提示音播放（PlaySoundW，截图快门/完成/错误音）
+# 提示音播放（PlaySoundW）+ SDR 白电平查询（DisplayConfig / Monitor API）
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
+    "Win32_Devices_Display",
+    "Win32_Graphics_Gdi",
 ] }
 
