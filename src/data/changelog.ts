@@ -6,6 +6,16 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "0.7.0",
+    date: "2026-09-04",
+    changes: [
+      "游戏手账支持中文名自动拉取封面：LLM 识别官方英文名，用英文名检索 SteamGridDB，中文名也能拉到正确封面",
+      "手账条目新增「英文名」字段，卡片与详情优先展示英文名，中文名保留在数据中",
+      "详情抽屉支持手动编辑中文名与英文名（清空英文名保存即清除，改完点「刷新信息」重新拉封面）",
+      "手账搜索同时匹配中文名与英文名，输入 Hollow Knight 也能找到「空洞骑士」",
+    ],
+  },
+  {
     version: "0.6.0",
     date: "2026-09-02",
     changes: [

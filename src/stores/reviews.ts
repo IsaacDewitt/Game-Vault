@@ -4,6 +4,11 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import type { Review } from "../lib/tauri";
 import * as api from "../lib/tauri";
 
+/** 界面展示名：英文名优先（中英文名都搜，展示纯英文策略） */
+export function displayName(r: { name: string; name_en?: string | null }): string {
+  return (r.name_en && r.name_en.trim()) || r.name;
+}
+
 export const useReviewsStore = defineStore("reviews", () => {
   // 状态
   const reviews = ref<Review[]>([]);
@@ -23,10 +28,14 @@ export const useReviewsStore = defineStore("reviews", () => {
   const filteredReviews = computed(() => {
     let result = [...reviews.value];
 
-    // 搜索
+    // 搜索（中英文名都匹配）
     if (searchQuery.value) {
       const query = searchQuery.value.toLowerCase();
-      result = result.filter((r) => r.name.toLowerCase().includes(query));
+      result = result.filter(
+        (r) =>
+          r.name.toLowerCase().includes(query) ||
+          (r.name_en || "").toLowerCase().includes(query)
+      );
     }
 
     // 状态筛选
@@ -46,7 +55,11 @@ export const useReviewsStore = defineStore("reviews", () => {
     const order = sortOrder.value === "asc" ? 1 : -1;
     switch (sortBy.value) {
       case "name":
-        result.sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN") * order);
+        // 展示名排序（英文名优先，与界面显示一致）
+        result.sort(
+          (a, b) =>
+            displayName(a).localeCompare(displayName(b), "zh-Hans-CN") * order
+        );
         break;
       case "rating":
         result.sort((a, b) => {

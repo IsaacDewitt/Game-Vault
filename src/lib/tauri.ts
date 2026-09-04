@@ -423,6 +423,8 @@ export async function getScreenshotHotkeyStatus(): Promise<string | null> {
 export interface Review {
   id: string;
   name: string;
+  /** 官方英文名（LLM 拉取或手动填写；SteamGridDB 检索与展示优先用） */
+  name_en: string | null;
   /** 本地封面缓存文件路径 */
   cover_local: string | null;
   cover_url: string | null;
@@ -474,6 +476,8 @@ export async function refreshReviewInfo(reviewId: string): Promise<Review> {
 
 export interface ReviewMetaInput {
   name?: string | null;
+  /** 传空字符串表示清除英文名 */
+  name_en?: string | null;
   description?: string | null;
   developer?: string | null;
   publisher?: string | null;

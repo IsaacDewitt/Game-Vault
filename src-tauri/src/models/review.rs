@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct Review {
     pub id: String,
     pub name: String,
+    /// 官方英文名称（LLM 拉取或手动填写；用于 SteamGridDB 检索，展示时优先于 name）
+    pub name_en: Option<String>,
     /// 本地封面缓存文件路径（如 covers/{uuid}.jpg）
     pub cover_local: Option<String>,
     pub cover_url: Option<String>,
@@ -35,6 +37,7 @@ impl Review {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             name,
+            name_en: None,
             cover_local: None,
             cover_url: None,
             description: None,

@@ -40,6 +40,9 @@ pub struct LlmGameMeta {
     /// LLM 纠正后的完整游戏名称（与原始输入语言一致）
     #[serde(default)]
     pub name: Option<String>,
+    /// 游戏官方英文名称（用于 SteamGridDB 等图库检索；输入为英文时与 name 相同）
+    #[serde(default)]
+    pub name_en: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -567,6 +570,7 @@ fn build_system_prompt() -> String {
      JSON 格式如下：\n\
      {\n\
        \"name\": \"游戏的完整正式名称\",\n\
+       \"name_en\": \"游戏的官方英文名称\",\n\
        \"description\": \"游戏的简短描述（中文，100字以内）\",\n\
        \"developer\": \"开发商名称\",\n\
        \"publisher\": \"发行商名称\",\n\
@@ -582,6 +586,7 @@ fn build_system_prompt() -> String {
      示例输出：\n\
      {\n\
        \"name\": \"空洞骑士\",\n\
+       \"name_en\": \"Hollow Knight\",\n\
        \"description\": \"Team Cherry 开发的 2D 类银河战士恶魔城游戏，玩家将探索庞大的地下昆虫王国，对抗被感染的生物，揭开远古秘密。\",\n\
        \"developer\": \"Team Cherry\",\n\
        \"publisher\": \"Team Cherry\",\n\
@@ -596,6 +601,7 @@ fn build_system_prompt() -> String {
      注意事项：\n\
      - 如果用户输入的名称是缩写、不完整或有误，请返回该游戏最正确、最完整的正式名称，语言与用户输入保持一致\n\
      - 如果名称已经是正确的，也请返回完整的正式名称\n\
+     - name_en 必须是该游戏在 Steam 等平台使用的官方英文名称（无论用户输入何种语言都要提供），确实没有官方英文名时填 null\n\
      - 某项信息确实无法确定时，填 null\n\
      - genres 不确定时填空数组 []\n\
      - release_date 必须严格使用 YYYY-MM-DD 格式\n\
@@ -623,6 +629,12 @@ fn sanitize_meta(mut meta: LlmGameMeta) -> LlmGameMeta {
         *name = name.trim().to_string();
         if name.is_empty() {
             meta.name = None;
+        }
+    }
+    if let Some(ref mut name_en) = meta.name_en {
+        *name_en = name_en.trim().to_string();
+        if name_en.is_empty() {
+            meta.name_en = None;
         }
     }
     if let Some(ref mut desc) = meta.description {
@@ -971,6 +983,7 @@ mod tests {
     fn test_sanitize_meta() {
         let meta = LlmGameMeta {
             name: Some("  测试游戏  ".to_string()),
+            name_en: Some("  Test Game  ".to_string()),
             description: Some("  一个测试  ".to_string()),
             developer: Some("Dev".to_string()),
             publisher: Some("Pub".to_string()),
@@ -983,6 +996,7 @@ mod tests {
         };
         let meta = sanitize_meta(meta);
         assert_eq!(meta.name.unwrap(), "测试游戏");
+        assert_eq!(meta.name_en.unwrap(), "Test Game");
         assert_eq!(meta.release_date.unwrap(), "2024-03-15");
         assert_eq!(meta.hltb_main_story, Some(1560));
         assert_eq!(meta.hltb_main_extra, None); // 0 被过滤

@@ -101,6 +101,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS reviews (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
+                name_en TEXT,
                 cover_local TEXT,
                 cover_url TEXT,
                 description TEXT,
@@ -136,6 +137,9 @@ impl Database {
 
         // 迁移：为旧数据库添加 status 字段（必须在索引创建之前）
         self.migrate_add_status_column()?;
+
+        // 迁移：为旧手账数据库添加英文名字段
+        self.migrate_add_review_name_en_column()?;
 
         // 迁移：为旧数据库添加 HLTB 字段
         self.migrate_add_hltb_columns()?;
@@ -188,6 +192,19 @@ impl Database {
     }
 
     // ==================== 辅助函数 ====================
+
+    /// 迁移：为旧数据库的 reviews 表添加 name_en（官方英文名）字段
+    fn migrate_add_review_name_en_column(&self) -> Result<()> {
+        if !self.has_column("reviews", "name_en")? {
+            tracing::info!("reviews.name_en 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE reviews ADD COLUMN name_en TEXT",
+                [],
+            )?;
+            tracing::info!("已添加 name_en 字段到 reviews 表");
+        }
+        Ok(())
+    }
 
     /// 检查表中是否存在指定列
     /// 注意：PRAGMA 不支持参数化查询，table/column 参数必须为内部硬编码值，不可来自用户输入
@@ -490,36 +507,37 @@ impl Database {
 
     /// 从数据库行构建 Review 对象
     /// 列顺序必须与 REVIEW_COLUMNS 完全一致：
-    /// 0:id 1:name 2:cover_local 3:cover_url 4:description 5:developer
-    /// 6:publisher 7:release_date 8:genres 9:hltb_main_story 10:hltb_main_extra
-    /// 11:hltb_completionist 12:rating 13:review 14:status 15:added_at 16:updated_at
+    /// 0:id 1:name 2:name_en 3:cover_local 4:cover_url 5:description 6:developer
+    /// 7:publisher 8:release_date 9:genres 10:hltb_main_story 11:hltb_main_extra
+    /// 12:hltb_completionist 13:rating 14:review 15:status 16:added_at 17:updated_at
     fn row_to_review(row: &rusqlite::Row) -> rusqlite::Result<Review> {
-        let genres_str: String = row.get(8)?;
+        let genres_str: String = row.get(9)?;
         let genres: Vec<String> = serde_json::from_str(&genres_str).unwrap_or_default();
 
         Ok(Review {
             id: row.get(0)?,
             name: row.get(1)?,
-            cover_local: row.get(2)?,
-            cover_url: row.get(3)?,
-            description: row.get(4)?,
-            developer: row.get(5)?,
-            publisher: row.get(6)?,
-            release_date: row.get(7)?,
+            name_en: row.get(2)?,
+            cover_local: row.get(3)?,
+            cover_url: row.get(4)?,
+            description: row.get(5)?,
+            developer: row.get(6)?,
+            publisher: row.get(7)?,
+            release_date: row.get(8)?,
             genres,
-            hltb_main_story: row.get::<_, Option<i64>>(9)?.map(|v| v.max(0) as u32),
-            hltb_main_extra: row.get::<_, Option<i64>>(10)?.map(|v| v.max(0) as u32),
-            hltb_completionist: row.get::<_, Option<i64>>(11)?.map(|v| v.max(0) as u32),
-            rating: row.get::<_, Option<i64>>(12)?.map(|v| v.max(0) as u32),
-            review: row.get(13)?,
-            status: row.get(14)?,
-            added_at: row.get(15)?,
-            updated_at: row.get(16)?,
+            hltb_main_story: row.get::<_, Option<i64>>(10)?.map(|v| v.max(0) as u32),
+            hltb_main_extra: row.get::<_, Option<i64>>(11)?.map(|v| v.max(0) as u32),
+            hltb_completionist: row.get::<_, Option<i64>>(12)?.map(|v| v.max(0) as u32),
+            rating: row.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u32),
+            review: row.get(14)?,
+            status: row.get(15)?,
+            added_at: row.get(16)?,
+            updated_at: row.get(17)?,
         })
     }
 
     const REVIEW_COLUMNS: &'static str = "
-        id, name, cover_local, cover_url, description, developer,
+        id, name, name_en, cover_local, cover_url, description, developer,
         publisher, release_date, genres, hltb_main_story, hltb_main_extra,
         hltb_completionist, rating, review, status, added_at, updated_at
     ";
@@ -528,15 +546,16 @@ impl Database {
     pub fn insert_review(&self, review: &Review) -> Result<()> {
         self.conn.execute(
             "INSERT INTO reviews (
-                id, name, cover_local, cover_url, description, developer,
+                id, name, name_en, cover_local, cover_url, description, developer,
                 publisher, release_date, genres, hltb_main_story, hltb_main_extra,
                 hltb_completionist, rating, review, status, added_at, updated_at
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
             )",
             params![
                 review.id,
                 review.name,
+                review.name_en,
                 review.cover_local,
                 review.cover_url,
                 review.description,
@@ -561,14 +580,15 @@ impl Database {
     pub fn update_review(&self, review: &Review) -> Result<()> {
         self.conn.execute(
             "UPDATE reviews SET
-                name = ?1, description = ?2,
-                developer = ?3, publisher = ?4, release_date = ?5,
-                genres = ?6, hltb_main_story = ?7, hltb_main_extra = ?8,
-                hltb_completionist = ?9, rating = ?10, review = ?11,
-                status = ?12, updated_at = ?13
-             WHERE id = ?14",
+                name = ?1, name_en = ?2, description = ?3,
+                developer = ?4, publisher = ?5, release_date = ?6,
+                genres = ?7, hltb_main_story = ?8, hltb_main_extra = ?9,
+                hltb_completionist = ?10, rating = ?11, review = ?12,
+                status = ?13, updated_at = ?14
+             WHERE id = ?15",
             params![
                 review.name,
+                review.name_en,
                 review.description,
                 review.developer,
                 review.publisher,
@@ -594,8 +614,17 @@ impl Database {
         let mut bind_values: Vec<String> = Vec::new();
 
         if let Some(ref search) = filter.search {
-            sql.push_str(&format!(" AND name LIKE ?{} ESCAPE '\\'", bind_values.len() + 1));
-            bind_values.push(format!("%{}%", escape_like(search)));
+            // 中英文名都搜：中文名条目用英文名也能命中
+            let idx1 = bind_values.len() + 1;
+            let idx2 = bind_values.len() + 2;
+            sql.push_str(&format!(
+                " AND (name LIKE ?{i1} ESCAPE '\\' OR name_en LIKE ?{i2} ESCAPE '\\')",
+                i1 = idx1,
+                i2 = idx2
+            ));
+            let like = format!("%{}%", escape_like(search));
+            bind_values.push(like.clone());
+            bind_values.push(like);
         }
         if let Some(ref status) = filter.status {
             if !status.is_empty() {

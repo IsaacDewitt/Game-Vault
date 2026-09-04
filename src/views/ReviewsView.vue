@@ -32,7 +32,7 @@ import {
   GameControllerOutline,
 } from "@vicons/ionicons5";
 import { useDebounceFn } from "@vueuse/core";
-import { useReviewsStore } from "../stores/reviews";
+import { useReviewsStore, displayName } from "../stores/reviews";
 import { useGamesStore } from "../stores/games";
 import type { CoverOption } from "../lib/tauri";
 import { DEBOUNCE_MS } from "../lib/constants";
@@ -149,6 +149,7 @@ async function confirmAdd() {
 
 const showDetail = ref(false);
 const editingName = ref("");
+const editingNameEn = ref("");
 const ratingInput = ref<number | null>(null);
 const reviewText = ref("");
 const savingReview = ref(false);
@@ -158,6 +159,7 @@ const selected = computed(() => store.selectedReview);
 function openDetail(review: (typeof store.reviews)[number]) {
   store.selectReview(review);
   editingName.value = review.name;
+  editingNameEn.value = review.name_en ?? "";
   ratingInput.value = review.rating;
   reviewText.value = review.review ?? "";
   showDetail.value = true;
@@ -202,7 +204,7 @@ async function saveReviewText() {
   }
 }
 
-/** 改名 */
+/** 改中文名 */
 async function saveName() {
   if (!selected.value) return;
   const name = editingName.value.trim();
@@ -210,6 +212,20 @@ async function saveName() {
   try {
     await store.updateMeta(selected.value.id, { name });
     message.success("名称已更新");
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e));
+  }
+}
+
+/** 改英文名（清空即清除；SteamGridDB 封面检索用） */
+async function saveNameEn() {
+  if (!selected.value) return;
+  const trimmed = editingNameEn.value.trim();
+  const current = selected.value.name_en ?? "";
+  if (trimmed === current) return;
+  try {
+    await store.updateMeta(selected.value.id, { name_en: trimmed });
+    message.success(trimmed ? "英文名已更新，点「刷新信息」可重新拉取封面" : "英文名已清除");
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e));
   }
@@ -229,7 +245,7 @@ async function handleSetStatus(status: string) {
 async function handleRefreshInfo(review: (typeof store.reviews)[number]) {
   try {
     await store.refreshReviewInfo(review.id);
-    message.success(`《${review.name}》信息已刷新`);
+    message.success(`《${displayName(review)}》信息已刷新`);
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e));
   }
@@ -239,7 +255,7 @@ async function handleRefreshInfo(review: (typeof store.reviews)[number]) {
 function confirmDelete(review: (typeof store.reviews)[number]) {
   dialog.warning({
     title: "删除手账",
-    content: `确定删除《${review.name}》吗？此操作不可恢复。`,
+    content: `确定删除《${displayName(review)}》吗？此操作不可恢复。`,
     positiveText: "删除",
     negativeText: "取消",
     onPositiveClick: async () => {
@@ -468,7 +484,7 @@ onMounted(async () => {
                   {{ statusMeta[review.status]?.label }}
                 </div>
               </div>
-              <div class="card-name" :title="review.name">{{ review.name }}</div>
+              <div class="card-name" :title="displayName(review)">{{ displayName(review) }}</div>
             </div>
           </div>
         </template>
@@ -550,19 +566,34 @@ onMounted(async () => {
           </div>
 
           <!-- 名称与状态 -->
-          <div class="detail-name-row">
-            <n-input
-              v-model:value="editingName"
-              size="large"
-              placeholder="游戏名称"
-              @blur="saveName"
-              @keyup.enter="saveName"
-            />
-            <n-button size="large" type="primary" ghost @click="saveName">
-              <template #icon>
-                <n-icon :component="CreateOutline" />
-              </template>
-            </n-button>
+          <div class="detail-name-block">
+            <div class="detail-name-row">
+              <n-input
+                v-model:value="editingName"
+                size="large"
+                placeholder="游戏名称"
+                @blur="saveName"
+                @keyup.enter="saveName"
+              />
+              <n-button size="large" type="primary" ghost @click="saveName">
+                <template #icon>
+                  <n-icon :component="CreateOutline" />
+                </template>
+              </n-button>
+            </div>
+            <div class="detail-name-row name-en-row">
+              <n-input
+                v-model:value="editingNameEn"
+                placeholder="英文名（封面检索用，留空保存即清除）"
+                @blur="saveNameEn"
+                @keyup.enter="saveNameEn"
+              />
+              <n-button size="small" type="primary" ghost @click="saveNameEn">
+                <template #icon>
+                  <n-icon :component="CreateOutline" />
+                </template>
+              </n-button>
+            </div>
           </div>
           <n-button-group class="status-segmented">
             <n-button
@@ -912,10 +943,21 @@ onMounted(async () => {
   padding: 16px 8px 8px;
 }
 
+.detail-name-block {
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .detail-name-row {
   display: flex;
   gap: 8px;
-  margin-bottom: 12px;
+  margin-bottom: 0;
+}
+
+.name-en-row .n-input {
+  font-style: italic;
 }
 
 .status-segmented {

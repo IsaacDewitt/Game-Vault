@@ -61,6 +61,16 @@ fn apply_meta_to_review(updated: &mut Review, meta: &LlmGameMeta) {
             updated.name = trimmed;
         }
     }
+    // name_en 特殊语义：Some("") 表示显式清除（手动编辑场景），其余非空才更新
+    if let Some(name_en) = &meta.name_en {
+        let trimmed = name_en.trim().to_string();
+        if trimmed.is_empty() {
+            updated.name_en = None;
+        } else if trimmed != updated.name_en.as_deref().unwrap_or("") {
+            tracing::info!("更新手账英文名: '{:?}' -> '{}'", updated.name_en, trimmed);
+            updated.name_en = Some(trimmed);
+        }
+    }
     if let Some(desc) = &meta.description {
         if !desc.is_empty() {
             updated.description = Some(desc.clone());
@@ -133,17 +143,23 @@ pub async fn refresh_review_info(
     }
 
     // 阶段 3：SteamGridDB 拉封面（无锁状态下 await）
+    // SteamGridDB 只认官方英文名：原名含非 ASCII 字符时改用英文名搜索（LLM 失败则退回原名）
     if !settings.steamgriddb_api_key.is_empty() {
+        let search_name = if !review.name.is_ascii() {
+            review.name_en.as_deref().unwrap_or(&review.name)
+        } else {
+            &review.name
+        };
         let cache_dir = utils::path::get_app_data_dir().join("covers");
         let fetcher = CoverFetcher::new(cache_dir, settings.steamgriddb_api_key.clone())
             .map_err(|e| e.to_string())?;
-        match fetcher.fetch_cover_for_id(&review.id, &review.name).await {
+        match fetcher.fetch_cover_for_id(&review.id, search_name).await {
             Ok(Some(path)) => {
                 review.cover_local = Some(path);
                 review.cover_url = review.cover_local.clone();
             }
             Ok(None) => {}
-            Err(e) => tracing::warn!("手账封面获取失败 {}: {}", review.name, e),
+            Err(e) => tracing::warn!("手账封面获取失败 {}（搜索词: {}）: {}", review.name, search_name, e),
         }
     }
 
@@ -256,7 +272,7 @@ pub async fn fetch_review_cover_options(
     db: State<'_, Arc<Mutex<Database>>>,
     review_id: String,
 ) -> Result<Vec<CoverOption>, String> {
-    let (name, api_key) = {
+    let (review, api_key) = {
         let db_guard = lock_or_recover(&db);
         let review = db_guard.get_review_by_id(&review_id)
             .map_err(|e| e.to_string())?
@@ -264,17 +280,24 @@ pub async fn fetch_review_cover_options(
         let api_key = db_guard.get_setting("steamgriddb_api_key")
             .map_err(|e| e.to_string())?
             .unwrap_or_default();
-        (review.name, api_key)
+        (review, api_key)
     };
 
     if api_key.is_empty() {
         return Err("未配置 SteamGridDB API Key，请在设置中填写".to_string());
     }
 
+    // SteamGridDB 只认官方英文名：原名含非 ASCII 字符时优先用英文名搜索
+    let search_name = if !review.name.is_ascii() {
+        review.name_en.as_deref().unwrap_or(&review.name)
+    } else {
+        &review.name
+    };
+
     let cache_dir = utils::path::get_app_data_dir().join("covers");
     let fetcher = CoverFetcher::new(cache_dir, api_key).map_err(|e| e.to_string())?;
 
-    fetcher.fetch_cover_options(&name, None)
+    fetcher.fetch_cover_options(search_name, None)
         .await
         .map_err(|e| e.to_string())
 }
