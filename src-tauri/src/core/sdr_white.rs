@@ -101,13 +101,16 @@ fn query_sdr_white_scale(hwnd: isize) -> f32 {
             white.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
                 r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
                 size: std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32,
-                adapterId: path.sourceInfo.adapterId,
-                id: path.sourceInfo.id,
+                // 官方文档明确要求 target 标识符（source id 与 target id 在多屏
+                // 拓扑下不同，用错会查错屏或失败回落 1.0）
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
             };
             if DisplayConfigGetDeviceInfo(&mut white.header) != 0 {
                 continue;
             }
-            // SDRWhiteLevel 单位 = 1/1000 × 80nits → nits/80 = 值/1000
+            // 官方语义：SDRWhiteLevel = nits/80 × 1000（1000=80nits，2000=160nits）
+            // → scRGB 归一化系数 nits/80 = 值/1000
             return white.SDRWhiteLevel as f32 / 1000.0;
         }
         0.0
