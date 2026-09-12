@@ -190,8 +190,9 @@ pub fn add_game_manual(
     // 凭这个 id 自动续接（热力图/时长/成就原样回归）。匹配键刻意不含路径，换盘重装也能认领。
     //
     // 两段式：① 名字 + exe 文件名双键（能区分同名不同游戏就尽量区分）；
-    // ② 双键未命中且**库中已无同名活条目**时按名字兜底——此时不存在"同名不同游戏"冲突，
-    // 覆盖换 exe 名重装（Steam→GOG）、原条目无安装路径等双键对不上的真实场景。
+    // ② 双键未命中且**库中已无同名活条目**时按名字兜底，且**不限 exe 名**
+    //   （2026-09-12 修订）——覆盖换安装程序重装（Steam 版删了装 GOG 版）、原条目无安装路径
+    //   等双键对不上的真实场景；前置的"无同名活条目"由这里把关，故不存在同名不同游戏的歧义。
     let mut claimed_tombstone = false;
     let mut tombstone_id = match game.exe_name.as_deref() {
         Some(exe_name) => db
@@ -343,8 +344,13 @@ pub fn set_game_cover(
 
     // 入库统一走 cover_store：解码 → 必要时转码 → 生成缩略图 → 写索引 → 清理旧文件。
     // delete_src = false：用户手选的文件不动它，只把内容收进封面库。
+    //
+    // 拆成两段（2026-09-12）：图像解码/编码是数百毫秒级的重活，放在**无锁段**做；
+    // 只有写索引这一步短暂持锁，避免一张大图把其它 DB 命令全部堵住。
+    let prepared = cover_store::prepare_path(OWNER_GAME, &game_id, src)
+        .map_err(|e| e.to_string())?;
     let db = lock_or_recover(&db);
-    cover_store::ingest_path(&db, OWNER_GAME, &game_id, src, false)
+    cover_store::commit_prepared(&db, OWNER_GAME, &game_id, prepared)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
@@ -509,19 +515,18 @@ pub async fn fetch_missing_covers(
 
         match fetcher.fetch_cover(game).await {
             Ok(Some(cover_path)) => {
-                // 第三阶段：单次获取锁登记封面（转码/缩略图/索引），然后立即释放。
+                // 第三阶段：封面入库。解码/编码在网络请求之后的**无锁段**完成，
+                // 只有写索引这一步短暂持锁（2026-09-12 拆锁）——批量抓封面时不再让
+                // 每一张图都占着全局 DB 锁，前端其它查询不会被堵住。
                 // 抓取器落盘的中间文件由 cover_store 在入库成功后清理（delete_src = true）。
-                let update_result = {
+                let src = std::path::Path::new(&cover_path);
+                let prepared_result = cover_store::prepare_path(OWNER_GAME, &game.id, src);
+                let update_result = prepared_result.and_then(|prepared| {
                     let db_guard = lock_or_recover(&db);
-                    cover_store::ingest_path(
-                        &db_guard,
-                        OWNER_GAME,
-                        &game.id,
-                        std::path::Path::new(&cover_path),
-                        true,
-                    )
-                    .map(|_| ())
-                };
+                    let set = cover_store::commit_prepared(&db_guard, OWNER_GAME, &game.id, prepared)?;
+                    cover_store::cleanup_ingest_source(&db_guard, src, &set, true)?;
+                    Ok(())
+                });
                 match update_result {
                     Ok(_) => {
                         fetched_count += 1;
@@ -608,10 +613,15 @@ pub async fn set_game_cover_from_url(
         .await
         .map_err(|e| format!("下载封面失败: {}", e))?;
 
+    // 同样拆锁（2026-09-12）：解码/编码在无锁段完成，只有写索引时短暂持锁
+    let prepared = cover_store::prepare_path(OWNER_GAME, &game_id, &actual_path)
+        .map_err(|e| e.to_string())?;
     let db_guard = lock_or_recover(&db);
-    cover_store::ingest_path(&db_guard, OWNER_GAME, &game_id, &actual_path, true)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let set = cover_store::commit_prepared(&db_guard, OWNER_GAME, &game_id, prepared)
+        .map_err(|e| e.to_string())?;
+    // 中间文件入库成功后清理（共享/原地替换的保护规则在函数内）
+    let _ = cover_store::cleanup_ingest_source(&db_guard, &actual_path, &set, true);
+    Ok(())
 }
 
 /// 将 LLM 返回的元数据合并到游戏对象（只更新非空字段，保留用户已有数据）

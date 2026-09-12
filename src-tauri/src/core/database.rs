@@ -825,9 +825,10 @@ impl Database {
     /// 按识别键找可认领的墓碑（大小写/首尾空格不敏感），返回旧 id；命中多条取最近删除的一条。
     ///
     /// - `Some(exe_name)`：名字 + exe 文件名双键匹配，避免「同名不同游戏」误接历史；
-    /// - `None`（名字兜底）：只匹配 exe_name 同样为空的墓碑——**不碰有 exe 游戏的墓碑**，
-    ///   由命令层先确认库中无同名活条目再调用（无同名时不存在"同名不同游戏"冲突，
-    ///   覆盖换 exe 名重装、原条目无安装路径等双键对不上的场景）。
+    /// - `None`（名字兜底）：只比名字、**不限 exe 名**——覆盖换安装程序重装（Steam 版删了
+    ///   装 GOG 版）、原条目未记 exe 等双键对不上的场景。
+    ///   （2026-09-12 修订：此前 SQL 附加 `exe_name IS NULL`，使"换了 exe 名重装"根本领不回
+    ///   历史，与本函数承诺相反；现由命令层以前置条件"库中已无同名活条目"防误接。）
     ///
     /// 不存路径，换盘/挪目录重装照样命中。
     pub fn find_tombstone_for_reclaim(
@@ -848,7 +849,6 @@ impl Database {
             self.conn.query_row(
                 "SELECT id FROM game_tombstones
                  WHERE LOWER(TRIM(name)) = LOWER(TRIM(?1))
-                   AND exe_name IS NULL
                  ORDER BY deleted_at DESC LIMIT 1",
                 params![name],
                 |r| r.get::<_, String>(0),
@@ -3078,28 +3078,21 @@ mod tests {
         assert_eq!(n_again, 1);
     }
 
-    /// 名字兜底认领语义（2026-09-06）：墓碑 exe 为空 / 重装换了 exe 名的场景。
-    /// ① `None` 只命中 exe IS NULL 的墓碑——不抢同名有 exe 墓碑的历史，反之亦然；
-    /// ② 命令层以「库中无同名活条目」作为调用兜底的前置，count_games_by_name 提供该判定。
+    /// 名字兜底认领语义（2026-09-12 修订）：**换 exe 名重装也能接回历史**。
+    ///
+    /// ① `Some(exe)` 走名字 + exe 双键，能区分同名不同游戏，exe 对不上则双键不命中；
+    /// ② `None` 是名字兜底：不限 exe 名，取最近删除的一条同名墓碑——正是 Steam 版删了
+    ///    装 GOG 版这类换了安装程序的重装场景；前置条件（库中无同名活条目）由命令层把关。
     #[test]
-    fn tombstone_name_only_fallback() {
+    fn tombstone_name_fallback_covers_renamed_exe() {
         let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
 
-        // 同名两条墓碑：一条无 exe（手动条目删除留档）、一条有 exe（对照防误接）
-        let no_exe_id = uuid::Uuid::new_v4().to_string();
+        // 一条带 exe 的墓碑（原为 Steam 版）
         let exe_id = uuid::Uuid::new_v4().to_string();
-        db.insert_tombstone(&no_exe_id, "叙事驱动小品", None, "2026-09-06T00:00:00Z")
-            .unwrap();
         db.insert_tombstone(&exe_id, "叙事驱动小品", Some("story.exe"), "2026-09-06T01:00:00Z")
             .unwrap();
 
-        // 名字兜底只认 exe IS NULL 的墓碑
-        let hit = db
-            .find_tombstone_for_reclaim("叙事驱动小品", None)
-            .unwrap();
-        assert_eq!(hit.as_deref(), Some(no_exe_id.as_str()));
-
-        // 有 exe 的新条目走双键：命中自己的 exe 墓碑，不会落到无 exe 墓碑上
+        // 双键：exe 对得上 → 命中；对不上 → 不命中（交给名字兜底）
         assert_eq!(
             db.find_tombstone_for_reclaim("叙事驱动小品", Some("story.exe"))
                 .unwrap()
@@ -3107,19 +3100,43 @@ mod tests {
             Some(exe_id.as_str()),
             "带 exe 重装应认领自己的 exe 墓碑"
         );
-        // exe 文件名对不上（疑似同名不同游戏）时双键不命中任何墓碑
         assert!(
             db.find_tombstone_for_reclaim("叙事驱动小品", Some("other.exe"))
                 .unwrap()
                 .is_none(),
-            "exe 不一致不应领走墓碑"
+            "exe 不一致时双键不应命中"
         );
 
-        // 库中无同名活条目：count == 0（命令层据此放行兜底）
-        assert_eq!(db.count_games_by_name("叙事驱动小品").unwrap(), 0);
+        // 名字兜底：换成 GOG 版 exe（story_gog.exe）也能领回历史
+        assert_eq!(
+            db.find_tombstone_for_reclaim("叙事驱动小品", None)
+                .unwrap()
+                .as_deref(),
+            Some(exe_id.as_str()),
+            "换 exe 名重装必须能按名字领回历史"
+        );
 
-        // 换 exe 名重装（如 Steam 版删了装 GOG 版）后库中出现同名活条目：
-        // count > 0 → 命令层将放弃兜底，防止同名不同游戏互偷历史
+        // 同名多条墓碑（无 exe 的那条更早删）→ 取最近删除的一条
+        let no_exe_id = uuid::Uuid::new_v4().to_string();
+        db.insert_tombstone(&no_exe_id, "叙事驱动小品", None, "2026-09-05T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            db.find_tombstone_for_reclaim("叙事驱动小品", None)
+                .unwrap()
+                .as_deref(),
+            Some(exe_id.as_str()),
+            "同名多条应取最近删除的一条"
+        );
+        // 名字两端空白与大小写不敏感
+        assert_eq!(
+            db.find_tombstone_for_reclaim("  叙事驱动小品 ", None)
+                .unwrap()
+                .as_deref(),
+            Some(exe_id.as_str())
+        );
+
+        // 兜底的前置条件由命令层把关：库中有同名活条目时不得再按名兜底
+        assert_eq!(db.count_games_by_name("叙事驱动小品").unwrap(), 0);
         let mut alive = Game::new("叙事驱动小品".to_string());
         alive.exe_name = Some("story_gog.exe".to_string());
         db.upsert_game(&alive).unwrap();

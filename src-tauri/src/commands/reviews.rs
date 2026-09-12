@@ -191,34 +191,59 @@ pub async fn refresh_review_info(
         }
     }
 
+    // 阶段 3.5：短锁判断新封面是否已在索引里（避免下面无锁段白做一次解码/编码）
+    let cover_needs_ingest = match fetched_cover.as_deref() {
+        Some(path) => {
+            let db_guard = lock_or_recover(&db);
+            !cover_store::resolve(&db_guard, OWNER_REVIEW, &review.id)
+                .map(|set| set.main.as_deref() == Some(path))
+                .unwrap_or(false)
+        }
+        None => false,
+    };
+
+    // 阶段 3.6：无锁段做图像重活（读文件 → 解码 → 转码 → 缩略图 → 落盘）
+    let prepared_cover = if cover_needs_ingest {
+        let path = match fetched_cover.as_deref() {
+            Some(p) => p,
+            None => unreachable!("cover_needs_ingest 蕴含 fetched_cover 有值"),
+        };
+        match cover_store::prepare_path(OWNER_REVIEW, &review.id, std::path::Path::new(path)) {
+            Ok(prepared) => Some(prepared),
+            Err(e) => {
+                tracing::warn!("手账封面预处理失败，回退用原始文件: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 阶段 4：重新取锁保存
     let db_guard = lock_or_recover(&db);
 
     // 新拉到的封面统一入库（转码 + 缩略图 + 索引）；已在索引里的缓存文件不重复处理
     if let Some(path) = fetched_cover {
-        let already_indexed = cover_store::resolve(&db_guard, OWNER_REVIEW, &review.id)
-            .map(|set| set.main.as_deref() == Some(path.as_str()))
-            .unwrap_or(false);
-        if already_indexed {
-            review.cover_local = Some(path.clone());
-            review.cover_url = Some(path);
-        } else {
-            match cover_store::ingest_path(
-                &db_guard,
-                OWNER_REVIEW,
-                &review.id,
-                std::path::Path::new(&path),
-                true,
-            ) {
-                Ok(set) => {
-                    review.cover_local = set.main.clone().or(Some(path.clone()));
-                    review.cover_url = review.cover_local.clone();
-                }
-                Err(e) => {
-                    tracing::warn!("手账封面入库失败，回退用原始文件: {}", e);
-                    review.cover_local = Some(path.clone());
-                    review.cover_url = Some(path);
-                }
+        let ingested = prepared_cover.map(|prepared| {
+            // 只有写索引这一步持锁；中间文件入库成功后再清理
+            let set = cover_store::commit_prepared(&db_guard, OWNER_REVIEW, &review.id, prepared)?;
+            cover_store::cleanup_ingest_source(&db_guard, std::path::Path::new(&path), &set, true)?;
+            Ok::<_, anyhow::Error>(set)
+        });
+        match ingested {
+            Some(Ok(set)) => {
+                review.cover_local = set.main.clone().or(Some(path.clone()));
+                review.cover_url = review.cover_local.clone();
+            }
+            Some(Err(e)) => {
+                tracing::warn!("手账封面入库失败，回退用原始文件: {}", e);
+                review.cover_local = Some(path.clone());
+                review.cover_url = Some(path);
+            }
+            // 已在索引里（或预处理失败）：直接用抓取器落盘的路径
+            None => {
+                review.cover_local = Some(path.clone());
+                review.cover_url = Some(path);
             }
         }
     }
@@ -436,10 +461,14 @@ pub async fn set_review_cover_from_url(
         .await
         .map_err(|e| format!("下载封面失败: {}", e))?;
 
+    // 拆锁（2026-09-12）：解码/编码在无锁段完成，只有写索引时短暂持锁
+    let prepared = cover_store::prepare_path(OWNER_REVIEW, &review_id, &actual_path)
+        .map_err(|e| e.to_string())?;
     let db_guard = lock_or_recover(&db);
-    cover_store::ingest_path(&db_guard, OWNER_REVIEW, &review_id, &actual_path, true)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let set = cover_store::commit_prepared(&db_guard, OWNER_REVIEW, &review_id, prepared)
+        .map_err(|e| e.to_string())?;
+    let _ = cover_store::cleanup_ingest_source(&db_guard, &actual_path, &set, true);
+    Ok(())
 }
 
 /// 从游戏库导入游戏到游戏手账（复用元数据与封面，评分/评价为空）

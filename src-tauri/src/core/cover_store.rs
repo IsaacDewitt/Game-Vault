@@ -243,7 +243,19 @@ pub fn resolve(db: &Database, owner_kind: &str, owner_id: &str) -> Result<CoverS
 }
 
 /// 入库一张图片：转码 → 生成缩略图 → 原子落盘 → 写索引 → 清理旧文件
-pub fn ingest_bytes(db: &Database, owner_kind: &str, owner_id: &str, bytes: &[u8]) -> Result<CoverSet> {
+/// 预处理产物：已编码落盘的主图/缩略图 + 待写入的索引行（**不包含任何数据库状态**）。
+///
+/// 拆出这一层是为了让命令层能「无锁做图像重活、短锁写索引」——
+/// 大图的解码/编码动辄数百毫秒，若一直握着全局 DB 锁，其它命令全部排队。
+pub struct PreparedCover {
+    rows: Vec<CoverIndexRow>,
+}
+
+/// 预处理（**不接触数据库**）：识别格式 → 解码 → 编码主图/缩略图 → 落盘 → 生成索引行。
+///
+/// 副作用只有两个原子写入（主图与缩略图）；索引尚未登记，提交前这些文件是"孤儿"，
+/// 由 [`commit_prepared`] 收编。
+pub fn prepare_bytes(owner_kind: &str, owner_id: &str, bytes: &[u8]) -> Result<PreparedCover> {
     path::ensure_cover_dirs()?;
 
     let format = image::guess_format(bytes).context("无法识别图片格式")?;
@@ -261,47 +273,90 @@ pub fn ingest_bytes(db: &Database, owner_kind: &str, owner_id: &str, bytes: &[u8
 
     let now = now_rfc3339();
     let thumb_img = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
-    let rows = vec![
-        CoverIndexRow {
-            owner_kind: owner_kind.to_string(),
-            owner_id: owner_id.to_string(),
-            kind: KIND_MAIN.to_string(),
-            rel_path: main_rel.clone(),
-            sha256: sha256_hex(&main_bytes),
-            width,
-            height,
-            bytes: main_bytes.len() as u64,
-            state: STATE_ACTIVE.to_string(),
-            updated_at: now.clone(),
-        },
-        CoverIndexRow {
-            owner_kind: owner_kind.to_string(),
-            owner_id: owner_id.to_string(),
-            kind: KIND_THUMB.to_string(),
-            rel_path: thumb_rel.clone(),
-            sha256: sha256_hex(&thumb_bytes),
-            width: thumb_img.width(),
-            height: thumb_img.height(),
-            bytes: thumb_bytes.len() as u64,
-            state: STATE_ACTIVE.to_string(),
-            updated_at: now,
-        },
-    ];
+    Ok(PreparedCover {
+        rows: vec![
+            CoverIndexRow {
+                owner_kind: owner_kind.to_string(),
+                owner_id: owner_id.to_string(),
+                kind: KIND_MAIN.to_string(),
+                rel_path: main_rel,
+                sha256: sha256_hex(&main_bytes),
+                width,
+                height,
+                bytes: main_bytes.len() as u64,
+                state: STATE_ACTIVE.to_string(),
+                updated_at: now.clone(),
+            },
+            CoverIndexRow {
+                owner_kind: owner_kind.to_string(),
+                owner_id: owner_id.to_string(),
+                kind: KIND_THUMB.to_string(),
+                rel_path: thumb_rel,
+                sha256: sha256_hex(&thumb_bytes),
+                width: thumb_img.width(),
+                height: thumb_img.height(),
+                bytes: thumb_bytes.len() as u64,
+                state: STATE_ACTIVE.to_string(),
+                updated_at: now,
+            },
+        ],
+    })
+}
 
-    let protect = vec![main_rel, thumb_rel];
-    let removed = db.replace_cover_rows(owner_kind, owner_id, &rows)?;
+/// 读文件 + 预处理（**不接触数据库**，供命令层在无锁段调用）
+pub fn prepare_path(owner_kind: &str, owner_id: &str, src: &Path) -> Result<PreparedCover> {
+    let bytes = std::fs::read(src).with_context(|| format!("读取图片失败: {}", src.display()))?;
+    prepare_bytes(owner_kind, owner_id, &bytes)
+}
+
+/// 提交预处理结果：写索引 → 回收被替换掉的旧文件 → 同步封面字段。
+/// 调用方须持有 DB 锁，本函数只做数据库操作与"无引用的旧文件"清理，耗时短。
+pub fn commit_prepared(
+    db: &Database,
+    owner_kind: &str,
+    owner_id: &str,
+    prepared: PreparedCover,
+) -> Result<CoverSet> {
+    let protect: Vec<String> = prepared.rows.iter().map(|r| r.rel_path.clone()).collect();
+    let removed = db.replace_cover_rows(owner_kind, owner_id, &prepared.rows)?;
     gc_rows(db, &removed, &protect)?;
     sync_owner_paths(db, owner_kind, owner_id)?;
 
     Ok(CoverSet {
-        main: Some(abs_path(&rows[0].rel_path).to_string_lossy().to_string()),
-        thumb: Some(abs_path(&rows[1].rel_path).to_string_lossy().to_string()),
+        main: prepared
+            .rows
+            .first()
+            .map(|r| abs_path(&r.rel_path).to_string_lossy().to_string()),
+        thumb: prepared
+            .rows
+            .get(1)
+            .map(|r| abs_path(&r.rel_path).to_string_lossy().to_string()),
     })
 }
 
+/// 入库成功后清理源文件（`ingest_path` 的第三步；命令层拆锁时也复用它）。
+/// 两重保护：① 源必须位于 covers 目录内；② 源路径不得仍被其他主体的索引行引用（共享文件绝不删）。
+pub fn cleanup_ingest_source(
+    db: &Database,
+    src: &Path,
+    set: &CoverSet,
+    delete_src: bool,
+) -> Result<()> {
+    if !delete_src {
+        return Ok(());
+    }
+    if let Some(rel) = rel_path_of(src) {
+        let new_main_rel = set.main.as_deref().and_then(|p| rel_path_of(Path::new(p)));
+        let replaced_in_place = new_main_rel.as_deref() == Some(rel.as_str());
+        if !replaced_in_place && db.cover_rel_refcount(&rel)? == 0 {
+            let _ = std::fs::remove_file(src);
+        }
+    }
+    Ok(())
+}
+
 /// 入库一个本地文件（手动选择封面 / 抓取器落盘的中间文件 / 迁移存量主图）
-/// `delete_src`：入库成功后尝试删除源文件，两重保护——① 源必须位于 covers 目录内；
-/// ② 源路径不得仍被其他主体的索引行引用（共享文件绝不删）。
+/// `delete_src`：入库成功后尝试删除源文件（保护规则见 `cleanup_ingest_source`）。
 pub fn ingest_path(
     db: &Database,
     owner_kind: &str,
@@ -309,21 +364,9 @@ pub fn ingest_path(
     src: &Path,
     delete_src: bool,
 ) -> Result<CoverSet> {
-    let bytes = std::fs::read(src).with_context(|| format!("读取图片失败: {}", src.display()))?;
-    let set = ingest_bytes(db, owner_kind, owner_id, &bytes)?;
-    if delete_src {
-        if let Some(rel) = rel_path_of(src) {
-            let new_main_rel = set
-                .main
-                .as_deref()
-                .and_then(|p| rel_path_of(Path::new(p)));
-            let replaced_in_place = new_main_rel.as_deref() == Some(rel.as_str());
-            // 共享文件（别的条目还在指向它）与"新主图就是它自己"都不删
-            if !replaced_in_place && db.cover_rel_refcount(&rel)? == 0 {
-                let _ = std::fs::remove_file(src);
-            }
-        }
-    }
+    let prepared = prepare_path(owner_kind, owner_id, src)?;
+    let set = commit_prepared(db, owner_kind, owner_id, prepared)?;
+    cleanup_ingest_source(db, src, &set, delete_src)?;
     Ok(set)
 }
 
@@ -583,6 +626,12 @@ mod tests {
     fn db() -> Database {
         test_root();
         Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败")
+    }
+
+    /// 一步入库（预处理 + 提交），测试专用：与生产调用方走同一条 prepare/commit 路径
+    fn ingest_bytes(db: &Database, owner_kind: &str, owner_id: &str, bytes: &[u8]) -> Result<CoverSet> {
+        let prepared = prepare_bytes(owner_kind, owner_id, bytes)?;
+        commit_prepared(db, owner_kind, owner_id, prepared)
     }
 
     /// 不透明 PNG（噪声图案：PNG 压不动、JPEG 明显更小，贴近真实封面图）
