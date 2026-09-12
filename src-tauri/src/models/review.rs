@@ -29,6 +29,13 @@ pub struct Review {
     pub status: String,
     pub added_at: String,
     pub updated_at: Option<String>,
+    /// 截图库定位：截图根目录下的**子目录名**（如 "MafiaTheOldCountry"），None/空 = 自动推断。
+    ///
+    /// 手账是独立库、不存 exe，早先靠「同名游戏」从游戏库借 exe_name 定位截图目录 ——
+    /// 游戏一旦从游戏库删除（只留墓碑），手账的截图库就跟着失效（2026-09-12 修）。
+    /// 现在手账自己持有该字段，解析优先级：
+    /// `screenshot_dir` > 同名活条目 exe > 同名墓碑 exe。
+    pub screenshot_dir: Option<String>,
 }
 
 impl Review {
@@ -53,6 +60,7 @@ impl Review {
             status: "wishlist".to_string(),
             added_at: chrono::Utc::now().to_rfc3339(),
             updated_at: None,
+            screenshot_dir: None,
         }
     }
 }

@@ -42,9 +42,51 @@ pub fn get_database_path() -> PathBuf {
     get_app_data_dir().join("gamevault.db")
 }
 
+/// 测试用：把封面根目录重定向到临时目录，避免单测动到用户真实封面库
+#[cfg(test)]
+static COVERS_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// 测试用：设定封面根目录覆盖（进程内只生效一次）
+#[cfg(test)]
+pub fn set_covers_dir_override(dir: PathBuf) {
+    let _ = COVERS_DIR_OVERRIDE.set(dir);
+}
+
 /// 获取封面缓存目录
 pub fn get_covers_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = COVERS_DIR_OVERRIDE.get() {
+        return dir.clone();
+    }
     get_app_data_dir().join("covers")
+}
+
+/// 封面缩略图目录（卡片网格 / 统计排行用小图，避免整张原图参与解码）
+pub fn get_covers_thumb_dir() -> PathBuf {
+    get_covers_dir().join("thumb")
+}
+
+/// 已移除条目的封面留档目录（删除游戏/手账时把封面挪进来，不再直接删除）
+pub fn get_covers_archive_dir() -> PathBuf {
+    get_covers_dir().join("archive")
+}
+
+/// 留档封面的缩略图目录
+pub fn get_covers_archive_thumb_dir() -> PathBuf {
+    get_covers_archive_dir().join("thumb")
+}
+
+/// 一次性确保封面体系的所有目录存在（主目录 / 缩略图 / 留档 / 留档缩略图）
+pub fn ensure_cover_dirs() -> std::io::Result<()> {
+    for dir in [
+        get_covers_dir(),
+        get_covers_thumb_dir(),
+        get_covers_archive_dir(),
+        get_covers_archive_thumb_dir(),
+    ] {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(())
 }
 
 /// 确保目录存在

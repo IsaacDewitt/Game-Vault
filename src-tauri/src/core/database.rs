@@ -75,13 +75,16 @@ impl Database {
                 updated_at TEXT
             );
 
+            -- 逐场游玩明细（近期回看用，12 个月滚动窗口；启动后延迟清理超期行）
+            -- 刻意**不设**外键级联（0.7.7 起）：删除游戏只移除库内条目，逐场明细要留档，
+            -- 与 play_stats_daily/hourly、成就、封面同一套「删除不删记录」语义。
+            -- 旧库由 migrate_detach_session_fk 重建去掉级联。
             CREATE TABLE IF NOT EXISTS play_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 game_id TEXT NOT NULL,
                 start_time TEXT NOT NULL,
                 end_time TEXT,
-                duration_seconds INTEGER NOT NULL,
-                FOREIGN KEY (game_id) REFERENCES games(id) ON DELETE CASCADE
+                duration_seconds INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -116,7 +119,8 @@ impl Database {
                 review TEXT,
                 status TEXT DEFAULT 'wishlist',
                 added_at TEXT NOT NULL,
-                updated_at TEXT
+                updated_at TEXT,
+                screenshot_dir TEXT
             );
 
             -- 插入默认设置
@@ -133,6 +137,37 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_achievement_unlocks_game ON achievement_unlocks(game_id);
             CREATE INDEX IF NOT EXISTS idx_reviews_name ON reviews(name);
             CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status);
+
+            -- 游戏墓碑表（2026-09-06）：删除游戏时留档，重装再入库时按 名字+exe文件名 认领并复用旧 id，
+            -- 使 play_stats_daily/hourly 与 achievement_unlocks 中留存的孤儿历史自动续接。
+            -- 只记认领所需的最小信息；路径刻意不存（换盘/挪目录也能接回）。
+            CREATE TABLE IF NOT EXISTS game_tombstones (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                exe_name TEXT,
+                deleted_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_game_tombstones_name ON game_tombstones(name);
+
+            -- 封面索引表（2026-09-10）：封面从「裸路径字符串」升级为可查询的资产。
+            -- rel_path 相对 covers 目录（含 thumb/ 与 archive/ 子目录）；sha256 为内容指纹，
+            -- 多个主体引用同一张图时共享物理文件，删除按指纹计数决定是否真删文件。
+            -- state: active 在库 / archived 已移除留档（删除条目不再删图）。
+            CREATE TABLE IF NOT EXISTS covers (
+                owner_kind TEXT NOT NULL,
+                owner_id   TEXT NOT NULL,
+                kind       TEXT NOT NULL,
+                rel_path   TEXT NOT NULL,
+                sha256     TEXT NOT NULL DEFAULT '',
+                width      INTEGER NOT NULL DEFAULT 0,
+                height     INTEGER NOT NULL DEFAULT 0,
+                bytes      INTEGER NOT NULL DEFAULT 0,
+                state      TEXT NOT NULL DEFAULT 'active',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (owner_kind, owner_id, kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_covers_sha ON covers(sha256);
+            CREATE INDEX IF NOT EXISTS idx_covers_rel ON covers(rel_path);
         ")?;
 
         // 迁移：为旧数据库添加 status 字段（必须在索引创建之前）
@@ -140,6 +175,9 @@ impl Database {
 
         // 迁移：为旧手账数据库添加英文名字段
         self.migrate_add_review_name_en_column()?;
+
+        // 迁移：为旧手账数据库添加截图目录字段（手账自持，不再依赖游戏库活条目）
+        self.migrate_add_review_screenshot_dir_column()?;
 
         // 迁移：为旧数据库添加 HLTB 字段
         self.migrate_add_hltb_columns()?;
@@ -156,6 +194,9 @@ impl Database {
         // 迁移：为旧数据库添加 abandoned_at 字段（弃坑重玩成就判定用）
         self.migrate_add_abandoned_at_column()?;
 
+        // 迁移：拆掉 play_sessions 的外键级联（删除游戏不再连明细一起删）
+        self.migrate_detach_session_fk()?;
+
         // 迁移：启用 WAL（读写并发，批量清理明细时不再阻塞前台查询）
         self.migrate_enable_wal()?;
 
@@ -165,6 +206,15 @@ impl Database {
         // 一次性迁移：历史明细按现行合并/丢弃规则重分级（仅执行一次）
         self.migrate_regrade_historical_sessions()?;
 
+        // 一次性迁移：历史游戏类型归一化到规范表（消除「动作」/「Action」这类中英双份）
+        self.migrate_normalize_genres()?;
+
+        // 一次性迁移：手账纯英文名补 name_en（0.7.0~0.7.2 期间导入的条目 name_en 为空）
+        self.migrate_backfill_review_name_en()?;
+
+        // 一次性迁移：手账截图目录回填（凭活条目/墓碑 exe 或名称唯一命中截图根目录下的同名子目录）
+        self.migrate_backfill_review_screenshot_dir()?;
+
         // 回填：首次建表后从明细全量重算预聚合（表非空则跳过）
         self.rebuild_play_stats_if_empty()?;
         // 创建 status 索引（在列存在之后）
@@ -173,6 +223,291 @@ impl Database {
         )?;
 
         Ok(())
+    }
+
+    /// 一次性迁移：把 games / reviews 两表的历史类型写法归一化到规范表。
+    ///
+    /// 起因：LLM 输出不稳定，同一类型在库里同时存在中文与英文两种写法（动作 / Action、
+    /// 开放世界 / Open World），导致筛选下拉重复项、类型统计被摊薄。
+    ///
+    /// 策略：命中规范表或别名表→替换为规范名；未收录的陌生类型**原样保留**（去重但不丢弃），
+    /// 避免静默吞掉用户已录入的信息。迁移一次即打标记，后续不再执行。
+    fn migrate_normalize_genres(&self) -> Result<()> {
+        const FLAG_KEY: &str = "genre_normalize_v1_done";
+        if self.get_setting(FLAG_KEY)?.is_some() {
+            return Ok(());
+        }
+
+        let mut changed = 0usize;
+        let mut unknown: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // 整体包事务：中途失败则整批回滚、标志位不落库，下次启动重跑（归一化幂等）。
+        // 注意 get_setting/set_setting 用的是 self.conn，不能与这里的写事务同开，
+        // 故标志位在事务提交后再写。
+        let tx = self.conn.unchecked_transaction()?;
+
+        // 表名是代码内硬编码的常量，不来自用户输入，无注入风险
+        for table in ["games", "reviews"] {
+            let mut stmt = tx.prepare(&format!("SELECT id, genres FROM {}", table))?;
+            // genres 用 Option 接：列理论上 NOT NULL，但旧库/异常写入可能出现 NULL，
+            // 直接按 String 取会让整条迁移报错，进而拖垮启动。
+            let rows: Vec<(String, Option<String>)> = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+
+            for (id, genres_str) in rows {
+                let raw = match genres_str {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let old: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+                if old.is_empty() {
+                    continue;
+                }
+                let new = crate::core::genres::normalize_genres(&old);
+                if new == old {
+                    continue;
+                }
+                // 记录未能归入规范表的类型，便于后续补表
+                for g in &new {
+                    if !crate::core::genres::CANONICAL_GENRES.contains(&g.as_str()) {
+                        unknown.insert(g.clone());
+                    }
+                }
+                let new_str = serde_json::to_string(&new)?;
+                tx.execute(
+                    &format!("UPDATE {} SET genres = ?1 WHERE id = ?2", table),
+                    params![new_str, id],
+                )?;
+                changed += 1;
+            }
+        }
+
+        tx.commit()?;
+
+        if !unknown.is_empty() {
+            let mut list: Vec<String> = unknown.into_iter().collect();
+            list.sort();
+            tracing::warn!(
+                "类型归一化：以下类型未收录进规范表，已原样保留（如需收敛请补 core/genres.rs）: {}",
+                list.join("、")
+            );
+        }
+        self.set_setting(FLAG_KEY, "1")?;
+        tracing::info!("游戏类型归一化迁移完成，共更新 {} 条记录", changed);
+        Ok(())
+    }
+
+    /// 一次性迁移：手账纯英文名补 name_en（2026-09-06，0.7.3 修复的存量补齐）。
+    ///
+    /// 背景：0.7.0 引入「英文名桥接」时，从游戏库导入 / 手动添加 / LLM 改名的纯英文名
+    /// 条目（如 "Mafia: The Old Country"）原样存进了 name，name_en 始终为空 ——
+    /// 详情页英文名框空着、中英双搜索缺一侧索引。commands/reviews.rs 的
+    /// normalize_review_name 只修新增路径，这里把历史数据一次性补齐。
+    ///
+    /// 规则（与 normalize_review_name 口径一致）：name 为纯 ASCII 且 name_en 为空/空白 → name_en = name。
+    /// 幂等：命中条件天然幂等，仍以 FLAG 键防重复扫描。
+    fn migrate_backfill_review_name_en(&self) -> Result<()> {
+        const FLAG_KEY: &str = "review_name_en_backfill_v1_done";
+        if self.get_setting(FLAG_KEY)?.is_some() {
+            return Ok(());
+        }
+
+        let mut changed = 0usize;
+        {
+            let tx = self.conn.unchecked_transaction()?;
+            // name_en 空串/纯空白也视为「未填」；NULL 由 Option 承接
+            let rows: Vec<(String, String, Option<String>)> = tx
+                .prepare("SELECT id, name, name_en FROM reviews")?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            for (id, name, name_en) in rows {
+                let trimmed = name.trim();
+                if trimmed.is_empty() || !trimmed.is_ascii() {
+                    continue;
+                }
+                let filled = name_en.as_deref().map_or(true, |v| v.trim().is_empty());
+                if !filled {
+                    continue;
+                }
+                tx.execute(
+                    "UPDATE reviews SET name_en = ?1 WHERE id = ?2",
+                    params![trimmed, id],
+                )?;
+                changed += 1;
+            }
+            tx.commit()?;
+        }
+
+        self.set_setting(FLAG_KEY, "1")?;
+        tracing::info!("手账英文名回填迁移完成，共补 {} 条", changed);
+        Ok(())
+    }
+
+    /// 一次性迁移：手账截图目录回填（2026-09-12）。
+    ///
+    /// 背景：手账本不存 exe，早先靠「同名游戏」从游戏库借 exe_name 定位截图目录 —— 游戏一旦
+    /// 从游戏库删除（只留墓碑，如 Mafia: The Old Country），手账的截图库就整块失效。现在手账
+    /// 自持 `screenshot_dir`，这里把存量一次性映射过来，此后删不删游戏都与手账无关。
+    ///
+    /// 推断顺序（命中项还必须**目录存在且有图**才落库，避免钉死一个空目录）：
+    /// 1. 同名活条目 exe_name → 目录名取 `process_stem`；
+    /// 2. 同名墓碑 exe_name → 同上（这条正是 Mafia 的救星）；
+    /// 3. `name_en` / `name` 归一化键与截图根目录子目录名**唯一**相等。
+    ///
+    /// 三条都不中则留空——不猜，交给前端手动指定。已有值不覆盖；FLAG 键防重复扫描。
+    fn migrate_backfill_review_screenshot_dir(&self) -> Result<()> {
+        const FLAG_KEY: &str = "review_screenshot_dir_backfill_v1_done";
+        if self.get_setting(FLAG_KEY)?.is_some() {
+            return Ok(());
+        }
+
+        // 截图根目录不可用（设置缺失 / 盘未挂载）时**不打 FLAG**，留待下次启动重试
+        let Some(root) = self.screenshot_root_dir() else {
+            tracing::warn!("手账截图目录回填跳过：无法解析截图根目录");
+            return Ok(());
+        };
+        let subdirs = crate::core::screenshot::list_image_subdirs(&root);
+        if subdirs.is_empty() {
+            tracing::warn!("手账截图目录回填跳过：{} 下没有含图片的子目录", root.display());
+            return Ok(());
+        }
+
+        let filled = self.backfill_review_screenshot_dirs(&subdirs)?;
+
+        self.set_setting(FLAG_KEY, "1")?;
+        tracing::info!("手账截图目录回填迁移完成，共补 {} 条", filled.len());
+        for (name, dir, reason) in &filled {
+            tracing::info!("  手账《{}》→ 截图目录 '{}'（依据：{}）", name, dir, reason);
+        }
+        Ok(())
+    }
+
+    /// 回填核心（不含 FLAG 判定，便于测试直调）：为 `screenshot_dir` 为空的条目推断目录并落库。
+    /// 返回 (手账名, 目录名, 依据) 列表。
+    fn backfill_review_screenshot_dirs(
+        &self,
+        subdirs: &[(String, usize)],
+    ) -> Result<Vec<(String, String, String)>> {
+        // 只读推断（收集完再开事务写，避免事务里做文件系统与多表查询）
+        let pending: Vec<(String, String, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, name, name_en FROM reviews
+                 WHERE screenshot_dir IS NULL OR TRIM(screenshot_dir) = ''",
+            )?;
+            let rows: Vec<(String, String, Option<String>)> = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            rows.into_iter()
+                .filter_map(|(id, name, name_en)| {
+                    self.infer_screenshot_dir(&name, name_en.as_deref(), subdirs)
+                        .map(|(dir, reason)| (id, name, dir, reason))
+                })
+                .collect()
+        };
+
+        if !pending.is_empty() {
+            let tx = self.conn.unchecked_transaction()?;
+            for (id, _name, dir, _reason) in &pending {
+                tx.execute(
+                    "UPDATE reviews SET screenshot_dir = ?1 WHERE id = ?2",
+                    params![dir, id],
+                )?;
+            }
+            tx.commit()?;
+        }
+
+        Ok(pending
+            .into_iter()
+            .map(|(_id, name, dir, reason)| (name, dir, reason))
+            .collect())
+    }
+
+    /// 为单条手账推断截图子目录名，返回 (目录名, 依据说明)。
+    ///
+    /// 候选目录须**确实存在且含图片**；第 3 步的归一化匹配要求唯一命中，防止
+    /// 「Mafia The Old Country / MafiaTheOldCountry」这类同键多的目录被误选。
+    fn infer_screenshot_dir(
+        &self,
+        name: &str,
+        name_en: Option<&str>,
+        subdirs: &[(String, usize)],
+    ) -> Option<(String, String)> {
+        let existing = |dir: &str| {
+            subdirs
+                .iter()
+                .find(|(n, count)| n.eq_ignore_ascii_case(dir) && *count > 0)
+                .map(|(n, count)| (n.clone(), *count))
+        };
+
+        // 1) 同名活条目借 exe
+        if let Ok(Some(game)) = self.find_game_by_name(name) {
+            if let Some(exe) = game.exe_name.as_deref() {
+                let stem = crate::core::screenshot::process_stem(exe);
+                if let Some((dir, count)) = existing(&stem) {
+                    return Some((
+                        dir,
+                        format!("游戏库同名条目 exe={}（{} 张）", exe, count),
+                    ));
+                }
+            }
+        }
+
+        // 2) 同名墓碑借 exe —— 游戏已从游戏库移除但留档的情形
+        if let Ok(Some(exe)) = self.find_tombstone_exe_by_name(name) {
+            let stem = crate::core::screenshot::process_stem(&exe);
+            if let Some((dir, count)) = existing(&stem) {
+                return Some((dir, format!("游戏库墓碑 exe={}（{} 张）", exe, count)));
+            }
+        }
+
+        // 3) 名称归一化唯一命中
+        for cand in [name_en, Some(name)].into_iter().flatten() {
+            let key = crate::core::screenshot::match_key(cand);
+            if key.is_empty() {
+                continue;
+            }
+            let hits: Vec<(&String, usize)> = subdirs
+                .iter()
+                .filter(|(n, count)| *count > 0 && crate::core::screenshot::match_key(n) == key)
+                .map(|(n, count)| (n, *count))
+                .collect();
+            if hits.len() == 1 {
+                return Some((
+                    hits[0].0.clone(),
+                    format!("名称唯一匹配 '{}'（{} 张）", cand, hits[0].1),
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// 截图根目录（设置项经环境变量展开）；未配置或为空返回 None
+    ///
+    /// 与运行期解析（commands/screenshots.rs）走同一口径：经 `Settings::load_from_db`
+    /// 读取，设置键缺失时回落到默认目录——否则从未在设置页保存过的用户其
+    /// `screenshot_dir` 键根本不存在，回填迁移会永远判定"根目录不可用"而空转。
+    fn screenshot_root_dir(&self) -> Option<std::path::PathBuf> {
+        let settings = crate::models::settings::Settings::load_from_db(self).ok()?;
+        let raw = settings.screenshot_dir.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        Some(std::path::PathBuf::from(crate::utils::path::expand_env_vars(raw)))
     }
 
     /// 迁移：添加 status 字段到旧数据库
@@ -202,6 +537,19 @@ impl Database {
                 [],
             )?;
             tracing::info!("已添加 name_en 字段到 reviews 表");
+        }
+        Ok(())
+    }
+
+    /// 迁移：为旧数据库的 reviews 表添加 screenshot_dir（截图目录名）字段（2026-09-12）
+    fn migrate_add_review_screenshot_dir_column(&self) -> Result<()> {
+        if !self.has_column("reviews", "screenshot_dir")? {
+            tracing::info!("reviews.screenshot_dir 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE reviews ADD COLUMN screenshot_dir TEXT",
+                [],
+            )?;
+            tracing::info!("已添加 screenshot_dir 字段到 reviews 表");
         }
         Ok(())
     }
@@ -315,6 +663,7 @@ impl Database {
                 play_time_seconds = games.play_time_seconds,
                 last_played = games.last_played,
                 play_count = games.play_count,
+                is_favorite = excluded.is_favorite,
                 status = excluded.status,
                 updated_at = excluded.updated_at,
                 hltb_main_story = COALESCE(excluded.hltb_main_story, games.hltb_main_story),
@@ -352,15 +701,6 @@ impl Database {
                 game.exe_modified_at,
                 game.exe_file_size,
             ],
-        )?;
-        Ok(())
-    }
-
-    /// 更新游戏封面 URL
-    pub fn update_game_cover_url(&self, game_id: &str, cover_url: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE games SET cover_url = ?1, updated_at = ?2 WHERE id = ?3",
-            params![cover_url, chrono::Utc::now().to_rfc3339(), game_id],
         )?;
         Ok(())
     }
@@ -439,16 +779,320 @@ impl Database {
         }
     }
 
+    /// 根据名称查找游戏（手账截图目录定位用：手账条目无 exe_name，按同名游戏借）
+    pub fn find_game_by_name(&self, name: &str) -> Result<Option<Game>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM games WHERE name = ?1",
+            Self::GAME_COLUMNS
+        ))?;
+
+        let mut games = stmt.query_map(params![name], Self::row_to_game)?;
+
+        match games.next() {
+            Some(Ok(game)) => Ok(Some(game)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
     /// 删除游戏
     pub fn delete_game(&self, id: &str) -> Result<()> {
         self.conn.execute("DELETE FROM games WHERE id = ?1", params![id])?;
         Ok(())
     }
 
+    // ==================== 游戏墓碑（删除留档，重装按名字认领续接历史） ====================
+
+    /// 删除游戏时写墓碑：记录被删条目的旧 id 与识别键（名字 + exe 文件名）。
+    /// 历史统计 play_stats_daily/hourly 与成就本就删而留档，靠墓碑记住的旧 id 才能在新条目入库时认领回来。
+    pub fn insert_tombstone(&self, id: &str, name: &str, exe_name: Option<&str>, deleted_at: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO game_tombstones (id, name, exe_name, deleted_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id, name, exe_name, deleted_at],
+        )?;
+        Ok(())
+    }
+
+    /// 列出全部墓碑（id, name）——存量封面迁移时给已移除条目回挂图片用
+    pub fn all_tombstones(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name FROM game_tombstones ORDER BY deleted_at DESC")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 按识别键找可认领的墓碑（大小写/首尾空格不敏感），返回旧 id；命中多条取最近删除的一条。
+    ///
+    /// - `Some(exe_name)`：名字 + exe 文件名双键匹配，避免「同名不同游戏」误接历史；
+    /// - `None`（名字兜底）：只匹配 exe_name 同样为空的墓碑——**不碰有 exe 游戏的墓碑**，
+    ///   由命令层先确认库中无同名活条目再调用（无同名时不存在"同名不同游戏"冲突，
+    ///   覆盖换 exe 名重装、原条目无安装路径等双键对不上的场景）。
+    ///
+    /// 不存路径，换盘/挪目录重装照样命中。
+    pub fn find_tombstone_for_reclaim(
+        &self,
+        name: &str,
+        exe_name: Option<&str>,
+    ) -> Result<Option<String>> {
+        let result = if let Some(exe) = exe_name {
+            self.conn.query_row(
+                "SELECT id FROM game_tombstones
+                 WHERE LOWER(TRIM(name)) = LOWER(TRIM(?1))
+                   AND LOWER(TRIM(exe_name)) = LOWER(TRIM(?2))
+                 ORDER BY deleted_at DESC LIMIT 1",
+                params![name, exe],
+                |r| r.get::<_, String>(0),
+            )
+        } else {
+            self.conn.query_row(
+                "SELECT id FROM game_tombstones
+                 WHERE LOWER(TRIM(name)) = LOWER(TRIM(?1))
+                   AND exe_name IS NULL
+                 ORDER BY deleted_at DESC LIMIT 1",
+                params![name],
+                |r| r.get::<_, String>(0),
+            )
+        };
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 按名字取墓碑里留档的 exe 文件名（大小写/首尾空格不敏感），命中多条取最近删除的一条。
+    ///
+    /// 用途与认领不同：这里只是**借 exe 名定位截图目录**（手账的截图库在游戏被删除后仍要可用）。
+    /// 缺失或墓碑里 exe 为空都返回 None，由调用方决定退回自动推断。
+    pub fn find_tombstone_exe_by_name(&self, name: &str) -> Result<Option<String>> {
+        let result = self.conn.query_row(
+            "SELECT exe_name FROM game_tombstones
+             WHERE LOWER(TRIM(name)) = LOWER(TRIM(?1))
+               AND exe_name IS NOT NULL AND TRIM(exe_name) <> ''
+             ORDER BY deleted_at DESC LIMIT 1",
+            params![name],
+            |r| r.get::<_, String>(0),
+        );
+        match result {
+            Ok(exe) => Ok(Some(exe)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 统计同名游戏数量（名字兜底认领的防误接判定：库中已无同名活条目才允许按名认领）
+    pub fn count_games_by_name(&self, name: &str) -> Result<u32> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM games WHERE LOWER(TRIM(name)) = LOWER(TRIM(?1))",
+            params![name],
+            |r| r.get(0),
+        )?;
+        Ok(n as u32)
+    }
+
+    /// 认领成功后清除墓碑
+    pub fn remove_tombstone(&self, id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM game_tombstones WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// 认领续接后，从预聚合表回填累计时长/游玩次数/上次游玩。
+    /// 历史数据删而留档在 play_stats_daily，新条目以旧 id 入库后 SUM 回来，
+    /// 卡片上的累计数字才完整回归（热力图/成就本就按 game_id 关联，无需处理）。
+    /// last_end 与 games.last_played 同为 RFC3339（源自会话 end_time），可安全回填。
+    pub fn reclaim_game_totals(&self, game_id: &str) -> Result<()> {
+        let (seconds, count, last_end): (i64, i64, Option<String>) = self.conn.query_row(
+            "SELECT COALESCE(SUM(total_seconds), 0),
+                    COALESCE(SUM(session_count), 0),
+                    MAX(last_end)
+             FROM play_stats_daily WHERE game_id = ?1",
+            params![game_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        self.conn.execute(
+            "UPDATE games SET play_time_seconds = ?1, play_count = ?2,
+                    last_played = COALESCE(?3, last_played)
+             WHERE id = ?4",
+            params![seconds.max(0) as u64, count.max(0) as u32, last_end, game_id],
+        )?;
+        Ok(())
+    }
+
+    // ==================== 封面索引（covers 表） ====================
+    //
+    // 封面文件的权威索引：谁在引用哪张图、图在哪、内容指纹是什么。
+    // 文件本身仍放在 covers 目录（asset 协议磁盘直读），本表只管"账"。
+
+    fn row_to_cover(row: &rusqlite::Row) -> rusqlite::Result<CoverIndexRow> {
+        Ok(CoverIndexRow {
+            owner_kind: row.get(0)?,
+            owner_id: row.get(1)?,
+            kind: row.get(2)?,
+            rel_path: row.get(3)?,
+            sha256: row.get(4)?,
+            width: row.get::<_, i64>(5).unwrap_or(0).max(0) as u32,
+            height: row.get::<_, i64>(6).unwrap_or(0).max(0) as u32,
+            bytes: row.get::<_, i64>(7).unwrap_or(0).max(0) as u64,
+            state: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    }
+
+    const COVER_COLUMNS: &'static str =
+        "owner_kind, owner_id, kind, rel_path, sha256, width, height, bytes, state, updated_at";
+
+    /// 读某主体的封面索引行（main + thumb）
+    pub fn cover_rows(&self, owner_kind: &str, owner_id: &str) -> Result<Vec<CoverIndexRow>> {
+        let sql = format!(
+            "SELECT {} FROM covers WHERE owner_kind = ?1 AND owner_id = ?2 ORDER BY kind",
+            Self::COVER_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![owner_kind, owner_id], Self::row_to_cover)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 全量索引行（启动迁移与前端全量取图用）
+    pub fn all_cover_rows(&self) -> Result<Vec<CoverIndexRow>> {
+        let sql = format!("SELECT {} FROM covers", Self::COVER_COLUMNS);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_cover)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 整体替换某主体的封面索引（事务内先删后插），返回**被移除的旧行**，
+    /// 供调用方按引用计数决定旧文件是删是留。
+    pub fn replace_cover_rows(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+        new_rows: &[CoverIndexRow],
+    ) -> Result<Vec<CoverIndexRow>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let removed = {
+            let sql = format!(
+                "SELECT {} FROM covers WHERE owner_kind = ?1 AND owner_id = ?2",
+                Self::COVER_COLUMNS
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let rows = stmt.query_map(params![owner_kind, owner_id], Self::row_to_cover)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "DELETE FROM covers WHERE owner_kind = ?1 AND owner_id = ?2",
+            params![owner_kind, owner_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO covers
+                    (owner_kind, owner_id, kind, rel_path, sha256, width, height, bytes, state, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            for row in new_rows {
+                stmt.execute(params![
+                    row.owner_kind,
+                    row.owner_id,
+                    row.kind,
+                    row.rel_path,
+                    row.sha256,
+                    row.width as i64,
+                    row.height as i64,
+                    row.bytes as i64,
+                    row.state,
+                    row.updated_at,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// 删除某主体的全部封面索引行，返回被删的行
+    pub fn delete_cover_rows(&self, owner_kind: &str, owner_id: &str) -> Result<Vec<CoverIndexRow>> {
+        self.replace_cover_rows(owner_kind, owner_id, &[])
+    }
+
+    /// 改状态（active ↔ archived），不动文件与路径
+    pub fn set_cover_state(&self, owner_kind: &str, owner_id: &str, state: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE covers SET state = ?1, updated_at = ?2 WHERE owner_kind = ?3 AND owner_id = ?4",
+            params![state, chrono::Utc::now().to_rfc3339(), owner_kind, owner_id],
+        )?;
+        Ok(())
+    }
+
+    /// 改路径（归档挪文件后同步索引）
+    pub fn set_cover_rel_path(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+        kind: &str,
+        rel_path: &str,
+        state: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE covers SET rel_path = ?1, state = ?2, updated_at = ?3
+             WHERE owner_kind = ?4 AND owner_id = ?5 AND kind = ?6",
+            params![
+                rel_path,
+                state,
+                chrono::Utc::now().to_rfc3339(),
+                owner_kind,
+                owner_id,
+                kind
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 还有几个主体在引用这个指纹（用于删除前的引用计数判断）
+    pub fn cover_sha_refcount(&self, sha256: &str) -> Result<u32> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM covers WHERE sha256 = ?1",
+            params![sha256],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    /// 还有几个索引行指向这个文件路径（转码替换旧文件前的安全闸）
+    pub fn cover_rel_refcount(&self, rel_path: &str) -> Result<u32> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM covers WHERE rel_path = ?1",
+            params![rel_path],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    /// 同名字（含英文名）的手账条目 id —— 删除游戏后回挂封面用
+    pub fn find_review_id_by_game_name(&self, name: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM reviews
+             WHERE LOWER(TRIM(name)) = LOWER(TRIM(?1))
+                OR (name_en IS NOT NULL AND TRIM(name_en) <> ''
+                    AND LOWER(TRIM(name_en)) = LOWER(TRIM(?1)))
+             ORDER BY updated_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| r.get::<_, String>(0))?;
+        match rows.next() {
+            Some(Ok(id)) => Ok(Some(id)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// 确保封面体系目录与索引就绪（幂等）
+    pub fn ensure_cover_storage(&self) -> Result<()> {
+        crate::utils::path::ensure_cover_dirs()?;
+        Ok(())
+    }
+
     /// 更新游戏封面（本地文件路径）
     pub fn update_game_cover(&self, id: &str, cover_local: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE games SET cover_local = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE games SET cover_local = ?1, cover_url = ?1, updated_at = ?2 WHERE id = ?3",
             params![cover_local, chrono::Utc::now().to_rfc3339(), id],
         )?;
         Ok(())
@@ -510,6 +1154,7 @@ impl Database {
     /// 0:id 1:name 2:name_en 3:cover_local 4:cover_url 5:description 6:developer
     /// 7:publisher 8:release_date 9:genres 10:hltb_main_story 11:hltb_main_extra
     /// 12:hltb_completionist 13:rating 14:review 15:status 16:added_at 17:updated_at
+    /// 18:screenshot_dir
     fn row_to_review(row: &rusqlite::Row) -> rusqlite::Result<Review> {
         let genres_str: String = row.get(9)?;
         let genres: Vec<String> = serde_json::from_str(&genres_str).unwrap_or_default();
@@ -533,13 +1178,14 @@ impl Database {
             status: row.get(15)?,
             added_at: row.get(16)?,
             updated_at: row.get(17)?,
+            screenshot_dir: row.get(18)?,
         })
     }
 
     const REVIEW_COLUMNS: &'static str = "
         id, name, name_en, cover_local, cover_url, description, developer,
         publisher, release_date, genres, hltb_main_story, hltb_main_extra,
-        hltb_completionist, rating, review, status, added_at, updated_at
+        hltb_completionist, rating, review, status, added_at, updated_at, screenshot_dir
     ";
 
     /// 插入手账条目
@@ -548,9 +1194,9 @@ impl Database {
             "INSERT INTO reviews (
                 id, name, name_en, cover_local, cover_url, description, developer,
                 publisher, release_date, genres, hltb_main_story, hltb_main_extra,
-                hltb_completionist, rating, review, status, added_at, updated_at
+                hltb_completionist, rating, review, status, added_at, updated_at, screenshot_dir
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
             )",
             params![
                 review.id,
@@ -571,6 +1217,7 @@ impl Database {
                 review.status,
                 review.added_at,
                 review.updated_at,
+                review.screenshot_dir,
             ],
         )?;
         Ok(())
@@ -584,8 +1231,8 @@ impl Database {
                 developer = ?4, publisher = ?5, release_date = ?6,
                 genres = ?7, hltb_main_story = ?8, hltb_main_extra = ?9,
                 hltb_completionist = ?10, rating = ?11, review = ?12,
-                status = ?13, updated_at = ?14
-             WHERE id = ?15",
+                status = ?13, updated_at = ?14, screenshot_dir = ?15
+             WHERE id = ?16",
             params![
                 review.name,
                 review.name_en,
@@ -601,6 +1248,7 @@ impl Database {
                 review.review,
                 review.status,
                 chrono::Utc::now().to_rfc3339(),
+                review.screenshot_dir,
                 review.id,
             ],
         )?;
@@ -718,6 +1366,15 @@ impl Database {
         self.conn.execute(
             "UPDATE reviews SET cover_local = ?1, cover_url = ?1, updated_at = ?2 WHERE id = ?3",
             params![cover_local, chrono::Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
+    /// 清除手账封面字段（封面被移除/过期时用）
+    pub fn remove_review_cover(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE reviews SET cover_local = NULL, cover_url = NULL, updated_at = ?1 WHERE id = ?2",
+            params![chrono::Utc::now().to_rfc3339(), id],
         )?;
         Ok(())
     }
@@ -885,11 +1542,41 @@ impl Database {
     }
 
     /// 获取游戏时长排行榜
+    ///
+    /// 语义（2026-09-10 修正）：**删除游戏不删记录**——已移除条目的历史汇总留档在
+    /// play_stats_daily，这里 UNION 回榜，按墓碑（game_tombstones）还原名字，标记
+    /// `is_removed = 1`。此前只查 games 表，删掉游戏后它的时长会从「时长分析」里凭空消失，
+    /// 与总时长/热力图/本月时长（均取自 play_stats_daily，含已删历史）自相矛盾。
+    ///
+    /// - 名字来源：优先墓碑（删前最后的名称）；墓碑缺失的孤儿历史（2026-09-06 墓碑机制
+    ///   上线前删除的条目）用兜底名，保证时长的"明细拆分"永远能对上总数，绝不静默丢历史。
+    /// - 重装认领会把游戏放回 games 并清除墓碑，此时由第一个分支供应，不会重复计数。
     pub fn get_play_stats(&self, limit: u32) -> Result<Vec<GamePlayStats>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, play_time_seconds, play_count, last_played
-             FROM games WHERE play_time_seconds > 0
-             ORDER BY play_time_seconds DESC LIMIT ?1"
+            "SELECT game_id, game_name, total_seconds, play_count, last_played, is_removed
+             FROM (
+                SELECT id AS game_id, name AS game_name,
+                       play_time_seconds AS total_seconds,
+                       play_count AS play_count,
+                       last_played AS last_played,
+                       0 AS is_removed
+                FROM games
+                WHERE play_time_seconds > 0
+
+                UNION ALL
+
+                SELECT d.game_id,
+                       COALESCE(t.name, '已移除的游戏'),
+                       COALESCE(SUM(d.total_seconds), 0),
+                       COALESCE(SUM(d.session_count), 0),
+                       MAX(d.last_end),
+                       1
+                FROM play_stats_daily d
+                LEFT JOIN game_tombstones t ON t.id = d.game_id
+                WHERE NOT EXISTS (SELECT 1 FROM games g WHERE g.id = d.game_id)
+                GROUP BY d.game_id
+             )
+             ORDER BY total_seconds DESC LIMIT ?1"
         )?;
 
         let stats = stmt.query_map(params![limit], |row| {
@@ -899,6 +1586,7 @@ impl Database {
                 total_seconds: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
                 play_count: row.get::<_, i64>(3).unwrap_or(0).max(0) as u32,
                 last_played: row.get(4)?,
+                is_removed: row.get::<_, i64>(5).unwrap_or(0) != 0,
             })
         })?.collect::<Result<Vec<_>, _>>()?;
 
@@ -1023,13 +1711,25 @@ impl Database {
     }
 
     /// 获取总游玩时长
+    ///
+    /// 口径 =「每款游戏取两个账本里较大的那个，再求和」，而非只查 games：
+    /// - 正常追踪的游戏两个账本恒等（add_play_sessions_batch 同事务双写）；
+    /// - 已删除的游戏只在 play_stats_daily 留档（games 行已移除）→ 取 daily，总时长不随删除缩水；
+    /// - 备份导入 / 预聚合迁移前的老游戏只在 games 有累计值 → 取 games，不因缺明细而少算。
+    /// 只查 games 会让「总时长」与同页的本月/今日/热力图（均出自 daily）自相矛盾。
     pub fn get_total_play_time(&self) -> Result<u64> {
         let total: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(play_time_seconds), 0) FROM games",
+            "SELECT COALESCE(SUM(MAX(COALESCE(h.secs, 0), COALESCE(g.play_time_seconds, 0))), 0)
+             FROM (SELECT game_id AS gid FROM play_stats_daily
+                   UNION
+                   SELECT id FROM games) AS ids
+             LEFT JOIN games g ON g.id = ids.gid
+             LEFT JOIN (SELECT game_id AS gid, SUM(total_seconds) AS secs
+                        FROM play_stats_daily GROUP BY game_id) AS h ON h.gid = ids.gid",
             [],
             |row| row.get(0),
         )?;
-        Ok(total as u64)
+        Ok(total.max(0) as u64)
     }
 
     /// 获取游戏类型统计
@@ -1122,14 +1822,19 @@ impl Database {
         Ok(stats)
     }
 
-    /// 获取游戏状态统计（智能推导：有游玩时长但状态仍为 unplayed 的游戏视为 playing）
+    /// 获取游戏状态统计（三态口径，2026-09-06 与前端筛选对齐）：
+    /// - completed：用户手动标记已通关（优先判定，通关但从未启动也算已通关）
+    /// - played：启动过（play_time_seconds > 0）且未通关
+    /// - unplayed：从未启动（无时长）且未通关
+    /// 收藏是独立维度不参与互斥；不再产出 playing / abandoned 桶
+    /// （前端筛选已从四态精简为三态，见 stores/games.ts 与 HomeView statusOptions）。
     pub fn get_status_stats(&self) -> Result<StatusStats> {
         let mut stmt = self.conn.prepare(
             "SELECT
                 CASE
-                    WHEN play_time_seconds = 0 THEN 'unplayed'
-                    WHEN status = 'unplayed' AND play_time_seconds > 0 THEN 'playing'
-                    ELSE status
+                    WHEN status = 'completed' THEN 'completed'
+                    WHEN play_time_seconds > 0 THEN 'played'
+                    ELSE 'unplayed'
                 END as effective_status,
                 COUNT(*)
             FROM games GROUP BY effective_status"
@@ -1137,9 +1842,8 @@ impl Database {
 
         let mut stats = StatusStats {
             unplayed: 0,
-            playing: 0,
+            played: 0,
             completed: 0,
-            abandoned: 0,
         };
 
         let rows = stmt.query_map([], |row| {
@@ -1152,9 +1856,8 @@ impl Database {
             let (status, count) = row?;
             match status.as_str() {
                 "unplayed" => stats.unplayed = count,
-                "playing" => stats.playing = count,
+                "played" => stats.played = count,
                 "completed" => stats.completed = count,
-                "abandoned" => stats.abandoned = count,
                 _ => {}
             }
         }
@@ -1192,10 +1895,14 @@ impl Database {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<PlaySessionDetail>> {
+        // games 走 LEFT JOIN：删除游戏只移除库内条目，逐场明细留档（0.7.7 起不再级联删除），
+        // 已移除条目的会话仍要在「游玩记录」里可见，名字从墓碑还原、缺墓碑才用兜底名。
         let mut sql = String::from(
-            "SELECT ps.id, ps.game_id, g.name, ps.start_time, ps.end_time, ps.duration_seconds
+            "SELECT ps.id, ps.game_id, COALESCE(g.name, t.name, '已移除的游戏'),
+                    ps.start_time, ps.end_time, ps.duration_seconds
              FROM play_sessions ps
-             JOIN games g ON ps.game_id = g.id
+             LEFT JOIN games g ON ps.game_id = g.id
+             LEFT JOIN game_tombstones t ON ps.game_id = t.id
              WHERE 1=1"
         );
 
@@ -1303,9 +2010,9 @@ impl Database {
         let mut s = AchievementGlobalStats::default();
 
         s.game_count = self.conn.query_row("SELECT COUNT(*) FROM games", [], |r| r.get::<_, i64>(0))? as u64;
-        s.total_play_time = self.conn.query_row(
-            "SELECT COALESCE(SUM(play_time_seconds),0) FROM games", [], |r| r.get::<_, i64>(0),
-        )? as u64;
+        // 累计时长（G-04「废寝忘食」/ G-05「游戏人生」）与统计页「总游玩时长」同口径：
+        // 删除游戏只移除库内条目，玩家已经玩过的小时数不该因此缩水，否则被锁成就的进度条会随删除倒退。
+        s.total_play_time = self.get_total_play_time()?;
         // 会话数取日汇总累加值：短会话按规则不独立成条，不计入
         s.total_sessions = self.conn.query_row(
             "SELECT COALESCE(SUM(session_count),0) FROM play_stats_daily", [], |r| r.get::<_, i64>(0),
@@ -1715,6 +2422,54 @@ impl Database {
         Ok(())
     }
 
+    /// 迁移：拆掉 play_sessions 的外键级联（0.7.7）
+    ///
+    /// 旧表带 `ON DELETE CASCADE`（且 `PRAGMA foreign_keys=ON` 常开），删游戏时数据库会
+    /// **连带删掉该游戏的全部逐场明细**——与「删除游戏不删记录」的语义冲突，也让
+    /// `get_play_sessions`（游玩记录）在删除后凭空少掉一截。
+    /// SQLite 不能 ALTER 外键，只能重建表：新建无外键同构表 → 复制行 → 换名 → 重建索引。
+    /// 幂等：以 `pragma_foreign_key_list` 为准，无外键即返回；另记 settings 标记便于排查。
+    fn migrate_detach_session_fk(&self) -> Result<()> {
+        const FLAG: &str = "session_detach_v1_done";
+        let has_fk: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('play_sessions')",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_fk == 0 {
+            return Ok(());
+        }
+
+        // 注意：PRAGMA foreign_keys 在事务内是 no-op，必须在 BEGIN 之前切换
+        self.conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             BEGIN;
+             CREATE TABLE play_sessions_detached (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 game_id TEXT NOT NULL,
+                 start_time TEXT NOT NULL,
+                 end_time TEXT,
+                 duration_seconds INTEGER NOT NULL
+             );
+             INSERT INTO play_sessions_detached (id, game_id, start_time, end_time, duration_seconds)
+                 SELECT id, game_id, start_time, end_time, duration_seconds FROM play_sessions;
+             DROP TABLE play_sessions;
+             ALTER TABLE play_sessions_detached RENAME TO play_sessions;
+             CREATE INDEX IF NOT EXISTS idx_play_sessions_game_id ON play_sessions(game_id);
+             CREATE INDEX IF NOT EXISTS idx_play_sessions_start_time ON play_sessions(start_time);
+             COMMIT;
+             PRAGMA foreign_keys = ON;",
+        )?;
+
+        let kept: i64 = self.conn.query_row("SELECT COUNT(*) FROM play_sessions", [], |r| r.get(0))?;
+        tracing::info!(
+            "已拆除逐场明细的外键级联：保留 {} 条明细，此后删除游戏不再连明细一起删",
+            kept
+        );
+        self.set_setting(FLAG, "1")?;
+        Ok(())
+    }
+
     /// 迁移：创建游玩时长预聚合表
     /// - play_stats_daily：日粒度，统计页 / 热力图 / 成就的历史底座，永久保留
     /// - play_stats_hourly：时段粒度（游戏 × 小时 × 星期），供时段热力图与深夜类成就
@@ -2035,5 +2790,576 @@ impl SessionBuckets {
             is_dawn: (5..=7).contains(&hour),
             is_daytime: (9..=17).contains(&hour),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 墓碑认领闭环（2026-09-06）：删除留档 → 按 名字+exe文件名（大小写/空格不敏感）命中 →
+    /// 复用旧 id 入库 → 从预聚合回填累计时长/次数；exe 文件名不同则防误接；认领后墓碑清除。
+    #[test]
+    fn tombstone_reclaim_roundtrip() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+
+        // 造一个"已删除"的游戏：先入库再删除（delete_game 只删 games 行，汇总留档）
+        let old_id = uuid::Uuid::new_v4().to_string();
+        let mut game = Game::new("The Witcher 3".to_string());
+        game.id = old_id.clone();
+        game.exe_name = Some("witcher3.exe".to_string());
+        db.upsert_game(&game).unwrap();
+        db.delete_game(&old_id).unwrap();
+
+        // 历史汇总留档（模拟该游戏玩过 7200 秒 / 3 次）
+        db.conn
+            .execute_batch(&format!(
+                "INSERT INTO play_stats_daily (day, game_id, total_seconds, session_count)
+                 VALUES ('2026-09-01', '{}', 7200, 3);",
+                old_id
+            ))
+            .unwrap();
+
+        // 删除时写墓碑（命令层在 delete_game 中调用，此处直调）
+        db.insert_tombstone(
+            &old_id,
+            &game.name,
+            game.exe_name.as_deref(),
+            "2026-09-06T00:00:00Z",
+        )
+        .unwrap();
+
+        // 重装命中：名字大小写/首尾空格不同也应认领
+        let found = db
+            .find_tombstone_for_reclaim("  the witcher 3 ", Some("WITCHER3.EXE"))
+            .unwrap();
+        assert_eq!(found.as_deref(), Some(old_id.as_str()));
+
+        // 误接防御：同名但 exe 文件名不同 → 双键不命中（兜底是否可用由命令层按「库中无同名」判定）
+        let wrong = db
+            .find_tombstone_for_reclaim("The Witcher 3", Some("other.exe"))
+            .unwrap();
+        assert!(wrong.is_none(), "同名不同 exe 不应认领，防止偷走历史");
+
+        // 认领：复用旧 id 入库 + 从预聚合回填累计
+        let mut new_game = Game::new("The Witcher 3".to_string());
+        new_game.id = old_id.clone(); // 模拟命令层认领赋值
+        new_game.exe_name = Some("witcher3.exe".to_string());
+        db.upsert_game(&new_game).unwrap();
+        // 与命令层 add_game_manual 认领分支一一对应：认领成功即清墓碑，防止下次重装误接同一份历史
+        db.remove_tombstone(&old_id).unwrap();
+        db.reclaim_game_totals(&old_id).unwrap();
+
+        let (seconds, count): (u64, u32) = db
+            .conn
+            .query_row(
+                "SELECT play_time_seconds, play_count FROM games WHERE id = ?1",
+                params![old_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(seconds, 7200, "累计时长应从预聚合回填");
+        assert_eq!(count, 3, "游玩次数应从预聚合回填");
+
+        // 认领后墓碑已清除，再次查找应落空
+        let again = db
+            .find_tombstone_for_reclaim("The Witcher 3", Some("witcher3.exe"))
+            .unwrap();
+        assert!(again.is_none(), "认领成功后墓碑应被清除");
+    }
+
+    /// 删除游戏不删记录（2026-09-10）：条目移除后历史不得从统计里消失。
+    /// ① 时长排行仍列出它（名字走墓碑还原，is_removed=true）；
+    /// ② 总时长不随删除缩水，且不缺明细的库内条目也不会被少算（双账本取大）；
+    /// ③ 无墓碑的孤儿历史（老数据）也要在榜上，绝不静默丢时长；
+    /// ④ 重装认领（id 回库 + 墓碑清除）后由活条目分支供应，不得重复计数。
+    #[test]
+    fn removed_game_history_survives_deletion() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+
+        // 库内活条目：1 小时，走正常写入链路（games 与 play_stats_daily 同事务双写）
+        let alive_id = uuid::Uuid::new_v4().to_string();
+        let mut alive = Game::new("在库游戏".to_string());
+        alive.id = alive_id.clone();
+        alive.exe_name = Some("alive.exe".to_string());
+        db.upsert_game(&alive).unwrap();
+        db.add_play_session(&alive_id, "2026-09-05T20:00:00+08:00", 3600).unwrap();
+
+        // 已删除条目：games 无行，历史留档在 play_stats_daily，名字靠墓碑记住
+        let gone_id = uuid::Uuid::new_v4().to_string();
+        db.conn
+            .execute_batch(&format!(
+                "INSERT INTO play_stats_daily
+                    (day, game_id, total_seconds, session_count, last_end)
+                 VALUES ('2026-09-05', '{gone_id}', 46754, 17,
+                         '2026-09-06T04:53:45.540138500+00:00');"
+            ))
+            .unwrap();
+        db.insert_tombstone(
+            &gone_id,
+            "Mafia: The Old Country",
+            Some("MafiaTheOldCountry.exe"),
+            "2026-09-10T00:00:00Z",
+        )
+        .unwrap();
+
+        // 只存在于 games 的累计值（备份导入的老条目，预聚合表里没有明细）
+        let imported_id = uuid::Uuid::new_v4().to_string();
+        let mut imported = Game::new("备份导入的游戏".to_string());
+        imported.id = imported_id.clone();
+        imported.play_time_seconds = 900;
+        db.upsert_game(&imported).unwrap();
+
+        let stats = db.get_play_stats(20).unwrap();
+        assert_eq!(stats.len(), 3, "已移除条目仍应在榜上（与两个在库条目并列）");
+        assert_eq!(stats[0].game_id, gone_id, "13 小时应排第一");
+        assert_eq!(stats[0].game_name, "Mafia: The Old Country", "名字应从墓碑还原");
+        assert_eq!(stats[0].total_seconds, 46754);
+        assert_eq!(stats[0].play_count, 17);
+        assert!(stats[0].is_removed, "已移除条目应带标记");
+        assert_eq!(stats[1].game_id, alive_id);
+        assert!(!stats[1].is_removed, "库内活条目不应带标记");
+        assert_eq!(stats[1].total_seconds, 3600);
+        assert_eq!(stats[2].game_id, imported_id, "只在 games 有累计值的条目按库内累计上榜");
+        assert_eq!(stats[2].total_seconds, 900);
+
+        assert_eq!(
+            db.get_total_play_time().unwrap(),
+            3600 + 46754 + 900,
+            "总时长不随删除缩水，也不漏算只在 games 有累计值的条目"
+        );
+
+        // 无墓碑的孤儿历史（墓碑机制上线前的删除）同样保留，用兜底名
+        let legacy_id = uuid::Uuid::new_v4().to_string();
+        db.conn
+            .execute_batch(&format!(
+                "INSERT INTO play_stats_daily (day, game_id, total_seconds, session_count)
+                 VALUES ('2026-08-01', '{legacy_id}', 1800, 1);"
+            ))
+            .unwrap();
+        let stats = db.get_play_stats(20).unwrap();
+        let legacy = stats
+            .iter()
+            .find(|s| s.game_id == legacy_id)
+            .expect("无墓碑的孤儿历史也应上榜");
+        assert_eq!(legacy.game_name, "已移除的游戏");
+        assert!(legacy.is_removed);
+
+        // 重装认领：id 回库 + 墓碑清除 → 由活条目分支供应，旧历史原样续接且不重复计数
+        let mut reclaimed = Game::new("Mafia: The Old Country".to_string());
+        reclaimed.id = gone_id.clone();
+        reclaimed.exe_name = Some("MafiaTheOldCountry.exe".to_string());
+        db.upsert_game(&reclaimed).unwrap();
+        db.remove_tombstone(&gone_id).unwrap();
+        db.reclaim_game_totals(&gone_id).unwrap();
+
+        let stats = db.get_play_stats(20).unwrap();
+        assert_eq!(
+            stats.iter().filter(|s| s.game_id == gone_id).count(),
+            1,
+            "认领后不得重复计数"
+        );
+        let hit = stats.iter().find(|s| s.game_id == gone_id).unwrap();
+        assert!(!hit.is_removed, "回到库内后不再标记为已移除");
+        assert_eq!(hit.total_seconds, 46754, "认领回填的历史时长应完整");
+        assert_eq!(
+            db.get_total_play_time().unwrap(),
+            3600 + 46754 + 1800 + 900,
+            "总时长口径：每款游戏双账本取大后求和"
+        );
+    }
+
+    /// 删除游戏不删明细（2026-09-10 拆级联）：
+    /// 逐场明细必须留档，「游玩记录」里仍能看到已移除游戏的场次（名字走墓碑还原）。
+    #[test]
+    fn session_details_survive_game_deletion() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+        let fk: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('play_sessions')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fk, 0, "play_sessions 不应再有外键（删除游戏不删明细）");
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut game = Game::new("Mafia: The Old Country".to_string());
+        game.id = id.clone();
+        game.exe_name = Some("MafiaTheOldCountry.exe".to_string());
+        db.upsert_game(&game).unwrap();
+        db.add_play_session(&id, "2026-09-05T20:00:00+08:00", 3600).unwrap();
+        db.add_play_session(&id, "2026-09-06T21:00:00+08:00", 1800).unwrap();
+        assert_eq!(db.get_play_sessions(Some(&id), 10, 0).unwrap().len(), 2);
+
+        // 走真实删除链路：写墓碑 → 删 games 行
+        db.insert_tombstone(
+            &id,
+            &game.name,
+            game.exe_name.as_deref(),
+            "2026-09-10T00:00:00Z",
+        )
+        .unwrap();
+        db.delete_game(&id).unwrap();
+
+        let sessions = db.get_play_sessions(None, 10, 0).unwrap();
+        let mine: Vec<_> = sessions.iter().filter(|s| s.game_id == id).collect();
+        assert_eq!(mine.len(), 2, "删除游戏后逐场明细必须保留");
+        assert!(
+            mine.iter().all(|s| s.game_name == "Mafia: The Old Country"),
+            "名字应从墓碑还原"
+        );
+        // 汇总账本不受影响
+        assert_eq!(db.get_total_play_time().unwrap(), 3600 + 1800);
+    }
+
+    /// 老库拆级联迁移：重建表后逐场明细一行不少，且幂等
+    #[test]
+    fn detach_session_fk_migration_preserves_rows() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+
+        // 手工还原 0.7.6 之前的表结构（带 ON DELETE CASCADE）
+        db.conn
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE play_sessions;
+                 CREATE TABLE play_sessions (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     game_id TEXT NOT NULL,
+                     start_time TEXT NOT NULL,
+                     end_time TEXT,
+                     duration_seconds INTEGER NOT NULL,
+                     FOREIGN KEY (game_id) REFERENCES games(id) ON DELETE CASCADE
+                 );
+                 INSERT INTO play_sessions (game_id, start_time, end_time, duration_seconds)
+                     VALUES ('gone-game', '2026-08-01T20:00:00+08:00',
+                             '2026-08-01T21:00:00+08:00', 3600);
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+        let fk_before: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('play_sessions')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fk_before, 1, "前置条件：老表确实带外键");
+
+        db.migrate_detach_session_fk().unwrap();
+
+        let fk_after: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('play_sessions')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fk_after, 0, "迁移后外键应已拆除");
+        let (n, sum): (i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(duration_seconds), 0) FROM play_sessions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((n, sum), (1, 3600), "明细行必须原样保留");
+
+        // 幂等：再跑一次不报错也不丢数据
+        db.migrate_detach_session_fk().unwrap();
+        let n_again: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM play_sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_again, 1);
+    }
+
+    /// 名字兜底认领语义（2026-09-06）：墓碑 exe 为空 / 重装换了 exe 名的场景。
+    /// ① `None` 只命中 exe IS NULL 的墓碑——不抢同名有 exe 墓碑的历史，反之亦然；
+    /// ② 命令层以「库中无同名活条目」作为调用兜底的前置，count_games_by_name 提供该判定。
+    #[test]
+    fn tombstone_name_only_fallback() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+
+        // 同名两条墓碑：一条无 exe（手动条目删除留档）、一条有 exe（对照防误接）
+        let no_exe_id = uuid::Uuid::new_v4().to_string();
+        let exe_id = uuid::Uuid::new_v4().to_string();
+        db.insert_tombstone(&no_exe_id, "叙事驱动小品", None, "2026-09-06T00:00:00Z")
+            .unwrap();
+        db.insert_tombstone(&exe_id, "叙事驱动小品", Some("story.exe"), "2026-09-06T01:00:00Z")
+            .unwrap();
+
+        // 名字兜底只认 exe IS NULL 的墓碑
+        let hit = db
+            .find_tombstone_for_reclaim("叙事驱动小品", None)
+            .unwrap();
+        assert_eq!(hit.as_deref(), Some(no_exe_id.as_str()));
+
+        // 有 exe 的新条目走双键：命中自己的 exe 墓碑，不会落到无 exe 墓碑上
+        assert_eq!(
+            db.find_tombstone_for_reclaim("叙事驱动小品", Some("story.exe"))
+                .unwrap()
+                .as_deref(),
+            Some(exe_id.as_str()),
+            "带 exe 重装应认领自己的 exe 墓碑"
+        );
+        // exe 文件名对不上（疑似同名不同游戏）时双键不命中任何墓碑
+        assert!(
+            db.find_tombstone_for_reclaim("叙事驱动小品", Some("other.exe"))
+                .unwrap()
+                .is_none(),
+            "exe 不一致不应领走墓碑"
+        );
+
+        // 库中无同名活条目：count == 0（命令层据此放行兜底）
+        assert_eq!(db.count_games_by_name("叙事驱动小品").unwrap(), 0);
+
+        // 换 exe 名重装（如 Steam 版删了装 GOG 版）后库中出现同名活条目：
+        // count > 0 → 命令层将放弃兜底，防止同名不同游戏互偷历史
+        let mut alive = Game::new("叙事驱动小品".to_string());
+        alive.exe_name = Some("story_gog.exe".to_string());
+        db.upsert_game(&alive).unwrap();
+        assert_eq!(db.count_games_by_name("叙事驱动小品").unwrap(), 1);
+    }
+
+    /// 手账英文名存量回填（2026-09-06）：纯 ASCII 名且 name_en 空/空白 → 补 name_en；
+    /// 中文名与已有 name_en 的条目不触碰；幂等（跑两次不产生新变更）。
+    #[test]
+    fn backfill_review_name_en_roundtrip() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+        // 注意：Database::new 已把迁移在空库上跑过一遍并置位 FLAG，
+        // 这里先清掉 FLAG，才能模拟「老库升级 + 已有存量数据 + 未迁移」的真实起点。
+        db.conn
+            .execute(
+                "DELETE FROM settings WHERE key = 'review_name_en_backfill_v1_done'",
+                [],
+            )
+            .unwrap();
+        let rows = [
+            ("r1", "Mafia: The Old Country", None),
+            ("r2", "Hollow Knight", Some("")),
+            ("r3", "空洞骑士", None),
+            ("r4", "Celeste", Some("Celeste")),
+            ("r5", "Portal 2", Some("   ")),
+        ];
+        for (id, name, name_en) in rows {
+            db.conn
+                .execute(
+                    "INSERT INTO reviews (id, name, name_en, added_at) VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z')",
+                    params![id, name, name_en],
+                )
+                .unwrap();
+        }
+
+        db.migrate_backfill_review_name_en().unwrap();
+
+        let name_en_of = |id: &str| -> Option<String> {
+            db.conn
+                .query_row(
+                    "SELECT name_en FROM reviews WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            name_en_of("r1").as_deref(),
+            Some("Mafia: The Old Country"),
+            "NULL name_en 的纯英文名应回填"
+        );
+        assert_eq!(
+            name_en_of("r2").as_deref(),
+            Some("Hollow Knight"),
+            "空串 name_en 的纯英文名应回填"
+        );
+        assert_eq!(
+            name_en_of("r5").as_deref(),
+            Some("Portal 2"),
+            "纯空白 name_en 的纯英文名应回填"
+        );
+        assert_eq!(name_en_of("r3"), None, "中文名不填 name_en");
+        assert_eq!(
+            name_en_of("r4").as_deref(),
+            Some("Celeste"),
+            "已有 name_en 不被覆盖"
+        );
+
+        // 幂等：重跑不再产生变更（FLAG 已置位，直接 return）
+        db.migrate_backfill_review_name_en().unwrap();
+        assert_eq!(
+            db.get_setting("review_name_en_backfill_v1_done").unwrap().as_deref(),
+            Some("1")
+        );
+    }
+
+    /// 测试临时目录守卫：Drop 时清理，断言失败也不留垃圾
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 手账截图目录存量回填（2026-09-12）：游戏从游戏库删除（只留墓碑）后手账截图库仍可定位。
+    ///
+    /// 覆盖四条判定：墓碑 exe 命中 / 活条目 exe 指向空目录时退名称匹配 / 名称唯一命中 /
+    /// 同键多目录歧义不猜 / 无候选留空。
+    #[test]
+    fn backfill_review_screenshot_dir_roundtrip() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+
+        // 造真实文件布局：GoW 是空目录（模拟游戏库 exe 名与实际截图目录名不一致的残留）
+        let root = std::env::temp_dir().join(format!("gv_shot_test_{}", uuid::Uuid::new_v4()));
+        let mk = |name: &str, files: &[&str]| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            for f in files {
+                std::fs::write(d.join(f), b"x").unwrap();
+            }
+        };
+        mk("MafiaTheOldCountry", &["a.png"]);
+        mk("GoW", &[]);
+        mk("God of War", &["a.png", "b.jpg"]);
+        mk("Alan Wake 2", &["a.png"]);
+        mk("AmbiguousA", &["a.png"]);
+        mk("Ambiguous A", &["a.png"]);
+        let _guard = TempDirGuard(root.clone());
+
+        // 活条目：God of War，exe 指向空的 GoW 目录
+        let mut gow = Game::new("God of War".to_string());
+        gow.exe_name = Some("GoW.exe".to_string());
+        db.upsert_game(&gow).unwrap();
+        // 墓碑：Mafia 已从游戏库删除
+        db.insert_tombstone(
+            &uuid::Uuid::new_v4().to_string(),
+            "Mafia: The Old Country",
+            Some("MafiaTheOldCountry.exe"),
+            "2026-09-10T13:26:02Z",
+        )
+        .unwrap();
+
+        let rows = [
+            ("r1", "Mafia: The Old Country", Some("Mafia: The Old Country")),
+            ("r2", "God of War", Some("God of War")),
+            ("r3", "心灵杀手2", Some("Alan Wake 2")),
+            ("r4", "Ambiguous A", Some("AmbiguousA")),
+            ("r5", "Bulletstorm", None),
+        ];
+        for (id, name, name_en) in rows {
+            db.conn
+                .execute(
+                    "INSERT INTO reviews (id, name, name_en, added_at) VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z')",
+                    params![id, name, name_en],
+                )
+                .unwrap();
+        }
+
+        let subdirs = crate::core::screenshot::list_image_subdirs(&root);
+        // 空目录 GoW 不应出现在候选里
+        assert!(!subdirs.iter().any(|(n, _)| n == "GoW"));
+
+        let filled = db.backfill_review_screenshot_dirs(&subdirs).unwrap();
+        assert_eq!(filled.len(), 3, "仅 3 条能确定目录: {:?}", filled);
+
+        let shot_of = |id: &str| -> Option<String> {
+            db.conn
+                .query_row(
+                    "SELECT screenshot_dir FROM reviews WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            shot_of("r1").as_deref(),
+            Some("MafiaTheOldCountry"),
+            "游戏已删除 → 借墓碑 exe 定位"
+        );
+        assert_eq!(
+            shot_of("r2").as_deref(),
+            Some("God of War"),
+            "活条目 exe 指向空目录 → 退名称唯一匹配，指向真正有图的目录"
+        );
+        assert_eq!(
+            shot_of("r3").as_deref(),
+            Some("Alan Wake 2"),
+            "中文名 + 英文名 → 英文名唯一命中"
+        );
+        assert_eq!(shot_of("r4"), None, "同键多目录必须放弃，不猜");
+        assert_eq!(shot_of("r5"), None, "无候选留空，交给手动指定");
+
+        // 二次运行：已有值不覆盖、无新增（幂等）
+        assert!(db
+            .backfill_review_screenshot_dirs(&subdirs)
+            .unwrap()
+            .is_empty());
+
+        // 手动指定值不被回填覆盖
+        db.conn
+            .execute(
+                "UPDATE reviews SET screenshot_dir = '手工指定' WHERE id = 'r1'",
+                [],
+            )
+            .unwrap();
+        db.backfill_review_screenshot_dirs(&subdirs).unwrap();
+        assert_eq!(shot_of("r1").as_deref(), Some("手工指定"));
+    }
+
+    /// 真实数据演练（默认忽略，**只跑副本**）：
+    /// ```text
+    /// GV_DRYRUN_DB=<db 副本路径> cargo test --lib review_screenshot_dir_real_data_dryrun -- --ignored --nocapture
+    /// ```
+    /// 上线前验证截图目录回填结果，全程不触碰用户真实数据。
+    #[test]
+    #[ignore]
+    fn review_screenshot_dir_real_data_dryrun() {
+        let Ok(db_path) = std::env::var("GV_DRYRUN_DB") else {
+            eprintln!("未设置 GV_DRYRUN_DB，跳过");
+            return;
+        };
+        // Database::new 会在打开副本时跑完全部迁移（含截图目录回填）
+        let db = Database::new(std::path::Path::new(&db_path)).expect("打开副本库失败");
+
+        let root = db.screenshot_root_dir();
+        println!("截图根目录: {:?}", root);
+
+        let rows: Vec<(String, String, Option<String>, Option<String>)> = db
+            .conn
+            .prepare("SELECT id, name, name_en, screenshot_dir FROM reviews ORDER BY name")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        println!("共 {} 条手账，回填结果：", rows.len());
+        for (_id, name, name_en, dir) in rows {
+            match dir {
+                None => println!("  ✗ 《{}》 未回填（需手动指定）", name),
+                Some(dir) => {
+                    let path = root.as_ref().map(|r| r.join(&dir));
+                    let count = path
+                        .as_deref()
+                        .map(crate::core::screenshot::count_images)
+                        .unwrap_or(0);
+                    println!(
+                        "  ✓ 《{}》(name_en={:?}) → '{}'  {} 张",
+                        name, name_en, dir, count
+                    );
+                }
+            }
+        }
     }
 }

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use reqwest::Client;
 use crate::models::settings::{DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL};
+use crate::core::genres;
 use crate::utils::constants::*;
 
 /// LLM 协议类型
@@ -563,7 +564,18 @@ impl LlmFetcher {
 
 /// 构建 system prompt（含 few-shot 示例）
 fn build_system_prompt() -> String {
-    "你是一个游戏信息查询助手。用户会给你一个游戏名称，你需要提供该游戏的结构化信息。\n\
+    // 类型清单动态内联：规范表是唯一事实来源，改 core/genres.rs 即可同步提示词，
+    // 避免提示词里写死一份、代码里跑另一份导致口径漂移。
+    //
+    // 用占位符替换而非 format!：模板内含大量 JSON 示例花括号，format! 需全部转义成 {{ }}，
+    // 改一处就漏一处，可读性也会毁掉。
+    const TEMPLATE: &str =
+    "你是一个游戏信息查询助手。用户会给你一个游戏名称，你需要提供该游戏在【Windows PC 平台】上的结构化信息。\n\
+     \n\
+     【平台红线】用户运行的是 Windows PC 版游戏。很多知名游戏首发于主机、后来才登陆 PC 甚至从未登陆 PC，不特意区分就会给错信息，因此：\n\
+     - release_date 以 PC 版发售日期为准；与主机首发日期不同时必须给 PC 版日期，无法确定 PC 版日期时填 null，不要拿主机日期充数\n\
+     - save_paths 只给 Windows PC 版的存档位置；该游戏没有 PC 版时一律填空数组 []，绝不要编造主机版或模拟器的路径\n\
+     - 该游戏没有 PC 版时，name、description 等其余字段仍按游戏本身如实填写\n\
      \n\
      【重要】你的回复必须且只能是一个合法的 JSON 对象，不要添加任何其他文字、解释、前缀或 markdown 标记。\n\
      \n\
@@ -574,8 +586,8 @@ fn build_system_prompt() -> String {
        \"description\": \"游戏的简短描述（中文，100字以内）\",\n\
        \"developer\": \"开发商名称\",\n\
        \"publisher\": \"发行商名称\",\n\
-       \"release_date\": \"发售日期（格式：YYYY-MM-DD）\",\n\
-       \"genres\": [\"类型1\", \"类型2\"],\n\
+       \"release_date\": \"PC 版发售日期（格式：YYYY-MM-DD）\",\n\
+       \"genres\": [\"类型1\", \"类型2\"],  // 必须从下方规范类型表中选择，见注意事项\n\
        \"hltb_main_story\": 主线通关时长（分钟，整数，无法确定填 null）,\n\
        \"hltb_main_extra\": 主线+支线时长（分钟，整数，无法确定填 null）,\n\
        \"hltb_completionist\": 完美通关时长（分钟，整数，无法确定填 null）,\n\
@@ -603,14 +615,16 @@ fn build_system_prompt() -> String {
      - 如果名称已经是正确的，也请返回完整的正式名称\n\
      - name_en 必须是该游戏在 Steam 等平台使用的官方英文名称（无论用户输入何种语言都要提供），确实没有官方英文名时填 null\n\
      - 某项信息确实无法确定时，填 null\n\
-     - genres 不确定时填空数组 []\n\
-     - release_date 必须严格使用 YYYY-MM-DD 格式\n\
-     - hltb 时长根据 HowLongToBeat 数据或你的知识估算，单位为分钟（整数），如《塞尔达传说：旷野之息》主线约50小时则填 3000\n\
-     - save_paths 为该游戏存档文件或存档文件夹的常见路径。支持 %%APPDATA%%、%%USERPROFILE%%、%%LOCALAPPDATA%% 等 Windows 环境变量\n\
+     - genres 必须从下面的【规范类型表】中选择 1-3 个，严格照抄表内写法（{genre_list}）\n\
+     - genres 禁止自造类型、禁止写英文、禁止写表中没有的近义词；确实无法确定时填空数组 []\n\
+     - release_date 必须严格使用 YYYY-MM-DD 格式，且以 PC 版发售日为准（平台红线见上）\n\
+     - hltb 时长根据 HowLongToBeat 数据或你的知识估算，单位为分钟（整数），如《艾尔登法环》主线约60小时则填 3600\n\
+     - save_paths 为该游戏 Windows PC 版存档文件或存档文件夹的常见路径（Steam 版优先）。支持 %%APPDATA%%、%%USERPROFILE%%、%%LOCALAPPDATA%% 等 Windows 环境变量\n\
      - 如果无法确定存档路径，save_paths 填空数组 []\n\
      - 如果搜索到的信息与你的知识冲突，以搜索结果为准\n\
-     - 不要用 markdown 代码块包裹，直接返回 JSON"
-        .to_string()
+     - 不要用 markdown 代码块包裹，直接返回 JSON";
+
+    TEMPLATE.replace("{genre_list}", &genres::genre_prompt_list())
 }
 
 /// 构建 user prompt（清理控制字符，防止 LLM 提示注入）
@@ -619,7 +633,12 @@ fn build_user_prompt(game_name: &str) -> String {
         .chars()
         .filter(|c| !c.is_control())
         .collect();
-    format!("请提供游戏《{}》的信息。", sanitized.trim())
+    // 平台限定在 user prompt 再钉一次：部分模型对 system prompt 的遵循弱于 user prompt，
+    // 尤其「主机独占名作」很容易顺口给主机版发售日期/存档路径
+    format!(
+        "请提供游戏《{}》的 Windows PC 版信息（发售日期与存档路径以 PC 版为准）。",
+        sanitized.trim()
+    )
 }
 
 /// 对 LLM 返回的元数据做后处理校验
@@ -671,14 +690,8 @@ fn sanitize_meta(mut meta: LlmGameMeta) -> LlmGameMeta {
     meta.hltb_main_extra = meta.hltb_main_extra.filter(|&v| v > 0 && v < 100_000);
     meta.hltb_completionist = meta.hltb_completionist.filter(|&v| v > 0 && v < 100_000);
 
-    // 4. genres 去重 + trim
-    meta.genres = meta.genres
-        .iter()
-        .map(|g| g.trim().to_string())
-        .filter(|g| !g.is_empty())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
+    // 4. genres 归一化：对齐规范类型表（英文写法映射为中文，如 Action→动作），再去重
+    meta.genres = genres::normalize_genres(&meta.genres);
 
     // 5. save_paths trim
     meta.save_paths = meta.save_paths
@@ -947,6 +960,35 @@ mod tests {
         let text = "这是游戏信息：\n```json\n{\"description\":\"测试\",\"developer\":null,\"publisher\":null,\"release_date\":null,\"genres\":[]}\n```\n以上是信息。";
         let meta = extract_json(text).unwrap();
         assert_eq!(meta.description.unwrap(), "测试");
+    }
+
+    /// 提示词必须把规范类型表整表注入，否则「让 LLM 从表内选」就是空话
+    #[test]
+    fn test_system_prompt_embeds_canonical_genres() {
+        let prompt = build_system_prompt();
+        // 占位符已被替换（漏替换会把 {genre_list} 原样发给 LLM）
+        assert!(!prompt.contains("{genre_list}"));
+        assert!(prompt.contains(&genres::genre_prompt_list()));
+        // 抽样确认规范名与「禁止自造」约束都在
+        assert!(prompt.contains("动作"));
+        assert!(prompt.contains("类银河战士恶魔城"));
+        assert!(prompt.contains("禁止自造类型"));
+    }
+
+    /// 平台限定必须钉进两级提示词：主机独占游戏（无 PC 版）不得输出主机发售日期/存档路径
+    #[test]
+    fn test_prompts_pin_windows_pc_platform() {
+        let prompt = build_system_prompt();
+        assert!(prompt.contains("Windows PC"));
+        assert!(prompt.contains("平台红线"));
+        assert!(prompt.contains("PC 版发售日期"));
+        assert!(prompt.contains("不要拿主机日期充数"));
+        // 主机独占的例子会自相矛盾，不应再出现在 PC 语境的提示词里
+        assert!(!prompt.contains("塞尔达传说"));
+
+        let user = build_user_prompt("血缘");
+        assert!(user.contains("Windows PC"));
+        assert!(user.contains("血缘"));
     }
 
     #[test]

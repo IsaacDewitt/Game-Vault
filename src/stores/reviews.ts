@@ -81,12 +81,16 @@ export const useReviewsStore = defineStore("reviews", () => {
     return result;
   });
 
-  /** 将封面本地路径转为 asset URL */
+  /** 将封面本地路径转为 asset URL（带 updated_at 破折，防同路径覆盖后 WebView 命中缓存不刷新） */
   function coverSrc(review: Review): string | null {
     const p = review.cover_local || review.cover_url;
     if (!p) return null;
     try {
-      return convertFileSrc(p);
+      const url = convertFileSrc(p);
+      // 更换封面时新图覆盖同名文件，asset URL 不变 → WebView 图片缓存会让界面显示旧图；
+      // updated_at 每次换封面都会被后端刷新，拼进 URL 即可强制重载
+      const t = review.updated_at ? encodeURIComponent(review.updated_at) : review.id;
+      return `${url}${url.includes("?") ? "&" : "?"}t=${t}`;
     } catch (e) {
       console.error("转换封面路径失败:", review.id, e);
       return null;
@@ -176,9 +180,16 @@ export const useReviewsStore = defineStore("reviews", () => {
     return updated;
   }
 
-  /** 删除手账条目 */
-  async function removeReview(reviewId: string) {
-    await api.deleteReview(reviewId);
+  /** 指定截图目录（null 清除，回到自动推断） */
+  async function setScreenshotDir(reviewId: string, dir: string | null) {
+    const updated = await api.setReviewScreenshotDir(reviewId, dir);
+    updateReviewInStore(reviewId, updated);
+    return updated;
+  }
+
+  /** 删除手账条目。keepCover 默认 true：封面挪进 covers/archive 留档 */
+  async function removeReview(reviewId: string, keepCover = true) {
+    await api.deleteReview(reviewId, keepCover);
     reviews.value = reviews.value.filter((r) => r.id !== reviewId);
     if (selectedReview.value?.id === reviewId) {
       selectedReview.value = null;
@@ -237,6 +248,7 @@ export const useReviewsStore = defineStore("reviews", () => {
     setRating,
     setReview,
     setStatus,
+    setScreenshotDir,
     removeReview,
     fetchCoverOptions,
     setCoverFromUrl,

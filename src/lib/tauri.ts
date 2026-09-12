@@ -55,6 +55,8 @@ export interface PlayStats {
   total_seconds: number;
   play_count: number;
   last_played: string | null;
+  /** 该条目已从库内移除，仅保留历史时长（删除游戏不删记录） */
+  is_removed: boolean;
 }
 
 export interface DailyStats {
@@ -82,9 +84,8 @@ export interface HourlyStats {
 
 export interface StatusStats {
   unplayed: number;
-  playing: number;
+  played: number;
   completed: number;
-  abandoned: number;
 }
 
 export interface Settings {
@@ -185,8 +186,9 @@ export async function toggleFavorite(gameId: string): Promise<boolean> {
   return invoke("toggle_favorite", { gameId });
 }
 
-export async function deleteGame(gameId: string): Promise<void> {
-  return invoke("delete_game", { gameId });
+/** 删除游戏。keepCover 默认 true：封面挪进 covers/archive 留档，重装后自动回归 */
+export async function deleteGame(gameId: string, keepCover = true): Promise<void> {
+  return invoke("delete_game", { gameId, keepCover });
 }
 
 export async function addGameManual(name: string, exePath: string): Promise<Game> {
@@ -221,7 +223,16 @@ export async function fetchMissingGameInfo(): Promise<CoverFetchResult> {
   return invoke("fetch_missing_game_info");
 }
 
-export async function getAllCovers(): Promise<Record<string, string>> {
+/**
+ * 封面路径集合：main 为原图（详情页用），thumb 为缩略图（卡片网格/排行用，可缺省）。
+ * 含已移除游戏的留档封面（时长排行里的「已移除」条目照样有图）。
+ */
+export interface CoverSet {
+  main: string | null;
+  thumb: string | null;
+}
+
+export async function getAllCovers(): Promise<Record<string, CoverSet>> {
   return invoke("get_all_covers");
 }
 
@@ -296,8 +307,25 @@ export async function saveSettings(settings: Settings): Promise<void> {
   return invoke("save_settings", { settings });
 }
 
-export async function exportGameData(): Promise<string> {
-  return invoke("export_game_data");
+/** 自动保存白名单字段：改动即生效项（主题/主题色/截图目录/快捷键/语言） */
+export type AutoSavePatch = Partial<
+  Pick<
+    Settings,
+    "theme" | "accent_color" | "screenshot_dir" | "screenshot_hotkey" | "language"
+  >
+>;
+
+/**
+ * 自动保存（主题/主题色/截图目录/快捷键等即时生效字段）。
+ * 后端只落盘 patch 内白名单键，其余设置保持库中现值——
+ * 不会把改了但没点「保存设置」的 LLM/密钥/窗口尺寸顺带写盘。
+ */
+export async function saveSettingsPartial(patch: AutoSavePatch): Promise<void> {
+  return invoke("save_settings_partial", { patch });
+}
+
+export async function exportGameData(filePath: string): Promise<{ main_path: string; keys_path: string }> {
+  return invoke("export_game_data", { filePath });
 }
 
 export async function renameGame(gameId: string, newName: string): Promise<void> {
@@ -308,8 +336,8 @@ export async function updateExePath(gameId: string, newExePath: string): Promise
   return invoke("update_exe_path", { gameId, newExePath });
 }
 
-export async function importGameData(jsonData: string): Promise<{ imported_games: number; settings_restored: boolean }> {
-  return invoke("import_game_data", { jsonData });
+export async function importGameData(filePath: string): Promise<{ imported_games: number; settings_restored: boolean; keys_restored: number }> {
+  return invoke("import_game_data", { filePath });
 }
 
 export async function getAllGenres(): Promise<string[]> {
@@ -408,9 +436,44 @@ export type ScreenshotOutcome =
   | { outcome: "foreground_mismatch" }
   | { outcome: "failed"; message: string };
 
-/** 打开某个游戏的截图文件夹（在文件管理器中） */
-export async function openScreenshotDir(gameId: string): Promise<void> {
-  return invoke("open_screenshot_dir", { gameId });
+/** 截图目录信息（路径 / 是否存在 / 已有截图数量 / 定位来源） */
+export interface ScreenshotDirInfo {
+  path: string;
+  exists: boolean;
+  count: number;
+  /** 定位来源："manual"(手账手动指定) | "game"(同名游戏 exe) | "tombstone"(游戏已删除，借墓碑) | "root"(截图根目录) */
+  source: string;
+}
+
+/** 可选的截图目录（截图根目录下含图片的子目录） */
+export interface ScreenshotDirOption {
+  /** 目录名（相对截图根目录） */
+  name: string;
+  count: number;
+}
+
+/**
+ * 打开截图文件夹（在文件管理器中）
+ * - 传 gameId：打开该游戏的截图目录（无 exe_name 时退回截图根目录）
+ * - 传 reviewId：打开手账条目的截图目录（手动指定 > 同名游戏 > 同名墓碑）
+ * - 都不传：打开截图根目录（设置页入口）
+ * 目录不存在时会自动创建
+ */
+export async function openScreenshotDir(gameId?: string, reviewId?: string): Promise<void> {
+  return invoke("open_screenshot_dir", { gameId: gameId ?? null, reviewId: reviewId ?? null });
+}
+
+/**
+ * 查询截图目录信息，不创建目录。
+ * 传 gameId 查该游戏目录，传 reviewId 查手账条目的目录，都不传查截图根目录
+ */
+export async function getScreenshotDir(gameId?: string, reviewId?: string): Promise<ScreenshotDirInfo> {
+  return invoke("get_screenshot_dir", { gameId: gameId ?? null, reviewId: reviewId ?? null });
+}
+
+/** 列出截图根目录下含图片的子目录（手账「指定截图目录」选择器用） */
+export async function listScreenshotDirs(): Promise<ScreenshotDirOption[]> {
+  return invoke("list_screenshot_dirs");
 }
 
 /** 查询截图热键注册状态：null=注册成功，字符串=注册失败原因 */
@@ -447,6 +510,11 @@ export interface Review {
   status: string;
   added_at: string;
   updated_at: string | null;
+  /**
+   * 截图库定位：截图根目录下的子目录名（null = 自动推断）。
+   * 手账自持该字段，游戏从游戏库删除后截图库照旧可用
+   */
+  screenshot_dir: string | null;
 }
 
 export interface ReviewFilter {
@@ -504,8 +572,14 @@ export async function setReviewStatus(reviewId: string, status: string): Promise
   return invoke("set_review_status", { reviewId, status });
 }
 
-export async function deleteReview(reviewId: string): Promise<void> {
-  return invoke("delete_review", { reviewId });
+/** 指定手账的截图目录（截图根目录下的单层文件夹名；传 null 清除，回到自动推断） */
+export async function setReviewScreenshotDir(reviewId: string, dir: string | null): Promise<Review> {
+  return invoke("set_review_screenshot_dir", { reviewId, dir });
+}
+
+/** 删除手账条目。keepCover 默认 true：封面挪进 covers/archive 留档 */
+export async function deleteReview(reviewId: string, keepCover = true): Promise<void> {
+  return invoke("delete_review", { reviewId, keepCover });
 }
 
 export async function fetchReviewCoverOptions(reviewId: string): Promise<CoverOption[]> {

@@ -25,6 +25,7 @@ import {
   TrophyOutline,
   TimeOutline,
   FolderOpenOutline,
+  ImagesOutline,
   CreateOutline,
   AddOutline,
   CloseOutline,
@@ -75,16 +76,59 @@ const showEditInfoModal = ref(false);
 // 最近游玩记录
 const recentSessions = ref<PlaySessionDetail[]>([]);
 
+// 截图库信息（解析后的目录 + 已有截图数量）
+const screenshotInfo = ref<api.ScreenshotDirInfo | null>(null);
+const openingScreenshots = ref(false);
+
+// 详情请求序号（2026-09-12）：本组件实例在切换游戏时被复用（父级未加 key），
+// 快速切游戏时旧游戏的响应可能后到并覆盖新游戏的数据，故按序号丢弃过期响应。
+let detailRequestSeq = 0;
+
+async function loadScreenshotInfo(gameId: string, seq: number) {
+  if (seq !== detailRequestSeq) return;
+  screenshotInfo.value = null;
+  try {
+    const info = await api.getScreenshotDir(gameId);
+    if (seq !== detailRequestSeq) return;
+    screenshotInfo.value = info;
+  } catch (e) {
+    console.error("获取截图目录信息失败:", e);
+    if (seq === detailRequestSeq) {
+      screenshotInfo.value = null;
+    }
+  }
+}
+
+async function handleOpenScreenshots() {
+  openingScreenshots.value = true;
+  try {
+    await api.openScreenshotDir(props.game.id);
+    // 目录可能刚被创建，打开后刷新数量
+    await loadScreenshotInfo(props.game.id, detailRequestSeq);
+  } catch (e) {
+    message.error("打开截图文件夹失败: " + (e as Error).toString());
+  } finally {
+    openingScreenshots.value = false;
+  }
+}
+
 watch(
   () => props.game.id,
   async (gameId) => {
     if (gameId) {
+      const seq = ++detailRequestSeq;
       try {
-        recentSessions.value = await api.getPlaySessions(gameId, 3);
+        const sessions = await api.getPlaySessions(gameId, 3);
+        if (seq !== detailRequestSeq) return;
+        recentSessions.value = sessions;
       } catch (e) {
         console.error("获取最近游玩记录失败:", e);
-        recentSessions.value = [];
+        if (seq === detailRequestSeq) {
+          recentSessions.value = [];
+        }
+        return;
       }
+      await loadScreenshotInfo(gameId, seq);
     }
   },
   { immediate: true }
@@ -120,7 +164,8 @@ function formatMinutes(minutes: number): string {
   return `${hours}小时${mins}分钟`;
 }
 
-const { coverImage, showPlaceholder, handleImageError } = useCoverImage(toRef(props, "game"));
+// 详情页展示大图，优先用原图（preferThumb = false）
+const { coverImage, showPlaceholder, handleImageError } = useCoverImage(toRef(props, "game"), false);
 
 // 标签颜色映射
 const genreColorMap: Record<string, string> = {
@@ -580,6 +625,34 @@ async function handleRemoveSavePath(index: number) {
         </div>
       </div>
 
+      <!-- 截图库 -->
+      <div class="screenshot-section">
+        <div class="section-title">
+          <n-icon :component="ImagesOutline" size="14" />
+          截图库
+          <n-button
+            size="tiny"
+            quaternary
+            :loading="openingScreenshots"
+            @click="handleOpenScreenshots"
+            style="margin-left: auto"
+          >
+            <template #icon>
+              <n-icon :component="FolderOpenOutline" />
+            </template>
+            打开
+          </n-button>
+        </div>
+        <div v-if="screenshotInfo" class="screenshot-item" @click="handleOpenScreenshots">
+          <span class="save-path-text" :title="screenshotInfo.path">{{ screenshotInfo.path }}</span>
+          <span v-if="screenshotInfo.count > 0" class="screenshot-count">
+            {{ screenshotInfo.count }} 张
+          </span>
+          <span v-else class="screenshot-empty">暂无截图</span>
+        </div>
+        <div v-else class="save-path-empty">正在读取截图目录…</div>
+      </div>
+
       <!-- 存档路径 -->
       <div class="save-paths-section">
         <div class="section-title">
@@ -876,6 +949,38 @@ async function handleRemoveSavePath(index: number) {
   font-size: 13px;
   font-weight: 600;
   color: #e0e0e0;
+}
+
+.screenshot-section {
+  margin-bottom: 16px;
+}
+
+.screenshot-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.screenshot-item:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.screenshot-count {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-color, #6366f1);
+}
+
+.screenshot-empty {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: #666;
 }
 
 .save-paths-section {

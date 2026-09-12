@@ -33,6 +33,9 @@ pub struct DailyStats {
 }
 
 /// 游戏时长排行榜
+///
+/// `is_removed`：该条目的历史来自 play_stats_daily 中已从库内移除的游戏
+/// （删除游戏不删记录，条目仍在榜上，仅标记为已移除）。库内活条目恒为 false。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GamePlayStats {
     pub game_id: String,
@@ -40,6 +43,8 @@ pub struct GamePlayStats {
     pub total_seconds: u64,
     pub play_count: u32,
     pub last_played: Option<String>,
+    #[serde(default)]
+    pub is_removed: bool,
 }
 
 /// 游戏类型统计
@@ -65,11 +70,11 @@ pub struct HourlyStats {
     pub total_seconds: u64,
 }
 
-/// 游戏状态统计
+/// 游戏状态统计（三态：未游玩 / 已游玩 / 已通关，2026-09-06 起与前端筛选口径对齐，
+/// 不再含 playing / abandoned 桶 —— 收藏是独立维度不参与状态互斥）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusStats {
     pub unplayed: u32,
-    pub playing: u32,
+    pub played: u32,
     pub completed: u32,
-    pub abandoned: u32,
 }

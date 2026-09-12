@@ -88,9 +88,8 @@ const heatmapStats = ref<HeatmapDay[]>([]);
 const hourlyStats = ref<HourlyStats[]>([]);
 const statusStats = ref<StatusStats>({
   unplayed: 0,
-  playing: 0,
+  played: 0,
   completed: 0,
-  abandoned: 0,
 });
 
 // 游玩会话历史
@@ -101,11 +100,25 @@ const sessionOffset = ref(0);
 const sessionHasMore = ref(true);
 const SESSION_PAGE_SIZE = 50;
 
+// 库内游戏 id 集合：会话历史里查不到的就是已移除条目
+// （删除游戏只移除库内条目，逐场明细留档，仍要在游玩记录里看得见）
+const libraryGameIds = computed(() => new Set(gamesStore.games.map((g) => g.id)));
+function isRemovedGame(gameId: string): boolean {
+  return !libraryGameIds.value.has(gameId);
+}
+
 // 游戏筛选选项（用于会话历史）
-const gameFilterOptions = computed(() => [
-  { label: "全部游戏", value: "" },
-  ...gamesStore.games.map((g) => ({ label: g.name, value: g.id })),
-]);
+// 活条目取自游戏库；已移除的游戏（历史留档）由时长排行补齐，否则它们的会话无法筛选
+const gameFilterOptions = computed(() => {
+  const options = gamesStore.games.map((g) => ({ label: g.name, value: g.id }));
+  const known = new Set(options.map((o) => o.value));
+  for (const s of playStats.value) {
+    if (s.is_removed && !known.has(s.game_id)) {
+      options.push({ label: s.game_name, value: s.game_id });
+    }
+  }
+  return [{ label: "全部游戏", value: "" }, ...options];
+});
 
 // 游戏主色调缓存 (game_id -> hex color)
 const gameColors = ref<Record<string, string>>({});
@@ -177,13 +190,12 @@ const overviewCards = computed(() => [
   },
 ]);
 
-// 游戏状态分布饼图
+// 游戏状态分布饼图（三态口径与首页筛选一致：未游玩=未通关且无时长 / 已游玩=启动过未通关 / 已通关=手动标记）
 const statusPieOption = computed(() => {
   const data = [
     { name: "未游玩", value: statusStats.value.unplayed, itemStyle: { color: "#8b5cf6" } },
-    { name: "游玩中", value: statusStats.value.playing, itemStyle: { color: "#3b82f6" } },
+    { name: "已游玩", value: statusStats.value.played, itemStyle: { color: "#3b82f6" } },
     { name: "已通关", value: statusStats.value.completed, itemStyle: { color: "#22c55e" } },
-    { name: "已弃坑", value: statusStats.value.abandoned, itemStyle: { color: "#6b7280" } },
   ].filter((item) => item.value > 0);
 
   return {
@@ -965,7 +977,10 @@ onUnmounted(() => {
                       <div v-else class="bar-icon-fallback">🎮</div>
                     </div>
                     <div class="bar-info">
-                      <div class="bar-name" :title="game.game_name">{{ game.game_name }}</div>
+                      <div class="bar-name" :title="game.game_name">
+                        {{ game.game_name }}
+                        <span v-if="game.is_removed" class="bar-removed-tag">已移除</span>
+                      </div>
                       <div class="bar-track">
                         <div
                           class="bar-fill"
@@ -1151,7 +1166,10 @@ onUnmounted(() => {
                 :key="session.id"
                 class="session-item"
               >
-                <div class="session-game-name">{{ session.game_name }}</div>
+                <div class="session-game-name">
+                  {{ session.game_name }}
+                  <span v-if="isRemovedGame(session.game_id)" class="bar-removed-tag">已移除</span>
+                </div>
                 <div class="session-details">
                   <span class="session-time">{{ formatDate(session.start_time) }}</span>
                   <span class="session-duration">{{ formatPlayTime(session.duration_seconds) }}</span>
@@ -1392,6 +1410,20 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   line-height: 1.2;
+}
+
+/* 「已移除」标记：删除游戏不删记录，条目仍在榜上，仅以此标明已不在库中 */
+.bar-removed-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 10px;
+  line-height: 15px;
+  color: #8b949e;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 3px;
+  vertical-align: 1px;
 }
 
 .bar-track {

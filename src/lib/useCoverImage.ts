@@ -6,8 +6,10 @@ import { useGamesStore } from "../stores/games";
  * 封面图片逻辑 composable
  * 通过 Tauri asset 协议（convertFileSrc）直接加载本地封面文件，
  * 避免全量 base64 传输；文件不存在或加载失败时回退到占位符。
+ *
+ * @param preferThumb 小尺寸场景（卡片网格）传 true 用缩略图；大图场景（详情页）传 false 用原图
  */
-export function useCoverImage(game: Ref<Game>) {
+export function useCoverImage(game: Ref<Game>, preferThumb = true) {
   const store = useGamesStore();
 
   // 标记图片渲染是否失败（asset URL 存在但无法渲染）
@@ -20,7 +22,7 @@ export function useCoverImage(game: Ref<Game>) {
 
   // 直接从 store 的封面路径映射生成 asset URL
   const coverImage = computed(() => {
-    return store.coverSrc(game.value.id);
+    return store.coverSrc(game.value.id, preferThumb);
   });
 
   // 如果配置了封面路径但没有可用的 asset URL，说明文件失效（删除/损坏）

@@ -66,3 +66,20 @@ pub const SESSION_RETENTION_DAYS: i64 = 365;
 
 /// 启动后延迟执行明细清理的秒数（避开启动高峰，避免拖慢首屏）
 pub const SESSION_CLEANUP_DELAY_SECS: u64 = 30;
+
+// ==================== 启动守卫（WebView 黑屏自愈） ====================
+
+/// 前端「报到」超时（秒）。
+///
+/// 窗口创建后，正常启动会在数百毫秒内完成前端挂载并报到（含 cold start）。
+/// 超过此值仍无报到，判定 `WebView` 创建失败（0x8007139F 一类静默失败），
+/// 触发自动重启。放得足够宽（正常值的数十倍）以免误杀慢盘/开机高峰。
+pub const FRONTEND_READY_TIMEOUT_SECS: u64 = 20;
+
+/// 连续自动重启的最大次数。超过则不再重启（避免无限重启循环），
+/// 改为弹窗告知用户手动处理。计数在「前端成功报到」时清零。
+pub const MAX_BOOT_RESTART_ATTEMPTS: u32 = 2;
+
+/// 看门狗轮询间隔（毫秒）。采用轮询而非一次性 sleep，
+/// 以便前端报到后立即退出线程，不空占资源。
+pub const BOOT_WATCHDOG_POLL_MS: u64 = 250;

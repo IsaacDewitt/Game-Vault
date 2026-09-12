@@ -44,6 +44,86 @@ pub fn screenshot_dir_for_process(screenshot_dir: &str, exe_name: &str) -> std::
     std::path::PathBuf::from(expanded).join(process_stem(exe_name))
 }
 
+// ==================== 截图目录枚举 / 匹配（手账自持截图目录用，2026-09-12） ====================
+
+/// 认定为截图的扩展名（与前端「N 张」口径一致）
+const IMAGE_EXTS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+
+/// 统计目录下的截图张数（非递归；目录不存在返回 0）
+pub fn count_images(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let path = e.path();
+            if !path.is_file() {
+                return false;
+            }
+            matches!(
+                path.extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+                    .as_deref()
+                    .map(|ext| IMAGE_EXTS.contains(&ext)),
+                Some(true)
+            )
+        })
+        .count()
+}
+
+/// 列出截图根目录下**含图片文件**的子目录：(目录名, 图片张数)，按目录名排序。
+///
+/// 手账回填与「指定截图目录」选择器共用：只暴露有图的目录，才不会把 `GoW` 这类
+/// 空目录（游戏库 exe 名与实际截图目录名不一致时产生）推给用户。
+pub fn list_image_subdirs(root: &std::path::Path) -> Vec<(String, usize)> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, usize)> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let count = count_images(&e.path());
+            if count > 0 {
+                Some((name, count))
+            } else {
+                None
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out
+}
+
+/// 名称 → 匹配键：仅保留字母数字并转小写。
+///
+/// 用于「手账名 vs 截图目录名」的对齐（`Assassin's Creed II` → `assassinscreedii`，
+/// 与目录 `Assassin's Creed  Brotherhood` 这类双空格、全角符号差异一并抹平）。
+/// 只做精确相等判定，不做包含匹配——避免 II / III 这类前缀互相误配。
+pub fn match_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// 校验并规范化用户指定的截图子目录名；非法（路径穿越 / 绝对路径 / 空）返回 None。
+///
+/// 只接受**单层目录名**：不含路径分隔符、不是 `.`/`..`、不带盘符或前导斜杠。
+pub fn sanitize_dir_name(name: &str) -> Option<String> {
+    let trimmed = name.trim().trim_end_matches(['\\', '/']).trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    if trimmed.contains(['\\', '/', ':']) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 /// 生成一个不重名的截图文件路径（同一秒多次截图自动加序号）
 fn build_unique_path(dir: &std::path::Path, stem: &str) -> std::path::PathBuf {
     let now = chrono::Local::now();
@@ -163,5 +243,64 @@ pub fn play_feedback(tone: FeedbackTone) {
             None,
             SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试临时目录守卫：Drop 时清理
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 目录名消毒：只接受单层目录名，挡住路径穿越与绝对路径
+    #[test]
+    fn sanitize_dir_name_blocks_traversal() {
+        assert_eq!(sanitize_dir_name("MafiaTheOldCountry").as_deref(), Some("MafiaTheOldCountry"));
+        assert_eq!(sanitize_dir_name("  Alan Wake 2  ").as_deref(), Some("Alan Wake 2"));
+        assert_eq!(sanitize_dir_name("dir\\").as_deref(), Some("dir"));
+
+        assert_eq!(sanitize_dir_name(".."), None);
+        assert_eq!(sanitize_dir_name("../etc"), None);
+        assert_eq!(sanitize_dir_name("a/b"), None);
+        assert_eq!(sanitize_dir_name(r"C:\Windows"), None);
+        assert_eq!(sanitize_dir_name("/abs"), None);
+        assert_eq!(sanitize_dir_name("   "), None);
+    }
+
+    /// 匹配键：抹平空格、标点与大小写，但保留字母数字差异（II ≠ III）
+    #[test]
+    fn match_key_normalizes() {
+        assert_eq!(match_key("Assassin's Creed  Brotherhood"), "assassinscreedbrotherhood");
+        assert_eq!(match_key("Assassin's Creed: Brotherhood"), "assassinscreedbrotherhood");
+        assert_eq!(match_key("SILENT HILL 2"), "silenthill2");
+        assert_eq!(match_key("Alan Wake 2"), "alanwake2");
+        assert_ne!(match_key("Assassin's Creed II"), match_key("Assassin's Creed III"));
+    }
+
+    /// 目录枚举：只收含图片的子目录，忽略空目录与根目录下的散落文件
+    #[test]
+    fn list_image_subdirs_filters_empty() {
+        let root = std::env::temp_dir().join(format!("gv_shot_dirs_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("HasImages")).unwrap();
+        std::fs::write(root.join("HasImages").join("a.png"), b"x").unwrap();
+        std::fs::write(root.join("HasImages").join("note.txt"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("EmptyDir")).unwrap();
+        std::fs::write(root.join("loose.png"), b"x").unwrap();
+        let _guard = TempDirGuard(root.clone());
+
+        let dirs = list_image_subdirs(&root);
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].0, "HasImages");
+        assert_eq!(dirs[0].1, 1, "txt 不计入张数");
+
+        // 根目录不存在：返回空而非 panic
+        assert!(list_image_subdirs(&root.join("nope")).is_empty());
     }
 }

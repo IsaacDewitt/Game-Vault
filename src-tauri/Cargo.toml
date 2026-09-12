@@ -1,6 +1,6 @@
 [package]
 name = "game-vault"
-version = "0.7.0"
+version = "0.7.8"
 description = "Game Vault - 轻量级游戏管理器"
 authors = ["Isaac"]
 edition = "2021"
@@ -59,6 +59,11 @@ windows-capture = "2.0.1"
 half = "2"
 png = "0.17"
 tauri-plugin-global-shortcut = "2"
+
+# 封面存储：解码 BMP/GIF 之外的常见格式 → 转码 WebP + 生成缩略图
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# 封面内容指纹（covers 索引去重与删除引用计数）
+sha2 = "0.10"
 
 # 提示音播放（PlaySoundW）+ SDR 白电平查询（DisplayConfig / Monitor API）
 windows = { version = "0.62", features = [

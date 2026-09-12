@@ -58,6 +58,11 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => [
     action: () => emit("click"),
   },
   {
+    label: "打开截图文件夹",
+    icon: "🖼️",
+    action: () => emit("openScreenshots"),
+  },
+  {
     label: "重命名游戏",
     icon: "✏️",
     action: () => emit("rename"),

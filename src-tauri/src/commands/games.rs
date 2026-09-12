@@ -3,6 +3,8 @@ use tauri_plugin_opener::OpenerExt;
 use std::sync::{Arc, Mutex};
 use crate::core::{Database, PlayTimeTracker, GameLauncher};
 use crate::core::cover_fetcher::CoverFetcher;
+use crate::core::cover_store;
+use crate::models::cover::OWNER_GAME;
 use crate::core::llm_fetcher::{LlmFetcher, LlmConfig, LlmProtocol, LlmGameMeta};
 use crate::models::*;
 use crate::models::settings::Settings;
@@ -94,35 +96,60 @@ pub fn toggle_favorite(
 /// 的历史汇总**有意保留**（通关后移除条目、历史统计留念）。因此删除后
 /// SUM(play_stats_daily) >= SUM(games.play_time_seconds)，差额即已删游戏的历史时长——
 /// 这是有意设计，不是数据错误，后续维护时不要"修复"这个差值。
+///
+/// `keep_cover`：`Some(true)`（默认）保留封面——文件挪进 covers/archive 留档，重装认领后自动回归；
+/// `Some(false)` 连封面一起删。前端删除前会询问用户，二者都遵循
+/// 「删除游戏 = 仅移除库内条目」的大原则（历史时长/成就/封面都不随删除蒸发）。
 #[tauri::command]
 pub fn delete_game(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
+    keep_cover: Option<bool>,
 ) -> Result<(), String> {
+    let keep_cover = keep_cover.unwrap_or(true);
+
     // 先获取游戏信息以清理封面文件
-    let cover_local = {
+    let has_any_cover = {
         let db_guard = lock_or_recover(&db);
         let game = db_guard.get_game_by_id(&game_id).map_err(|e| e.to_string())?;
-        db_guard.delete_game(&game_id).map_err(|e| e.to_string())?;
-        game.and_then(|g| g.cover_local)
-    };
 
-    // 清理封面缓存文件（所有可能的扩展名，与 set_game_cover 保持一致）
-    let covers_dir = utils::path::get_covers_dir();
-    for ext in &["jpg", "png", "jpeg", "webp"] {
-        let cover_path = covers_dir.join(format!("{}.{}", game_id, ext));
-        let _ = std::fs::remove_file(cover_path);
-    }
-
-    // 清理 cover_local 指向的文件（仅当在 covers 目录下时）
-    if let Some(ref local_path) = cover_local {
-        let path = std::path::Path::new(local_path);
-        if let Ok(canonical) = path.canonicalize() {
-            let covers_canonical = covers_dir.canonicalize().unwrap_or(covers_dir.clone());
-            if canonical.starts_with(&covers_canonical) {
-                let _ = std::fs::remove_file(&canonical);
+        // 删除留档：写墓碑（2026-09-06）。历史汇总与成就本就删而留档，墓碑记住旧 id + 识别键
+        // （名字 + exe 文件名），重装再入库时按名字认领、复用旧 id，孤儿历史统计即可自动续接。
+        // 路径刻意不存——换盘/挪目录重装照样能认领。墓碑写失败不应阻断删除，仅告警。
+        if let Some(g) = &game {
+            if let Err(e) = db_guard.insert_tombstone(
+                &g.id,
+                &g.name,
+                g.exe_name.as_deref(),
+                &chrono::Utc::now().to_rfc3339(),
+            ) {
+                tracing::warn!("写游戏墓碑失败（不影响删除）: {}", e);
             }
         }
+
+        let has_cover = !db_guard.cover_rows(OWNER_GAME, &game_id)
+            .map_err(|e| e.to_string())?
+            .is_empty()
+            || game.as_ref().map(|g| g.cover_local.is_some() || g.cover_url.is_some()).unwrap_or(false);
+
+        // 保留：归档（挪进 archive/，共享文件只改状态）；不保留：交给下面的 purge 递归处理
+        if keep_cover {
+            if let Err(e) = cover_store::archive(&db_guard, OWNER_GAME, &game_id) {
+                tracing::warn!("归档封面失败（不影响删除）: {}", e);
+            }
+        }
+
+        db_guard.delete_game(&game_id).map_err(|e| e.to_string())?;
+        has_cover
+    };
+
+    if !keep_cover {
+        let db_guard = lock_or_recover(&db);
+        if let Err(e) = cover_store::purge(&db_guard, OWNER_GAME, &game_id) {
+            tracing::warn!("删除封面失败（不影响删除）: {}", e);
+        }
+    } else if has_any_cover {
+        tracing::info!("已删除游戏，封面已留档（重装可续接）: {}", game_id);
     }
 
     Ok(())
@@ -158,7 +185,78 @@ pub fn add_game_manual(
         game.exe_file_size = Some(metadata.file_size);
     }
 
+    // 重装认领（2026-09-06）：若存在匹配的墓碑（即之前删除过、又装回来了的游戏），
+    // 复用其旧 id 入库——play_stats_daily/hourly 与 achievement_unlocks 里留存的孤儿历史
+    // 凭这个 id 自动续接（热力图/时长/成就原样回归）。匹配键刻意不含路径，换盘重装也能认领。
+    //
+    // 两段式：① 名字 + exe 文件名双键（能区分同名不同游戏就尽量区分）；
+    // ② 双键未命中且**库中已无同名活条目**时按名字兜底——此时不存在"同名不同游戏"冲突，
+    // 覆盖换 exe 名重装（Steam→GOG）、原条目无安装路径等双键对不上的真实场景。
+    let mut claimed_tombstone = false;
+    let mut tombstone_id = match game.exe_name.as_deref() {
+        Some(exe_name) => db
+            .find_tombstone_for_reclaim(&game.name, Some(exe_name))
+            .map_err(|e| e.to_string())?,
+        None => None,
+    };
+    if tombstone_id.is_none() {
+        let same_name_alive = db
+            .count_games_by_name(&game.name)
+            .map_err(|e| e.to_string())?;
+        if same_name_alive == 0 {
+            tombstone_id = db
+                .find_tombstone_for_reclaim(&game.name, None)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if let Some(old_id) = tombstone_id {
+        match db.get_game_by_id(&old_id) {
+            // 防呆：旧 id 已被其他途径复活（如备份导入）时不再认领，避免覆盖活条目
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    "墓碑 id {} 已存在于库中（疑似备份导入复活），跳过认领",
+                    old_id
+                );
+            }
+            Ok(None) => {
+                game.id = old_id.clone();
+                claimed_tombstone = true;
+                tracing::info!(
+                    "重装认领成功：「{}」复用旧 id {}，历史游玩统计与成就已续接",
+                    game.name,
+                    old_id
+                );
+            }
+            Err(e) => {
+                tracing::warn!("查重墓碑 id 失败，跳过认领: {}", e);
+            }
+        }
+    }
+
     db.upsert_game(&game).map_err(|e| e.to_string())?;
+
+    // 墓碑在**入库成功之后**才清除（2026-09-12 修正）：若先清后写而在 upsert 处失败，
+    // 墓碑已丢、旧 id 未回库，留档的历史统计与封面就再也认领不回来了。
+    if claimed_tombstone {
+        if let Err(e) = db.remove_tombstone(&game.id) {
+            // 清不掉也不算致命：后续认领会被"该 id 已在库中"的防呆挡下，不会误接
+            tracing::warn!("清除墓碑失败（不影响本次入库）: {}", e);
+        }
+    }
+
+    // 认领场景：新条目从 0 计，从预聚合表 SUM 回填累计时长/次数/上次游玩，让卡片数字完整回归
+    if claimed_tombstone {
+        if let Err(e) = db.reclaim_game_totals(&game.id) {
+            tracing::warn!("回填认领游戏累计时长失败: {}", e);
+        }
+        // 封面一并回归：留档在 archive/ 的封面挪回正式目录（与历史时长同一套续接语义）
+        match cover_store::restore(&db, OWNER_GAME, &game.id) {
+            Ok(true) => tracing::info!("已恢复「{}」的留档封面", game.name),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("恢复留档封面失败: {}", e),
+        }
+    }
+
     Ok(game)
 }
 
@@ -243,87 +341,79 @@ pub fn set_game_cover(
         return Err("选择的图片文件不存在".to_string());
     }
 
-    // 取源文件扩展名，默认 jpg
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("jpg");
-    let covers_dir = utils::path::get_covers_dir();
-    utils::path::ensure_dir_exists(&covers_dir).map_err(|e| e.to_string())?;
-    let dest = covers_dir.join(format!("{}.{}", game_id, ext));
-
-    // 清理旧封面文件（删除 covers 目录下该 game_id 的所有图片）
-    for old_ext in &["jpg", "png", "jpeg", "webp"] {
-        let old_path = covers_dir.join(format!("{}.{}", game_id, old_ext));
-        if old_path != dest {
-            let _ = std::fs::remove_file(&old_path);
-        }
-    }
-
-    std::fs::copy(src, &dest).map_err(|e| format!("复制封面文件失败: {}", e))?;
-
+    // 入库统一走 cover_store：解码 → 必要时转码 → 生成缩略图 → 写索引 → 清理旧文件。
+    // delete_src = false：用户手选的文件不动它，只把内容收进封面库。
     let db = lock_or_recover(&db);
-    db.update_game_cover(&game_id, &dest.to_string_lossy())
+    cover_store::ingest_path(&db, OWNER_GAME, &game_id, src, false)
+        .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
-/// 删除游戏封面（清除 cover_url 和 cover_local，同时删除本地文件）
+/// 删除游戏封面（摘索引 + 引用计数归零才删文件）
 #[tauri::command]
 pub fn remove_game_cover(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
 ) -> Result<(), String> {
     let db_guard = lock_or_recover(&db);
-
-    // 先获取游戏信息，拿到封面文件路径
-    let game = db_guard.get_game_by_id(&game_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "游戏不存在".to_string())?;
-
-    // 删除本地封面文件
-    if let Some(ref cover_url) = game.cover_url {
-        let path = std::path::Path::new(cover_url);
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(path) {
-                tracing::warn!("删除封面文件失败 {}: {}", cover_url, e);
-            }
-        }
-    }
-    if let Some(ref cover_local) = game.cover_local {
-        let path = std::path::Path::new(cover_local);
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(path) {
-                tracing::warn!("删除封面文件失败 {}: {}", cover_local, e);
-            }
-        }
-    }
-
-    // 清除数据库记录
-    db_guard.remove_game_cover(&game_id).map_err(|e| e.to_string())
+    cover_store::purge(&db_guard, OWNER_GAME, &game_id).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// 获取所有游戏的有效封面路径（供前端通过 asset 协议加载）
+///
+/// 返回 `{ game_id: { main, thumb } }`：
+/// - **含已移除游戏的留档封面**（state=archived）——时长排行里已删条目照样显示图片；
+/// - `thumb` 供卡片网格/排行等小尺寸场景使用，避免整张原图参与解码。
+/// - 索引缺失但 `cover_local` 指向的文件确实存在时兜底返回（迁移未跑完/外部放入）。
 #[tauri::command]
 pub fn get_all_covers(
     db: State<'_, Arc<Mutex<Database>>>,
-) -> Result<std::collections::HashMap<String, String>, String> {
+) -> Result<std::collections::HashMap<String, crate::models::CoverSet>, String> {
     let db_guard = lock_or_recover(&db);
-    let filter = GameFilter::default();
-    let games = db_guard.get_games(&filter).map_err(|e| e.to_string())?;
 
-    let mut covers = std::collections::HashMap::new();
+    let mut covers: std::collections::HashMap<String, crate::models::CoverSet> =
+        std::collections::HashMap::new();
 
+    for row in db_guard.all_cover_rows().map_err(|e| e.to_string())? {
+        if row.owner_kind != OWNER_GAME {
+            continue;
+        }
+        let abs = cover_store::abs_path(&row.rel_path);
+        if !abs.exists() {
+            continue;
+        }
+        let path = abs.to_string_lossy().to_string();
+        let entry = covers.entry(row.owner_id).or_default();
+        match row.kind.as_str() {
+            crate::models::KIND_MAIN => entry.main = Some(path),
+            crate::models::KIND_THUMB => entry.thumb = Some(path),
+            _ => {}
+        }
+    }
+
+    // 兜底：索引里没有、但 games.cover_local 指向的文件还在（迁移未跑完 / 外部放入）
+    let games = db_guard
+        .get_games(&GameFilter::default())
+        .map_err(|e| e.to_string())?;
     for game in games {
-        // 优先使用 cover_local，其次 cover_url
-        let cover_path = game.cover_local.as_ref().or(game.cover_url.as_ref());
-        if let Some(path_str) = cover_path {
-            let path = std::path::Path::new(path_str);
-            if path.exists() {
-                if let Ok(metadata) = std::fs::metadata(path) {
-                    if metadata.len() >= COVER_MIN_FILE_SIZE {
-                        covers.insert(game.id.clone(), path_str.clone());
-                    }
-                }
+        if covers.contains_key(&game.id) {
+            continue;
+        }
+        let Some(path_str) = game.cover_local.or(game.cover_url) else {
+            continue;
+        };
+        let path = std::path::Path::new(&path_str);
+        if !path.exists() {
+            continue;
+        }
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if metadata.len() >= COVER_MIN_FILE_SIZE {
+                let entry = crate::models::CoverSet {
+                    main: Some(path_str),
+                    thumb: None,
+                };
+                covers.insert(game.id.clone(), entry);
             }
         }
     }
@@ -418,11 +508,19 @@ pub async fn fetch_missing_covers(
         }));
 
         match fetcher.fetch_cover(game).await {
-            Ok(Some(cover_url)) => {
-                // 第三阶段：单次获取锁更新封面，然后立即释放
+            Ok(Some(cover_path)) => {
+                // 第三阶段：单次获取锁登记封面（转码/缩略图/索引），然后立即释放。
+                // 抓取器落盘的中间文件由 cover_store 在入库成功后清理（delete_src = true）。
                 let update_result = {
                     let db_guard = lock_or_recover(&db);
-                    db_guard.update_game_cover_url(&game.id, &cover_url)
+                    cover_store::ingest_path(
+                        &db_guard,
+                        OWNER_GAME,
+                        &game.id,
+                        std::path::Path::new(&cover_path),
+                        true,
+                    )
+                    .map(|_| ())
                 };
                 match update_result {
                     Ok(_) => {
@@ -501,26 +599,18 @@ pub async fn set_game_cover_from_url(
 
     let covers_dir = utils::path::get_covers_dir();
     utils::path::ensure_dir_exists(&covers_dir).map_err(|e| e.to_string())?;
-    // 默认请求 .jpg；download_from_url 会按实际图片格式决定最终扩展名并返回真实路径
-    let save_path = covers_dir.join(format!("{}.jpg", game_id));
+    // 先落到 covers 目录下的临时文件（download_from_url 会按实际图片格式定扩展名），
+    // 再由 cover_store 统一入库并清理这个中间文件
+    let save_path = covers_dir.join(format!(".{}.picked", game_id));
 
     let fetcher = CoverFetcher::new(covers_dir.clone(), api_key).map_err(|e| e.to_string())?;
     let actual_path = fetcher.download_from_url(&url, &save_path)
         .await
         .map_err(|e| format!("下载封面失败: {}", e))?;
 
-    // 清理该游戏同 id 的其他扩展名封面（避免残留旧文件）
-    let base_stem = format!("{}", game_id);
-    for ext in ["jpg", "png", "jpeg", "webp"] {
-        let old = covers_dir.join(format!("{}.{}", base_stem, ext));
-        if old != actual_path {
-            let _ = std::fs::remove_file(&old);
-        }
-    }
-
-    let cover_path = actual_path.to_string_lossy().to_string();
     let db_guard = lock_or_recover(&db);
-    db_guard.update_game_cover(&game_id, &cover_path)
+    cover_store::ingest_path(&db_guard, OWNER_GAME, &game_id, &actual_path, true)
+        .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
@@ -555,7 +645,8 @@ fn apply_llm_meta(updated: &mut Game, meta: &LlmGameMeta) {
         }
     }
     if !meta.genres.is_empty() {
-        updated.genres = meta.genres.clone();
+        // 手动填写也走归一化，保证库内类型口径与规范表一致
+        updated.genres = crate::core::genres::normalize_genres(&meta.genres);
     }
     if let Some(v) = meta.hltb_main_story {
         updated.hltb_main_story = Some(v);
@@ -666,7 +757,9 @@ pub fn update_game_meta(
         game.release_date = if v.is_empty() { None } else { Some(v) };
     }
     if let Some(v) = genres {
-        game.genres = v;
+        // 手动填写也走归一化（与 apply_llm_meta / apply_meta_to_review 口径一致），
+        // 否则 NSelect 自由输入仍能造出「Action」这类非规范类型
+        game.genres = crate::core::genres::normalize_genres(&v);
     }
     // Some(Some(v)) 设置值，Some(None) 清空（用户清空输入框），None 不处理
     if let Some(v) = hltb_main_story {
@@ -768,11 +861,28 @@ pub fn set_game_status(
     db.set_game_status(&game_id, &status).map_err(|e| e.to_string())
 }
 
-/// 导出游戏库数据为 JSON 文件
+/// 从主备份文件路径推导独立密钥文件路径（xxx.json -> xxx.keys.json）
+/// 后缀剥离大小写不敏感（.json / .Json / .JSON 都命中），否则用户手输混合大小写
+/// 文件名会得到 backup.Json.keys.json 这类怪名。
+fn derive_keys_path(file_path: &str) -> String {
+    let stripped = if file_path.to_lowercase().ends_with(".json") {
+        // ".json" 是 5 个 ASCII 字节：从末尾截断必然落在字符边界
+        // （后缀之前即使紧贴 CJK 等多字节字符，截点也在其完整字节之后）
+        &file_path[..file_path.len() - ".json".len()]
+    } else {
+        file_path
+    };
+    format!("{}.keys.json", stripped)
+}
+
+/// 导出游戏库数据为 JSON 文件。
+/// 主备份（file_path）脱敏 API Key；另存独立密钥文件（xxx.keys.json），
+/// 与主数据隔离，避免分享主备份时把密钥一并泄露出去。
 #[tauri::command]
 pub fn export_game_data(
     db: State<'_, Arc<Mutex<Database>>>,
-) -> Result<String, String> {
+    file_path: String,
+) -> Result<serde_json::Value, String> {
     let db_guard = lock_or_recover(&db);
 
     // 获取所有游戏数据
@@ -781,6 +891,10 @@ pub fn export_game_data(
 
     // 获取设置
     let settings = Settings::load_from_db(&db_guard).map_err(|e| e.to_string())?;
+
+    // 提前取出两个密钥（后续要写入独立文件）
+    let sgdb_key = settings.steamgriddb_api_key.clone();
+    let llm_key = settings.llm_api_key.clone();
 
     // 构建导出数据结构（脱敏 API Key，避免用户分享备份时泄露密钥）
     let sanitized_settings = serde_json::json!({
@@ -793,6 +907,10 @@ pub fn export_game_data(
         "llm_base_url": settings.llm_base_url,
         "llm_model": settings.llm_model,
         "llm_enabled": settings.llm_enabled,
+        "window_width": settings.window_width,
+        "window_height": settings.window_height,
+        "screenshot_dir": settings.screenshot_dir,
+        "screenshot_hotkey": settings.screenshot_hotkey,
     });
     let export_data = serde_json::json!({
         "version": "1.0",
@@ -801,19 +919,39 @@ pub fn export_game_data(
         "settings": sanitized_settings,
     });
 
-    // 序列化为 JSON
+    // 序列化并写入主备份
     let json = serde_json::to_string_pretty(&export_data)
         .map_err(|e| format!("序列化失败: {}", e))?;
+    std::fs::write(&file_path, json)
+        .map_err(|e| format!("写入主备份失败: {}", e))?;
 
-    Ok(json)
+    // 独立密钥文件（敏感信息，单独存放、单独标注）
+    let keys_json = serde_json::to_string_pretty(&serde_json::json!({
+        "type": "gamevault-api-keys",
+        "description": "GameVault API 密钥备份（敏感信息，请勿分享或上传到公开位置）",
+        "steamgriddb_api_key": sgdb_key,
+        "llm_api_key": llm_key,
+    }))
+    .map_err(|e| format!("序列化密钥失败: {}", e))?;
+    let keys_path = derive_keys_path(&file_path);
+    std::fs::write(&keys_path, keys_json)
+        .map_err(|e| format!("写入密钥文件失败: {}", e))?;
+
+    Ok(serde_json::json!({
+        "main_path": file_path,
+        "keys_path": keys_path,
+    }))
 }
 
-/// 导入游戏库数据（从 JSON 备份恢复）
+/// 导入游戏库数据（从 JSON 备份文件恢复，自动识别同目录的密钥文件）
 #[tauri::command]
 pub fn import_game_data(
     db: State<'_, Arc<Mutex<Database>>>,
-    json_data: String,
+    file_path: String,
 ) -> Result<serde_json::Value, String> {
+    let json_data = std::fs::read_to_string(&file_path)
+        .map_err(|e| format!("读取备份文件失败: {}", e))?;
+
     let import_data: serde_json::Value = serde_json::from_str(&json_data)
         .map_err(|e| format!("JSON 解析失败: {}", e))?;
 
@@ -863,9 +1001,34 @@ pub fn import_game_data(
         }
     }
 
+    // 自动恢复密钥文件（若存在）。只恢复非空值，避免空值覆盖现有密钥
+    let mut keys_restored = 0u32;
+    let keys_path = derive_keys_path(&file_path);
+    if let Ok(keys_data) = std::fs::read_to_string(&keys_path) {
+        if let Ok(keys_json) = serde_json::from_str::<serde_json::Value>(&keys_data) {
+            if let Some(key) = keys_json["steamgriddb_api_key"].as_str() {
+                if !key.is_empty() {
+                    match db_guard.set_setting("steamgriddb_api_key", key) {
+                        Ok(_) => keys_restored += 1,
+                        Err(e) => tracing::warn!("恢复 SteamGridDB 密钥失败: {}", e),
+                    }
+                }
+            }
+            if let Some(key) = keys_json["llm_api_key"].as_str() {
+                if !key.is_empty() {
+                    match db_guard.set_setting("llm_api_key", key) {
+                        Ok(_) => keys_restored += 1,
+                        Err(e) => tracing::warn!("恢复 LLM 密钥失败: {}", e),
+                    }
+                }
+            }
+        }
+    }
+
     Ok(serde_json::json!({
         "imported_games": imported_games,
         "settings_restored": settings_restored,
+        "keys_restored": keys_restored,
     }))
 }
 
@@ -1204,7 +1367,9 @@ fn import_saves_backup_sync(zip_path: &str) -> Result<serde_json::Value, String>
     let all_zip_names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
 
     // 构建每个 manifest 条目对应的目标路径映射
-    let mut extract_plan: Vec<(String, std::path::PathBuf)> = Vec::new();
+    // errors 提前声明：manifest 解析阶段的建目录失败也要对前端可见，不能静默跳过
+    let mut errors: Vec<String> = Vec::new();
+    let mut extract_plan: Vec<(String, std::path::PathBuf, String)> = Vec::new();
     for entry in &manifest {
         let original_path = entry["original_path"].as_str().unwrap_or("");
         let zip_prefix = entry["zip_prefix"].as_str().unwrap_or("");
@@ -1216,10 +1381,15 @@ fn import_saves_backup_sync(zip_path: &str) -> Result<serde_json::Value, String>
         let expanded = utils::path::expand_env_vars(original_path);
         let target_path = std::path::PathBuf::from(&expanded);
 
-        // 创建目标目录
-        if let Some(parent) = target_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!("创建目录失败 {}: {}", parent.display(), e);
+        // 创建目标目录本身（原存档目录不存在时也要能恢复——换机/存档丢失场景）。
+        // 必须建出 target_path，否则下方 is_safe 的 canonicalize 校验会因目录不存在而误判"不安全"，
+        // 导致所有文件被跳过、restored 却虚报成功。
+        // 注意：save_path 可能指向单个文件（add_path_to_zip 支持 is_file），目标已存在且是文件时
+        // create_dir_all 必然失败——此时跳过建目录（下方 is_safe 走 dest.canonicalize() 直比分支）；
+        // 其余建目录失败记入 errors 后跳过，保持错误对前端可见。
+        if !target_path.is_file() {
+            if let Err(e) = std::fs::create_dir_all(&target_path) {
+                errors.push(format!("创建存档目标目录失败 {}: {}", target_path.display(), e));
                 continue;
             }
         }
@@ -1266,9 +1436,12 @@ fn import_saves_backup_sync(zip_path: &str) -> Result<serde_json::Value, String>
                     .map(|ct| canonical_dest.starts_with(&ct))
                     .unwrap_or(false)
             } else {
-                // 路径不存在（新文件），检查其父目录
+                // 路径不存在（新文件），先创建其父目录再做安全检查，
+                // 否则嵌套子目录尚未创建时 canonicalize 会失败，误判"不安全"而跳过文件
                 let parent = dest.parent().unwrap_or(&dest);
-                if let Ok(canonical_parent) = parent.canonicalize() {
+                if std::fs::create_dir_all(parent).is_err() {
+                    false
+                } else if let Ok(canonical_parent) = parent.canonicalize() {
                     if let Ok(canonical_target) = target_path.canonicalize() {
                         // 父目录必须在目标目录下，且文件名不含路径分隔符
                         canonical_parent.starts_with(&canonical_target)
@@ -1284,14 +1457,15 @@ fn import_saves_backup_sync(zip_path: &str) -> Result<serde_json::Value, String>
                 tracing::warn!("跳过目标路径超出预期目录的 ZIP 条目: {}", file_name);
                 continue;
             }
-            extract_plan.push((file_name.to_string(), dest));
+            extract_plan.push((file_name.to_string(), dest, zip_prefix.to_string()));
         }
     }
 
     // 一次性遍历计划，逐个从 archive 中提取（archive 只打开一次）
-    let mut errors: Vec<String> = Vec::new();
+    // 成功恢复的存档路径（zip_prefix）集合，用于精确计数而非按 manifest 条目数虚报
+    let mut restored_prefixes: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for (file_name, dest) in extract_plan {
+    for (file_name, dest, zip_prefix) in extract_plan {
         let mut zip_file = match archive.by_name(&file_name) {
             Ok(f) => f,
             Err(e) => {
@@ -1320,15 +1494,14 @@ fn import_saves_backup_sync(zip_path: &str) -> Result<serde_json::Value, String>
             };
             if let Err(e) = std::io::copy(&mut zip_file, &mut dest_file) {
                 errors.push(format!("写入文件失败 {}: {}", dest.display(), e));
+            } else {
+                restored_prefixes.insert(zip_prefix);
             }
         }
     }
 
-    // 恢复计数 = manifest 中有效条目数
-    let restored_count = manifest.iter().filter(|e| {
-        !e["original_path"].as_str().unwrap_or("").is_empty()
-        && !e["zip_prefix"].as_str().unwrap_or("").is_empty()
-    }).count() as u32;
+    // 恢复计数 = 实际成功写出文件的存档路径数
+    let restored_count = restored_prefixes.len() as u32;
 
     for entry in &manifest {
         let game_id = entry["game_id"].as_str().unwrap_or("");

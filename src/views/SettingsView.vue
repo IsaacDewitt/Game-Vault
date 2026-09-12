@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch, inject } from "vue";
+import { ref, computed, onMounted, onUnmounted, watch, inject } from "vue";
 import {
   NCard,
   NForm,
@@ -13,9 +13,8 @@ import {
   NInputNumber,
   useMessage,
 } from "naive-ui";
-import { DownloadOutline, CloudUploadOutline } from "@vicons/ionicons5";
+import { DownloadOutline, CloudUploadOutline, FolderOpenOutline, SaveOutline } from "@vicons/ionicons5";
 import { save, open } from "@tauri-apps/plugin-dialog";
-import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
 import * as api from "../lib/tauri";
 import type { Settings } from "../lib/tauri";
 import { DEFAULT_ACCENT_COLOR, DEBOUNCE_MS } from "../lib/constants";
@@ -68,11 +67,42 @@ const presetColors = [
 // 加载中标记，避免初始化时触发自动保存
 const loading = ref(true);
 
+// ==================== 未保存改动标记 ====================
+// 只有下面这些字段需要手动点「保存设置」；主题色/主题/截图目录/快捷键都是改动后即自动保存，
+// 不计入脏标记，否则会出现「刚改完主题就提示有未保存修改」的假警报。
+const manualSaveFields = computed(() => ({
+  steamgriddb_api_key: settings.value.steamgriddb_api_key,
+  llm_enabled: settings.value.llm_enabled,
+  llm_protocol: settings.value.llm_protocol,
+  llm_base_url: settings.value.llm_base_url,
+  llm_model: settings.value.llm_model,
+  llm_api_key: settings.value.llm_api_key,
+  window_width: settings.value.window_width,
+  window_height: settings.value.window_height,
+}));
+
+const dirty = ref(false);
+let baseline = "";
+
+function markSaved() {
+  baseline = JSON.stringify(manualSaveFields.value);
+  dirty.value = false;
+}
+
+watch(
+  manualSaveFields,
+  (v) => {
+    if (loading.value) return;
+    dirty.value = JSON.stringify(v) !== baseline;
+  },
+  { deep: true }
+);
+
 // 通过 inject 获取父组件提供的主题更新函数
 const updateAccentColor = inject<(color: string) => void>("updateAccentColor");
 const updateTheme = inject<(dark: boolean) => void>("updateTheme");
 
-// 主题色变化时实时预览并自动保存
+// 主题色变化时实时预览并自动保存（只存主题色，不带手动字段）
 watch(() => settings.value.accent_color, (color) => {
   // 非法值（输入未完成等）不应用、不保存，避免 NaN 颜色
   if (!color || !isValidHexColor(color)) return;
@@ -80,34 +110,44 @@ watch(() => settings.value.accent_color, (color) => {
     updateAccentColor(color);
   }
   if (!loading.value) {
-    autoSaveThemeSettings();
+    autoSaveThemeSettings({ accent_color: color });
   }
 });
 
-// 主题切换时实时预览并自动保存
+// 主题切换时实时预览并自动保存（只存主题，不带手动字段）
 watch(() => settings.value.theme, (theme) => {
   if (updateTheme) {
     updateTheme(theme !== "light");
   }
   if (!loading.value) {
-    autoSaveThemeSettings();
+    autoSaveThemeSettings({ theme });
   }
 });
 
-// 防抖自动保存外观设置
+// 防抖自动保存外观设置（partial：只更新 patch 内白名单字段）
+//
+// 主题与主题色两个 watch 共用这一个防抖器，故**必须累积 patch 而不是替换**
+// （2026-09-12 修正）：此前每调用一次就覆盖整个 patch，300ms 内先切主题再改主题色
+// （或反过来）会取消前一次、只落盘后者，重启后前一项改动丢失。
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
-function autoSaveThemeSettings() {
+let pendingThemePatch: api.AutoSavePatch = {};
+function autoSaveThemeSettings(patch: api.AutoSavePatch) {
+  pendingThemePatch = { ...pendingThemePatch, ...patch };
   if (autoSaveTimer) clearTimeout(autoSaveTimer);
   autoSaveTimer = setTimeout(async () => {
+    const toSave = pendingThemePatch;
+    pendingThemePatch = {};
     try {
-      await api.saveSettings(settings.value);
+      await api.saveSettingsPartial(toSave);
     } catch (e) {
       console.error("自动保存外观设置失败:", e);
+      // 落盘失败则把改动并回待保存队列，下次触发时一并重试，避免静默丢失
+      pendingThemePatch = { ...toSave, ...pendingThemePatch };
     }
   }, DEBOUNCE_MS);
 }
 
-// 截图目录修改后防抖自动保存（立即生效，无需手动点保存）
+// 截图目录修改后防抖自动保存（立即生效，无需手动点保存；同样只存目录本身）
 watch(() => settings.value.screenshot_dir, () => {
   if (!loading.value) {
     autoSaveScreenshotDir();
@@ -119,7 +159,7 @@ function autoSaveScreenshotDir() {
   if (screenshotDirSaveTimer) clearTimeout(screenshotDirSaveTimer);
   screenshotDirSaveTimer = setTimeout(async () => {
     try {
-      await api.saveSettings(settings.value);
+      await api.saveSettingsPartial({ screenshot_dir: settings.value.screenshot_dir });
       message.success("截图目录已保存");
     } catch (e) {
       console.error("保存截图目录失败:", e);
@@ -143,6 +183,8 @@ async function loadSettings() {
   } catch (e) {
     console.error("加载设置失败:", e);
   } finally {
+    // 以加载到的服务端数据为基线，之后的表单改动才判定为「有未保存修改」
+    markSaved();
     // 等待 DOM 更新后再解除加载标记，避免 watch 误触发保存
     setTimeout(() => { loading.value = false; }, 0);
   }
@@ -174,6 +216,7 @@ async function saveSettings() {
   saving.value = true;
   try {
     await api.saveSettings(settings.value);
+    markSaved();
     message.success("设置已保存");
   } catch (e) {
     console.error("保存设置失败:", e);
@@ -186,8 +229,6 @@ async function saveSettings() {
 async function handleExportData() {
   exporting.value = true;
   try {
-    const jsonData = await api.exportGameData();
-
     // 弹出保存文件对话框
     const filePath = await save({
       defaultPath: "gamevault-backup.json",
@@ -200,8 +241,9 @@ async function handleExportData() {
     });
 
     if (filePath) {
-      await writeTextFile(filePath, jsonData);
-      message.success("数据导出成功");
+      // 后端负责写入：主备份（脱敏密钥）+ 独立的 xxx.keys.json 密钥文件
+      await api.exportGameData(filePath);
+      message.success("数据导出成功（已同时生成独立密钥文件）");
     }
   } catch (e) {
     console.error("导出数据失败:", e);
@@ -230,17 +272,25 @@ async function handleImportData() {
       return;
     }
 
-    const jsonContent = await readTextFile(selected as string);
-    const result = await api.importGameData(jsonContent);
+    // 后端负责读取：主备份 + 自动识别同目录下的 xxx.keys.json 密钥文件
+    const result = await api.importGameData(selected as string);
 
     message.success(
-      `导入成功！已恢复 ${result.imported_games} 个游戏${result.settings_restored ? "和设置" : ""}`
+      `导入成功！已恢复 ${result.imported_games} 个游戏${result.settings_restored ? "和设置" : ""}${
+        result.keys_restored > 0 ? `、${result.keys_restored} 个密钥` : ""
+      }`
     );
 
     // 刷新游戏列表
     const { useGamesStore } = await import("../stores/games");
     const store = useGamesStore();
     await store.loadGames();
+
+    // 备份里含设置时，必须把设置重新读进表单（2026-09-12 修正）：
+    // 否则表单仍是导入前的旧值，用户下一次点「保存设置」会把旧值回写，等于抹掉刚恢复的设置。
+    if (result.settings_restored) {
+      await loadSettings();
+    }
   } catch (e) {
     console.error("导入数据失败:", e);
     message.error("导入失败: " + (e as Error).toString());
@@ -285,6 +335,23 @@ async function handleChooseScreenshotDir() {
     }
   } catch (e) {
     console.error("选择截图目录失败:", e);
+  }
+}
+
+/**
+ * 在文件管理器中打开截图根目录。
+ * 先落盘一次设置：目录是防抖自动保存的，用户刚改完路径就点打开时
+ * 可能还没保存到后端，不先保存会打开到旧目录。
+ */
+async function handleOpenScreenshotDir() {
+  try {
+    // 先落盘截图目录：它是防抖自动保存的，用户刚改完路径就点打开时可能还没保存，
+    // 不先保存会打开到旧目录。partial 只写目录，不会带走未确认的手动字段。
+    await api.saveSettingsPartial({ screenshot_dir: settings.value.screenshot_dir });
+    await api.openScreenshotDir();
+  } catch (e) {
+    console.error("打开截图目录失败:", e);
+    message.error("打开截图目录失败: " + (e as Error).toString());
   }
 }
 
@@ -383,10 +450,11 @@ function onGlobalHotkeyKeydown(e: KeyboardEvent) {
   void applyHotkeyChange();
 }
 
-// 快捷键变更后立即保存并重新注册全局热键，同时检测冲突
+// 快捷键变更后立即保存并重新注册全局热键，同时检测冲突。
+// 走 partial（只存快捷键字段），后端据此触发重注册，不带走手动字段。
 async function applyHotkeyChange() {
   try {
-    await api.saveSettings(settings.value);
+    await api.saveSettingsPartial({ screenshot_hotkey: settings.value.screenshot_hotkey });
     message.success(
       settings.value.screenshot_hotkey
         ? `截图快捷键已设为 ${settings.value.screenshot_hotkey}`
@@ -498,7 +566,19 @@ async function handleImportSaves() {
 
 <template>
   <div class="settings-view">
-    <h2 style="margin-bottom: 24px">设置</h2>
+    <!-- 吸顶操作栏：保存按钮常驻顶部，不用滚到数据管理上方才能找到 -->
+    <div class="settings-header" :class="{ 'is-dirty': dirty }">
+      <div class="header-title-row">
+        <h2 class="header-title">设置</h2>
+        <span v-if="dirty" class="dirty-badge">有未保存的修改</span>
+      </div>
+      <n-button type="primary" size="large" :loading="saving" @click="saveSettings">
+        <template #icon>
+          <n-icon :component="SaveOutline" />
+        </template>
+        保存设置
+      </n-button>
+    </div>
 
     <!-- 外观设置 -->
     <n-card title="外观设置" style="margin-bottom: 16px">
@@ -616,6 +696,12 @@ async function handleImportSaves() {
             <n-button size="small" @click="handleChooseScreenshotDir">
               浏览
             </n-button>
+            <n-button size="small" @click="handleOpenScreenshotDir">
+              <template #icon>
+                <n-icon :component="FolderOpenOutline" />
+              </template>
+              打开
+            </n-button>
           </n-space>
         </n-form-item>
         <n-form-item label="截图快捷键">
@@ -692,14 +778,7 @@ async function handleImportSaves() {
       </n-form>
     </n-card>
 
-    <!-- 保存按钮 -->
-    <n-space>
-      <n-button type="primary" :loading="saving" @click="saveSettings">
-        保存设置
-      </n-button>
-    </n-space>
-
-    <!-- 数据管理 -->
+    <!-- 数据管理（保存按钮已上移至顶部吸顶栏） -->
     <n-card title="数据管理" style="margin-top: 16px">
       <n-form label-placement="left" label-width="140">
         <n-form-item label="导出游戏数据">
@@ -753,7 +832,66 @@ async function handleImportSaves() {
 
 <style scoped>
 .settings-view {
-  max-width: 800px;
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+/* 吸顶操作栏：随内容区居中（不再通栏铺满），与下方卡片同宽对齐 */
+.settings-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+  padding: 16px 20px;
+  border-radius: 10px;
+  /* 半透明 + 毛玻璃：滚动时内容从下方穿过，仍保持标题与保存按钮可读 */
+  background: rgba(22, 33, 62, 0.85);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+/* 有未保存改动时给顶栏一点视觉重量，配合右侧徽标提醒 */
+.settings-header.is-dirty {
+  border-color: var(--accent-color, #6366f1);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+
+.header-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  min-width: 0;
+}
+
+.header-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.dirty-badge {
+  flex-shrink: 0;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 12px;
+  color: var(--accent-color, #6366f1);
+  /* 前两行是 color-mix 不可用时的降级（旧版 WebView2） */
+  background: rgba(99, 102, 241, 0.18);
+  border: 1px solid rgba(99, 102, 241, 0.4);
+  background: color-mix(in srgb, var(--accent-color, #6366f1) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-color, #6366f1) 40%, transparent);
+  white-space: nowrap;
+}
+
+/* 亮色主题适配 */
+.light-theme .settings-header {
+  background: rgba(240, 240, 240, 0.88);
+  border-color: rgba(0, 0, 0, 0.1);
 }
 
 .color-swatch {

@@ -13,8 +13,8 @@ export const useGamesStore = defineStore("games", () => {
   const searchQuery = ref("");
   const selectedGame = ref<Game | null>(null);
   const activeGames = ref<string[]>([]);
-  // 封面文件路径映射 (game_id -> 本地文件路径)
-  const coverPaths = ref<Record<string, string>>({});
+  // 封面路径映射 (game_id -> { main, thumb })，含已移除游戏的留档封面
+  const coverPaths = ref<Record<string, api.CoverSet>>({});
   // 封面获取进度
   const coverFetchProgress = ref<{ current: number; total: number; game_name: string } | null>(null);
   // 游戏信息获取进度
@@ -88,19 +88,20 @@ export const useGamesStore = defineStore("games", () => {
       result = result.filter((g) => g.name.toLowerCase().includes(query));
     }
 
-    // 状态筛选（与后端 get_status_stats 保持一致：
-    // status='unplayed' 但有游玩时长的游戏视为 'playing'）
+    // 状态筛选（与后端 get_status_stats 的智能推导保持一致：
+    // 是否「玩过」看 play_time_seconds、是否「通关」看 status=completed）
     if (statusFilter.value) {
       if (statusFilter.value === "favorites") {
         result = result.filter((g) => g.is_favorite);
-      } else if (statusFilter.value === "playing") {
-        result = result.filter((g) =>
-          g.status === "playing" || (g.status === "unplayed" && g.play_time_seconds > 0)
-        );
       } else if (statusFilter.value === "unplayed") {
-        result = result.filter((g) =>
-          g.status === "unplayed" && g.play_time_seconds === 0
-        );
+        // 未游玩 = 从未启动（无游玩时长）且未通关
+        result = result.filter((g) => g.status !== "completed" && g.play_time_seconds === 0);
+      } else if (statusFilter.value === "played") {
+        // 已游玩 = 启动过（有游玩时长）且未通关
+        result = result.filter((g) => g.status !== "completed" && g.play_time_seconds > 0);
+      } else if (statusFilter.value === "completed") {
+        // 已通关 = 用户手动标记
+        result = result.filter((g) => g.status === "completed");
       } else {
         result = result.filter((g) => g.status === statusFilter.value);
       }
@@ -203,9 +204,15 @@ export const useGamesStore = defineStore("games", () => {
     }
   }
 
-  /** 将封面本地路径转为 asset URL（Tauri asset 协议直接加载，避免全量 base64 传输） */
-  function coverSrc(gameId: string): string | null {
-    const p = coverPaths.value[gameId];
+  /**
+   * 将封面路径转为 asset URL（Tauri asset 协议直接加载，避免全量 base64 传输）。
+   * preferThumb=true 时优先用缩略图（卡片网格/统计排行等小尺寸场景，避免整张原图参与解码）；
+   * 缩略图缺失时自动回退原图。
+   */
+  function coverSrc(gameId: string, preferThumb = true): string | null {
+    const entry = coverPaths.value[gameId];
+    if (!entry) return null;
+    const p = (preferThumb ? entry.thumb : entry.main) || entry.main || entry.thumb;
     if (!p) return null;
     try {
       return convertFileSrc(p);
@@ -360,15 +367,20 @@ export const useGamesStore = defineStore("games", () => {
     }
   }
 
-  async function removeGame(gameId: string) {
+  async function removeGame(gameId: string, keepCover = true) {
     try {
-      await api.deleteGame(gameId);
+      await api.deleteGame(gameId, keepCover);
       games.value = games.value.filter((g) => g.id !== gameId);
       if (selectedGame.value?.id === gameId) {
         selectedGame.value = null;
       }
-      // 清理封面缓存
-      delete coverPaths.value[gameId];
+      // 保留封面时它进了 archive，全量刷新一次封面映射即可（时长排行要用）；
+      // 不保留时直接摘掉本地缓存
+      if (keepCover) {
+        loadAllCovers().catch(() => {});
+      } else {
+        delete coverPaths.value[gameId];
+      }
     } catch (e) {
       console.error("删除游戏失败:", e);
       throw e;  // 向上传播错误，让调用方可以提示用户

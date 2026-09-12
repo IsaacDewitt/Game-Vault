@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use tauri::{Emitter, Manager};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButtonState, MouseButton};
 use tauri::menu::{Menu, MenuItem};
+use tauri::webview::WebviewWindowBuilder;
 
 /// 双写日志：同时输出到 stderr（开发时终端可见）与日志文件（正式版可排查）
 struct MultiLogWriter {
@@ -47,7 +48,55 @@ fn init_logging() {
         .init();
 }
 
-/// 优雅退出：通知后台线程、持久化活跃会话、退出进程
+/// 安装 panic hook：把 panic 落进日志文件。
+///
+/// release 版 `windows_subsystem = "windows"` 没有控制台，panic 默认只写向已失效的
+/// stderr —— 例如 WebView 创建失败时 Tauri 抛的 `Failed to setup app: WebView2 error: ...`
+/// 会彻底沉没，事后完全无从查证。这里把它落到日志里，让「闪退 / 黑屏」类问题有据可依。
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<非字符串 panic 负载>".to_string()
+        };
+        tracing::error!("PANIC @ {} | {}", location, payload);
+        default_hook(info);
+    }));
+}
+
+/// 手动创建主窗口。
+///
+/// `tauri.conf.json` 中主窗口已设 `create: false`，改由这里显式创建，目的是让
+/// WebView 创建失败（WebView2 `0x8007139F`）变成**可捕获的 `Err`**：
+/// Tauri 内部 setup 遇到同样情况会 `panic!("Failed to setup app")` 直接带走整个进程，
+/// 应用没有任何自愈余地。捕获后交由启动看门狗超时重启。
+fn create_main_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "main")
+        .cloned()
+        .ok_or_else(|| "未在 tauri.conf.json 中找到 label=main 的窗口配置".to_string())?;
+
+    WebviewWindowBuilder::from_config(app, &config)
+        .map_err(|e| format!("构建窗口失败: {e}"))?
+        .build()
+        .map_err(|e| format!("创建 WebView 失败: {e}"))?;
+
+    Ok(())
+}
+
+/// 优雅退出：通知后台线程、持久化活跃会话、清除启动标记、退出进程
 fn graceful_exit(app: &tauri::AppHandle) {
     // 通知后台监控线程退出（Release 保证写入对后台线程可见）
     {
@@ -72,7 +121,18 @@ fn graceful_exit(app: &tauri::AppHandle) {
             }
         }
     }
+    // 正常退出，清除启动标记：下次启动便不会误判为「异常退出」而清理残留锁
+    core::boot_guard::mark_clean_exit();
     app.exit(0);
+}
+
+/// 前端挂载成功的报到入口（黑屏看门狗据此确认 WebView 正常）。
+///
+/// 前端在 `app.mount()` 成功后调用一次；后端超时未收到即判定 WebView 创建失败并自动重启。
+/// 报到成功同时清零重启计数，保证后续偶发黑屏仍有完整的重启额度。
+#[tauri::command]
+fn frontend_ready() {
+    core::boot_guard::mark_frontend_ready();
 }
 
 /// 退出应用程序（优雅关闭后台线程，持久化活跃会话）
@@ -86,8 +146,16 @@ fn quit_app(app: tauri::AppHandle) {
 pub fn run() {
     // 初始化日志输出到终端 + 日志文件
     init_logging();
+    // 让 panic（尤其 Tauri 内部 setup 失败）不再静默沉没
+    install_panic_hook();
 
-    tauri::Builder::default()
+    let context = tauri::generate_context!();
+
+    // 注意：启动守卫（清理上次异常退出残留的 WebView2 锁）**不能**放在这里——单实例
+    // 插件是在 Builder::build() 内部的插件 setup 里判定的，晚于本行；若在此清理，
+    // 用户重复双击启动时，第二个进程会先把**正在运行实例**的 Chromium 单例锁删掉，
+    // 再被单实例插件拦截退出。故移至应用 setup 首行（见下方 ---- 0. ----）。
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -104,16 +172,42 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
-            // 初始化数据库
+            let t_setup = std::time::Instant::now();
+
+            // ---- 0. 启动守卫：识别上次异常退出 → 清 WebView2 残留锁 → 写本次运行标记 ----
+            // 时序要点（2026-09-12 修正）：本回调执行于 Builder::build() 之后的插件 setup
+            // 之后（tauri app.rs：插件 initialize 在 build 内，应用 setup 在 run 内），
+            // 因此第二个实例已在插件处 process::exit，**不会走到这里**——重复双击启动
+            // 不再误删运行中实例的单例锁。仍早于下面的窗口创建，语义不变。
+            core::boot_guard::prepare_launch(&app.config().identifier);
+
+            // ---- 1. 数据库（同步必需：前端所有命令都依赖它，必须最先就绪）----
             let db_path = utils::path::get_database_path();
             let parent_dir = db_path.parent().ok_or_else(|| anyhow::anyhow!("无法获取数据库目录"))?;
             utils::path::ensure_dir_exists(parent_dir)
                 .expect("无法创建数据目录");
 
+            let t_db = std::time::Instant::now();
             let db = core::Database::new(&db_path)
                 .expect("无法初始化数据库");
+            tracing::info!("数据库初始化耗时 {} ms", t_db.elapsed().as_millis());
 
             let db = Arc::new(Mutex::new(db));
+
+            // ---- 2. 手动创建主窗口 ----
+            // create:false + 显式创建，让 WebView 创建失败成为可捕获的错误而非 panic
+            match create_main_window(app.handle()) {
+                Ok(()) => tracing::info!("主窗口创建成功"),
+                Err(e) => tracing::error!("主窗口创建失败: {e}（看门狗将在超时后自动重启）"),
+            }
+
+            // ---- 3. 启动黑屏看门狗 ----
+            // 置于窗口创建之后：只有窗口存在了才有「黑屏」可言，也避免数据库初始化
+            // 偏慢时被误判。看门狗不依赖任何 state，仅凭 AppHandle 即可工作。
+            core::boot_guard::start_watchdog(
+                app.handle().clone(),
+                app.config().identifier.clone(),
+            );
 
             // 初始化时长追踪器
             let tracker = core::PlayTimeTracker::new();
@@ -123,17 +217,48 @@ pub fn run() {
             app.manage(db.clone());
             app.manage(tracker.clone());
 
-            // 成就系统：启动时立即结算存量数据（静默，不弹通知）
+            // 成就系统：启动结算存量数据（静默，不弹通知）
+            // 挪到后台线程并稍作延迟 —— 该结算需独占 DB 锁，留在 setup 里既推迟
+            // 窗口/托盘/热键就绪，也容易与前端首屏查询抢锁。
             {
-                let db_guard = db.lock().unwrap_or_else(|e| e.into_inner());
-                match core::AchievementEngine::evaluate(&db_guard) {
-                    Ok(events) => {
-                        if !events.is_empty() {
-                            tracing::info!("成就系统：启动结算解锁 {} 条历史成就", events.len());
+                let ach_db = db.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let db_guard = match ach_db.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    match core::AchievementEngine::evaluate(&db_guard) {
+                        Ok(events) => {
+                            if !events.is_empty() {
+                                tracing::info!("成就系统：启动结算解锁 {} 条历史成就", events.len());
+                            }
                         }
+                        Err(e) => tracing::error!("成就系统启动结算失败: {}", e),
                     }
-                    Err(e) => tracing::error!("成就系统启动结算失败: {}", e),
-                }
+                });
+            }
+
+            // 封面体系迁移（2026-09-10，一次性，settings 标记防重跑）：
+            // 把现有游戏/手账封面登记进 covers 索引表并补生成缩略图；已移除条目
+            // 没图时按同名从手账回挂一张（"删游戏不删图"的历史欠账）。后台跑，不阻塞启动。
+            {
+                let cover_db = db.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(2500));
+                    let db_guard = match cover_db.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    match core::cover_store::migrate(&db_guard) {
+                        Ok(r) if r.indexed + r.relinked > 0 => tracing::info!(
+                            "封面索引迁移：登记 {}，回挂 {}，缺文件 {}，失败 {}（{} → {} 字节）",
+                            r.indexed, r.relinked, r.missing_file, r.failed, r.bytes_before, r.bytes_after
+                        ),
+                        Ok(_) => tracing::debug!("封面索引迁移：无需处理"),
+                        Err(e) => tracing::error!("封面索引迁移失败: {}", e),
+                    }
+                });
             }
 
             // 启动后台进程监控（支持优雅退出）
@@ -331,6 +456,7 @@ pub fn run() {
                 });
             }
 
+            tracing::info!("应用初始化完成，耗时 {} ms", t_setup.elapsed().as_millis());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -372,6 +498,7 @@ pub fn run() {
             commands::reviews::set_review_rating,
             commands::reviews::set_review_review,
             commands::reviews::set_review_status,
+            commands::reviews::set_review_screenshot_dir,
             commands::reviews::delete_review,
             commands::reviews::fetch_review_cover_options,
             commands::reviews::set_review_cover_from_url,
@@ -391,15 +518,27 @@ pub fn run() {
             // 设置相关
             commands::settings::get_settings,
             commands::settings::save_settings,
+            commands::settings::save_settings_partial,
             commands::settings::get_autostart_enabled,
             commands::settings::set_autostart_enabled,
             commands::settings::set_window_size,
             // 截图相关
             commands::screenshots::open_screenshot_dir,
+            commands::screenshots::get_screenshot_dir,
+            commands::screenshots::list_screenshot_dirs,
             commands::screenshots::get_screenshot_hotkey_status,
             // 应用
             quit_app,
+            frontend_ready,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(context)
+        .expect("error while building tauri application");
+
+    // 显式接管退出事件：正常退出（含看门狗重启前的退出）清除启动标记，
+    // 使下次启动不再把本次判为「异常退出」。强杀/崩溃时标记残留，正好触发清理。
+    app.run(|_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            core::boot_guard::mark_clean_exit();
+        }
+    });
 }

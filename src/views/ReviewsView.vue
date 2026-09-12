@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, onMounted, h } from "vue";
 import {
   NInput,
   NButton,
   NButtonGroup,
+  NSpace,
   NIcon,
   NSpin,
   NEmpty,
@@ -28,13 +29,16 @@ import {
   RefreshOutline,
   TrashOutline,
   ImageOutline,
+  ImagesOutline,
+  FolderOpenOutline,
   CreateOutline,
   GameControllerOutline,
 } from "@vicons/ionicons5";
 import { useDebounceFn } from "@vueuse/core";
 import { useReviewsStore, displayName } from "../stores/reviews";
 import { useGamesStore } from "../stores/games";
-import type { CoverOption } from "../lib/tauri";
+import { getScreenshotDir, openScreenshotDir, listScreenshotDirs } from "../lib/tauri";
+import type { CoverOption, ScreenshotDirInfo, ScreenshotDirOption } from "../lib/tauri";
 import { DEBOUNCE_MS } from "../lib/constants";
 import ContextMenu from "../components/ContextMenu.vue";
 import type { ContextMenuItem } from "../components/ContextMenu.vue";
@@ -156,13 +160,115 @@ const savingReview = ref(false);
 
 const selected = computed(() => store.selectedReview);
 
+/** 主名是否为纯 ASCII（即原名本身就是英文） */
+const selectedNameIsAscii = computed(() => {
+  const name = selected.value?.name ?? "";
+  return name.length > 0 && /^[\x20-\x7E]+$/.test(name);
+});
+
 function openDetail(review: (typeof store.reviews)[number]) {
   store.selectReview(review);
   editingName.value = review.name;
   editingNameEn.value = review.name_en ?? "";
   ratingInput.value = review.rating;
   reviewText.value = review.review ?? "";
+  loadScreenshotInfo(review.id);
   showDetail.value = true;
+}
+
+// ==================== 截图库（与游戏库详情同款：路径 + 张数 + 打开资源管理器） ====================
+
+const screenshotInfo = ref<ScreenshotDirInfo | null>(null);
+const screenshotError = ref<string | null>(null);
+const openingScreenshots = ref(false);
+
+// 请求序号：快速切换手账条目时，旧条目的响应可能后到并覆盖新条目的截图信息
+let screenshotSeq = 0;
+
+async function loadScreenshotInfo(reviewId: string) {
+  const seq = ++screenshotSeq;
+  screenshotInfo.value = null;
+  screenshotError.value = null;
+  try {
+    // 后端按 手动指定目录 > 同名游戏 exe > 同名墓碑 exe 定位（手账自持，删游戏不受影响）
+    const info = await getScreenshotDir(undefined, reviewId);
+    if (seq !== screenshotSeq) return;
+    screenshotInfo.value = info;
+  } catch (e) {
+    if (seq !== screenshotSeq) return;
+    screenshotError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+async function handleOpenScreenshots() {
+  if (!selected.value) return;
+  openingScreenshots.value = true;
+  try {
+    await openScreenshotDir(undefined, selected.value.id);
+    // 目录可能刚被创建，打开后刷新数量
+    await loadScreenshotInfo(selected.value.id);
+  } catch (e) {
+    message.error("打开截图文件夹失败: " + (e instanceof Error ? e.message : String(e)));
+  } finally {
+    openingScreenshots.value = false;
+  }
+}
+
+// ---- 指定截图目录（手账自持：游戏从游戏库删除后截图库照旧可用） ----
+
+const showDirPicker = ref(false);
+const dirOptions = ref<ScreenshotDirOption[]>([]);
+const loadingDirOptions = ref(false);
+const savingDir = ref(false);
+/** 选择器当前值；null = 自动推断 */
+const dirInput = ref<string | null>(null);
+
+const dirSelectOptions = computed(() =>
+  dirOptions.value.map((o) => ({ label: `${o.name}（${o.count} 张）`, value: o.name }))
+);
+
+/** 当前定位来源的中文说明 */
+const sourceLabel = computed(() => {
+  switch (screenshotInfo.value?.source) {
+    case "manual":
+      return "手动指定";
+    case "game":
+      return "按同名游戏匹配";
+    case "tombstone":
+      return "按游戏历史归档匹配";
+    default:
+      return "";
+  }
+});
+
+async function openDirPicker() {
+  if (!selected.value) return;
+  dirInput.value = selected.value.screenshot_dir ?? null;
+  showDirPicker.value = true;
+  loadingDirOptions.value = true;
+  try {
+    dirOptions.value = await listScreenshotDirs();
+  } catch (e) {
+    dirOptions.value = [];
+    message.error("读取截图目录失败: " + (e instanceof Error ? e.message : String(e)));
+  } finally {
+    loadingDirOptions.value = false;
+  }
+}
+
+async function saveDirPicker() {
+  if (!selected.value) return;
+  savingDir.value = true;
+  try {
+    const updated = await store.setScreenshotDir(selected.value.id, dirInput.value);
+    await loadScreenshotInfo(updated.id);
+    message.success(dirInput.value ? `已指定截图目录：${dirInput.value}` : "已恢复自动匹配截图目录");
+    showDirPicker.value = false;
+  } catch (e) {
+    message.error("保存截图目录失败: " + (e instanceof Error ? e.message : String(e)));
+  } finally {
+    savingDir.value = false;
+  }
 }
 
 function closeDetail() {
@@ -204,13 +310,16 @@ async function saveReviewText() {
   }
 }
 
-/** 改中文名 */
+/** 改主名称（原名）。填英文时后端会自动同步一份到 name_en */
 async function saveName() {
   if (!selected.value) return;
   const name = editingName.value.trim();
   if (!name || name === selected.value.name) return;
   try {
-    await store.updateMeta(selected.value.id, { name });
+    const updated = await store.updateMeta(selected.value.id, { name });
+    // 后端可能自动补了 name_en（纯英文原名），同步回输入框，
+    // 否则下次 blur 英文名框时会拿旧值覆盖回去
+    editingNameEn.value = updated.name_en ?? "";
     message.success("名称已更新");
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e));
@@ -253,20 +362,44 @@ async function handleRefreshInfo(review: (typeof store.reviews)[number]) {
 
 /** 删除 */
 function confirmDelete(review: (typeof store.reviews)[number]) {
-  dialog.warning({
+  const hasCover = !!(review.cover_local || review.cover_url);
+
+  const doDelete = async (keepCover: boolean) => {
+    try {
+      await store.removeReview(review.id, keepCover);
+      showDetail.value = false;
+      message.success(keepCover ? "已删除，封面图片已留档" : "已删除");
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  let d: ReturnType<typeof dialog.warning>;
+  d = dialog.warning({
     title: "删除手账",
-    content: `确定删除《${displayName(review)}》吗？此操作不可恢复。`,
-    positiveText: "删除",
-    negativeText: "取消",
-    onPositiveClick: async () => {
-      try {
-        await store.removeReview(review.id);
-        showDetail.value = false;
-        message.success("已删除");
-      } catch (e) {
-        message.error(e instanceof Error ? e.message : String(e));
-      }
-    },
+    content:
+      `确定删除《${displayName(review)}》吗？此操作不可恢复。` +
+      (hasCover ? "封面图片请选择处理方式：" : ""),
+    // 删除前每次都问一次封面去留（与游戏库删除口径一致）
+    action: () =>
+      hasCover
+        ? h(NSpace, { justify: "end" }, () => [
+            h(NButton, { size: "small", onClick: () => d.destroy() }, () => "取消"),
+            h(
+              NButton,
+              { size: "small", type: "primary", ghost: true, onClick: () => doDelete(true) },
+              () => "删除，保留封面"
+            ),
+            h(
+              NButton,
+              { size: "small", type: "error", onClick: () => doDelete(false) },
+              () => "删除，一并删图"
+            ),
+          ])
+        : h(NSpace, { justify: "end" }, () => [
+            h(NButton, { size: "small", onClick: () => d.destroy() }, () => "取消"),
+            h(NButton, { size: "small", type: "error", onClick: () => doDelete(true) }, () => "删除"),
+          ]),
   });
 }
 
@@ -522,7 +655,7 @@ onMounted(async () => {
             filterable
             clearable
           />
-          <p class="add-hint">导入后复用游戏库的元数据与封面</p>
+          <p class="add-hint">导入后复用游戏库的元数据与封面；英文原名会自动填入英文名</p>
         </n-tab-pane>
       </n-tabs>
       <template #footer>
@@ -567,32 +700,40 @@ onMounted(async () => {
 
           <!-- 名称与状态 -->
           <div class="detail-name-block">
-            <div class="detail-name-row">
-              <n-input
-                v-model:value="editingName"
-                size="large"
-                placeholder="游戏名称"
-                @blur="saveName"
-                @keyup.enter="saveName"
-              />
-              <n-button size="large" type="primary" ghost @click="saveName">
-                <template #icon>
-                  <n-icon :component="CreateOutline" />
-                </template>
-              </n-button>
+            <div class="name-field">
+              <div class="name-field-label">游戏名称（原名）</div>
+              <div class="detail-name-row">
+                <n-input
+                  v-model:value="editingName"
+                  placeholder="游戏名称"
+                  @blur="saveName"
+                  @keyup.enter="saveName"
+                />
+                <n-button type="primary" ghost @click="saveName">
+                  <template #icon>
+                    <n-icon :component="CreateOutline" :size="18" />
+                  </template>
+                </n-button>
+              </div>
+              <p v-if="selectedNameIsAscii" class="name-hint">
+                原名即英文，已自动同步到下方英文名框（卡片展示与封面检索优先用英文名）
+              </p>
             </div>
-            <div class="detail-name-row name-en-row">
-              <n-input
-                v-model:value="editingNameEn"
-                placeholder="英文名（封面检索用，留空保存即清除）"
-                @blur="saveNameEn"
-                @keyup.enter="saveNameEn"
-              />
-              <n-button size="small" type="primary" ghost @click="saveNameEn">
-                <template #icon>
-                  <n-icon :component="CreateOutline" />
-                </template>
-              </n-button>
+            <div class="name-field">
+              <div class="name-field-label">官方英文名（检索与展示优先）</div>
+              <div class="detail-name-row name-en-row">
+                <n-input
+                  v-model:value="editingNameEn"
+                  placeholder="英文名（封面检索用，留空保存即清除）"
+                  @blur="saveNameEn"
+                  @keyup.enter="saveNameEn"
+                />
+                <n-button type="primary" ghost @click="saveNameEn">
+                  <template #icon>
+                    <n-icon :component="CreateOutline" :size="18" />
+                  </template>
+                </n-button>
+              </div>
             </div>
           </div>
           <n-button-group class="status-segmented">
@@ -692,6 +833,59 @@ onMounted(async () => {
             </div>
           </div>
 
+          <!-- 截图库 -->
+          <div class="detail-section">
+            <div class="section-title">
+              <n-icon :component="ImagesOutline" />
+              截图库
+              <n-button size="tiny" quaternary style="margin-left: auto" @click="openDirPicker">
+                <template #icon>
+                  <n-icon :component="CreateOutline" />
+                </template>
+                指定目录
+              </n-button>
+              <n-button
+                size="tiny"
+                quaternary
+                :loading="openingScreenshots"
+                :disabled="!screenshotInfo"
+                @click="handleOpenScreenshots"
+              >
+                <template #icon>
+                  <n-icon :component="FolderOpenOutline" />
+                </template>
+                打开
+              </n-button>
+            </div>
+            <div v-if="screenshotInfo" class="screenshot-item" @click="handleOpenScreenshots">
+              <span class="save-path-text" :title="screenshotInfo.path">{{ screenshotInfo.path }}</span>
+              <span v-if="screenshotInfo.count > 0" class="screenshot-count">
+                {{ screenshotInfo.count }} 张
+              </span>
+              <span v-else class="screenshot-empty">暂无截图</span>
+            </div>
+            <div v-else class="screenshot-unavailable">
+              <span class="screenshot-unavailable-text">
+                {{ screenshotError ?? "正在读取截图目录…" }}
+              </span>
+              <n-button
+                v-if="screenshotError"
+                size="tiny"
+                quaternary
+                type="primary"
+                @click="openDirPicker"
+              >
+                指定截图目录
+              </n-button>
+            </div>
+            <div v-if="screenshotInfo && sourceLabel" class="screenshot-source">
+              {{ sourceLabel }}
+              <span v-if="selected?.screenshot_dir" class="screenshot-source-dir">
+                {{ selected.screenshot_dir }}
+              </span>
+            </div>
+          </div>
+
           <!-- 危险操作 -->
           <div class="detail-footer">
             <n-button size="small" type="error" quaternary @click="confirmDelete(selected)">
@@ -755,6 +949,36 @@ onMounted(async () => {
           <n-empty v-else-if="!coverLoading" description="没有可用封面" />
         </n-spin>
       </div>
+    </n-modal>
+
+    <!-- 截图目录选择弹窗 -->
+    <n-modal
+      v-model:show="showDirPicker"
+      preset="card"
+      title="指定截图目录"
+      style="width: 520px"
+    >
+      <div class="dir-picker-hint">
+        手账自己记住这个截图文件夹，之后从游戏库删除游戏、改名字都不影响。
+        留空则按同名游戏自动匹配（游戏已删除时靠历史归档匹配）。
+      </div>
+      <n-select
+        v-model:value="dirInput"
+        :options="dirSelectOptions"
+        :loading="loadingDirOptions"
+        clearable
+        filterable
+        tag
+        placeholder="选择或输入截图根目录下的文件夹名"
+      />
+      <template #footer>
+        <div class="dir-picker-footer">
+          <n-button size="small" @click="showDirPicker = false">取消</n-button>
+          <n-button size="small" type="primary" :loading="savingDir" @click="saveDirPicker">
+            保存
+          </n-button>
+        </div>
+      </template>
     </n-modal>
 
     <!-- 右键菜单 -->
@@ -956,6 +1180,24 @@ onMounted(async () => {
   margin-bottom: 0;
 }
 
+.name-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.name-field-label {
+  font-size: 11px;
+  opacity: 0.55;
+}
+
+.name-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  opacity: 0.5;
+}
+
 .name-en-row .n-input {
   font-style: italic;
 }
@@ -1054,6 +1296,85 @@ onMounted(async () => {
   justify-content: flex-end;
 }
 
+/* ==================== 截图库 ==================== */
+.screenshot-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.screenshot-item:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.save-path-text {
+  flex: 1;
+  font-size: 11px;
+  color: #aaa;
+  word-break: break-all;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.screenshot-count {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-color, #6366f1);
+}
+
+.screenshot-empty {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: #666;
+}
+
+.screenshot-unavailable {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px;
+  font-size: 11px;
+  color: #666;
+}
+
+.screenshot-unavailable-text {
+  flex: 1;
+  line-height: 1.5;
+}
+
+.screenshot-source {
+  padding: 4px 4px 0;
+  font-size: 11px;
+  color: #777;
+}
+
+.screenshot-source-dir {
+  margin-left: 4px;
+  font-weight: 600;
+  color: var(--accent-color, #6366f1);
+}
+
+/* ==================== 截图目录选择弹窗 ==================== */
+.dir-picker-hint {
+  margin-bottom: 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #999;
+}
+
+.dir-picker-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .detail-footer {
   border-top: 1px solid rgba(255, 255, 255, 0.08);
   padding-top: 12px;
@@ -1122,5 +1443,24 @@ onMounted(async () => {
 
 :global(.light-theme) .detail-footer {
   border-top-color: rgba(0, 0, 0, 0.08);
+}
+
+:global(.light-theme) .screenshot-item {
+  border-bottom-color: rgba(0, 0, 0, 0.05);
+}
+
+:global(.light-theme) .screenshot-item:hover {
+  background-color: rgba(0, 0, 0, 0.04);
+}
+
+:global(.light-theme) .save-path-text,
+:global(.light-theme) .screenshot-empty,
+:global(.light-theme) .screenshot-unavailable {
+  color: rgba(0, 0, 0, 0.55);
+}
+
+:global(.light-theme) .screenshot-source,
+:global(.light-theme) .dir-picker-hint {
+  color: rgba(0, 0, 0, 0.5);
 }
 </style>

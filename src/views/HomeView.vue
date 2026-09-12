@@ -10,12 +10,15 @@ import {
   NProgress,
   NSelect,
   NButtonGroup,
+  NDropdown,
+  NTooltip,
   useMessage,
   useDialog,
+  type DropdownOption,
 } from "naive-ui";
-import { SearchOutline, CloudDownloadOutline, AddOutline, DocumentTextOutline, FolderOutline } from "@vicons/ionicons5";
+import { SearchOutline, CloudDownloadOutline, AddOutline, DocumentTextOutline, FolderOutline, RefreshOutline, InformationCircleOutline } from "@vicons/ionicons5";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, onMounted, onUnmounted, h } from "vue";
 import { useDebounceFn } from "@vueuse/core";
 import { listen } from "@tauri-apps/api/event";
 import { useGamesStore } from "../stores/games";
@@ -97,13 +100,15 @@ const homeContextMenuX = ref(0);
 const homeContextMenuY = ref(0);
 
 // 状态筛选选项
+// 三态模型：未游玩（从未启动）/ 已游玩（启动过）/ 已通关（用户手动标记）。
+// 是否「玩过」用 play_time_seconds 判断、是否「通关」用 status=completed 判断，
+// 与后端 get_status_stats 的智能推导口径一致；收藏是独立维度，不参与三态互斥。
 const statusOptions = [
   { label: "全部", value: "" },
   { label: "收藏", value: "favorites" },
   { label: "未游玩", value: "unplayed" },
-  { label: "游玩中", value: "playing" },
+  { label: "已游玩", value: "played" },
   { label: "已通关", value: "completed" },
-  { label: "已弃坑", value: "abandoned" },
 ];
 
 // 类型筛选选项（从 store 动态加载）
@@ -111,6 +116,36 @@ const genreSelectOptions = computed(() => [
   { label: "全部类型", value: "" },
   ...store.allGenres.map((g) => ({ label: g, value: g })),
 ]);
+
+// 「刷新」合并下拉菜单：把刷新封面 / 刷新游戏信息 / 检查存档三项收进一个按钮
+const refreshMenuOptions: DropdownOption[] = [
+  {
+    label: "刷新封面",
+    key: "covers",
+    icon: () => h(NIcon, null, { default: () => h(CloudDownloadOutline) }),
+  },
+  {
+    label: "刷新游戏信息",
+    key: "info",
+    icon: () => h(NIcon, null, { default: () => h(DocumentTextOutline) }),
+  },
+  {
+    label: "检查存档",
+    key: "saves",
+    icon: () => h(NIcon, null, { default: () => h(FolderOutline) }),
+  },
+];
+
+// 下拉菜单项点击分发到对应刷新动作
+function handleRefreshSelect(key: string | number) {
+  if (key === "covers") {
+    handleRefreshCovers();
+  } else if (key === "info") {
+    handleRefreshAllInfo();
+  } else if (key === "saves") {
+    store.checkSavePaths();
+  }
+}
 
 // 最近游玩的游戏（取最近 8 个有游玩记录的）
 const recentGames = computed(() => {
@@ -397,19 +432,51 @@ async function handleSetGameStatus(gameId: string, status: string) {
 function handleDeleteGame(gameId: string) {
   const game = store.games.find((g) => g.id === gameId);
   const gameName = game?.name || "该游戏";
-  dialog.warning({
+  // 有封面才需要问「留不留图」；没有封面走普通确认框
+  const hasCover = !!store.coverPaths[gameId];
+
+  const doDelete = async (keepCover: boolean) => {
+    // 自定义 action 的弹窗不会被 naive-ui 自动关闭（2026-09-12 修正）：
+    // 不在删除后 destroy，弹窗会一直留着，用户可以反复点删除/留图按钮重复触发。
+    d?.destroy();
+    try {
+      await store.removeGame(gameId, keepCover);
+      message.success(
+        keepCover
+          ? `已删除「${gameName}」，历史游玩记录与封面图片已保留`
+          : `已删除「${gameName}」，历史游玩记录已保留`
+      );
+    } catch (e) {
+      message.error("删除失败");
+    }
+  };
+
+  let d: ReturnType<typeof dialog.warning>;
+  d = dialog.warning({
     title: "确认删除",
-    content: `确定要删除「${gameName}」吗？此操作不可撤销，游戏的游玩记录将一并删除。`,
-    positiveText: "删除",
-    negativeText: "取消",
-    onPositiveClick: async () => {
-      try {
-        await store.removeGame(gameId);
-        message.success("已删除游戏");
-      } catch (e) {
-        message.error("删除失败");
-      }
-    },
+    content:
+      `确定要删除「${gameName}」吗？此操作不可撤销，但记录会保留——仅从库中移除条目与启动入口，历史游玩统计、已解锁成就与截图文件都不受影响。` +
+      (hasCover ? "封面图片请选择处理方式：" : ""),
+    // 用 action 自定义按钮区：删除前每次都问一次封面的去留
+    action: () =>
+      hasCover
+        ? h(NSpace, { justify: "end" }, () => [
+            h(NButton, { size: "small", onClick: () => d.destroy() }, () => "取消"),
+            h(
+              NButton,
+              { size: "small", type: "primary", ghost: true, onClick: () => doDelete(true) },
+              () => "删除，保留封面"
+            ),
+            h(
+              NButton,
+              { size: "small", type: "error", onClick: () => doDelete(false) },
+              () => "删除，一并删图"
+            ),
+          ])
+        : h(NSpace, { justify: "end" }, () => [
+            h(NButton, { size: "small", onClick: () => d.destroy() }, () => "取消"),
+            h(NButton, { size: "small", type: "error", onClick: () => doDelete(true) }, () => "删除"),
+          ]),
   });
 }
 
@@ -490,25 +557,33 @@ function handleDeleteGame(gameId: string) {
           />
         </n-space>
 
-        <n-space>
-          <n-button @click="handleRefreshCovers" :loading="refreshingCovers">
-            <template #icon>
-              <n-icon :component="CloudDownloadOutline" />
+        <n-space align="center">
+          <!-- 「刷新」合并下拉：三个刷新动作收进一个按钮 -->
+          <n-dropdown trigger="click" :options="refreshMenuOptions" @select="handleRefreshSelect">
+            <n-button :loading="refreshingCovers || refreshingInfo || store.checkingSavePaths">
+              <template #icon>
+                <n-icon :component="RefreshOutline" />
+              </template>
+              刷新
+            </n-button>
+          </n-dropdown>
+
+          <!-- 圈感叹号：悬停解释每个刷新动作具体做什么 -->
+          <n-tooltip trigger="hover" placement="bottom-end" :style="{ maxWidth: '340px', whiteSpace: 'normal' }">
+            <template #trigger>
+              <n-button quaternary circle>
+                <template #icon>
+                  <n-icon :component="InformationCircleOutline" />
+                </template>
+              </n-button>
             </template>
-            刷新封面
-          </n-button>
-          <n-button @click="handleRefreshAllInfo" :loading="refreshingInfo">
-            <template #icon>
-              <n-icon :component="DocumentTextOutline" />
-            </template>
-            刷新游戏信息
-          </n-button>
-          <n-button @click="store.checkSavePaths()" :loading="store.checkingSavePaths">
-            <template #icon>
-              <n-icon :component="FolderOutline" />
-            </template>
-            检查存档
-          </n-button>
+            <div style="font-size: 12px; line-height: 1.8; text-align: left;">
+              <div><b>刷新封面</b> — 从 SteamGridDB 下载缺少封面的游戏封面图</div>
+              <div><b>刷新游戏信息</b> — 调用 AI 补全游戏简介、类型、发售日期等资料</div>
+              <div><b>检查存档</b> — 检测各游戏是否已正确配置存档目录</div>
+            </div>
+          </n-tooltip>
+
           <n-button type="primary" @click="handleAddGame">
             <template #icon>
               <n-icon :component="AddOutline" />

@@ -7,13 +7,15 @@ import {
   NInput,
   NInputNumber,
   NDatePicker,
-  NDynamicTags,
+  NSelect,
   NSpace,
   useMessage,
 } from "naive-ui";
 import { CreateOutline, AddOutline, TrashOutline } from "@vicons/ionicons5";
 import type { Game } from "../lib/tauri";
+import type { SelectOption } from "naive-ui";
 import { useGamesStore } from "../stores/games";
+import { GENRE_GROUPS } from "../lib/constants";
 
 const props = defineProps<{
   show: boolean;
@@ -28,6 +30,15 @@ const emit = defineEmits<{
 const store = useGamesStore();
 const message = useMessage();
 const saving = ref(false);
+
+// 类型候选：从规范表里选，避免手打又冒出「Action」这类新写法。
+// 仍保留自由输入（tag），输入的值会由后端归一化（命中别名即转规范名）。
+const genreOptions: SelectOption[] = GENRE_GROUPS.map((g) => ({
+  type: "group",
+  label: g.group,
+  key: g.group,
+  children: g.genres.map((name) => ({ label: name, value: name })),
+}));
 
 // 表单字段
 const description = ref("");
@@ -166,7 +177,15 @@ async function handleSave() {
       <!-- 类型标签 -->
       <div class="form-field">
         <label>游戏类型</label>
-        <n-dynamic-tags v-model:value="genres" />
+        <n-select
+          v-model:value="genres"
+          :options="genreOptions"
+          multiple
+          filterable
+          tag
+          clearable
+          placeholder="输入或选择类型，可多选"
+        />
       </div>
 
       <!-- HLTB 时长 -->
