@@ -1,6 +1,6 @@
 [package]
 name = "game-vault"
-version = "0.7.8"
+version = "0.8.0"
 description = "Game Vault - 轻量级游戏管理器"
 authors = ["Isaac"]
 edition = "2021"
@@ -71,5 +71,12 @@ windows = { version = "0.62", features = [
     "Win32_Media_Audio",
     "Win32_Devices_Display",
     "Win32_Graphics_Gdi",
+    # 协议启动：ShellExecuteW —— steam:// 与 com.epicgames.launcher:// 是注册在
+    # HKEY_CLASSES_ROOT 下的协议处理器，只有 shell 会按注册表转发给客户端
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    # 截图兜底通道：WH_KEYBOARD_LL 钩子需要 GetAsyncKeyState（查修饰键态）与 VK_* 常量
+    # —— 全屏游戏在前台时注册热键收不到 WM_HOTKEY，只能靠键盘钩子（见 core/hotkey_hook.rs）
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 

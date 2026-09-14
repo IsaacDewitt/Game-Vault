@@ -46,6 +46,7 @@ fn reapply_screenshot_hotkey(
         tracker,
     );
     // 同步更新热键注册错误状态（前端设置页可据此提示）
+    let reg_ok = reg_result.is_ok();
     let mut err_state = hotkey_error.lock().unwrap_or_else(|e| e.into_inner());
     match reg_result {
         Ok(()) => *err_state = None,
@@ -53,6 +54,24 @@ fn reapply_screenshot_hotkey(
             tracing::error!("重新注册截图热键失败: {e}");
             *err_state = Some(e);
         }
+    }
+    drop(err_state);
+    // 键盘钩子通道同步换键：不换的话新旧两个键都会触发截图（钩子仍按老键位响应）。
+    // 注册失败（该键被别的程序占用）时一并停用，避免替别的程序响应按键。
+    let parsed = if reg_ok {
+        crate::core::hotkey_hook::parse_key_spec(new_hotkey)
+    } else {
+        None
+    };
+    crate::core::hotkey_hook::set_spec(parsed);
+    // 回读实际生效值（而不是回显解析结果），日志才可信
+    match crate::core::hotkey_hook::current_spec() {
+        Some(spec) => tracing::info!(
+            "截图键盘钩子键位已更新: vk=0x{:02X}（热键 {new_hotkey}）",
+            spec.vk
+        ),
+        None if reg_ok => tracing::info!("截图热键 {new_hotkey} 无对应钩子键位，钩子通道停用"),
+        None => tracing::info!("截图热键 {new_hotkey} 注册失败，钩子通道一并停用"),
     }
     let mut state = hotkey_state.lock().unwrap_or_else(|e| e.into_inner());
     *state = new_hotkey.to_string();

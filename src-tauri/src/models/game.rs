@@ -39,6 +39,18 @@ pub struct Game {
     pub exe_modified_at: Option<i64>,
     /// exe 文件大小（字节），用于缓存判断
     pub exe_file_size: Option<i64>,
+    /// 来源平台："local"（本地/手动添加，默认）、"steam"、"epic"
+    /// 决定启动方式（local 直接 spawn；steam/epic 走 URI 交由客户端拉起）与截图策略
+    #[serde(default = "default_platform")]
+    pub platform: String,
+    /// 平台侧标识：Steam=appid（如 "550"）；Epic="CatalogNamespace:CatalogItemId:AppName"；local=None
+    #[serde(default)]
+    pub platform_id: Option<String>,
+}
+
+/// platform 字段的 serde 默认值（兼容不含该字段的旧备份 JSON）
+fn default_platform() -> String {
+    "local".to_string()
 }
 
 impl Game {
@@ -71,6 +83,8 @@ impl Game {
             save_paths: Vec::new(),
             exe_modified_at: None,
             exe_file_size: None,
+            platform: "local".to_string(),
+            platform_id: None,
         }
     }
 

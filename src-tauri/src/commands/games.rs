@@ -2,6 +2,7 @@ use tauri::{State, Emitter};
 use tauri_plugin_opener::OpenerExt;
 use std::sync::{Arc, Mutex};
 use crate::core::{Database, PlayTimeTracker, GameLauncher};
+use crate::core::launcher::LaunchOutcome;
 use crate::core::cover_fetcher::CoverFetcher;
 use crate::core::cover_store;
 use crate::models::cover::OWNER_GAME;
@@ -51,29 +52,56 @@ pub fn launch_game(
     };
     // DB 锁已释放
 
-    // 阶段 2：启动游戏（无锁状态下的 I/O 操作），获取 PID 用于进程树追踪
-    let spawned_pid = GameLauncher::launch(&game).map_err(|e| e.to_string())?;
+    // 阶段 2：启动（无锁状态下的 I/O 操作）
+    // - local：直接 spawn exe，拿到 PID 可走进程树追踪
+    // - steam / epic：交协议 URI 给客户端，**拿不到 PID**，须靠 armed 待命发现进程
+    let outcome = GameLauncher::launch_game(&game).map_err(|e| e.to_string())?;
 
-    // 阶段 3：开始追踪时长（独立获取 Tracker 锁）
-    if let Some(ref exe_name) = game.exe_name {
-        let mut tracker_guard = lock_or_recover(&tracker);
-        if let Some(finished_session) = tracker_guard.start_tracking(
-            &game_id,
-            exe_name,
-            game.exe_path.as_deref(),
-            Some(spawned_pid),
-            game.install_path.as_deref(),
-        ) {
-            // 如果有旧会话结束，持久化到数据库
-            drop(tracker_guard);  // 释放 Tracker 锁再获取 DB 锁
-            let db_guard = lock_or_recover(&db);
-            if let Err(e) = db_guard.add_play_session(
-                &finished_session.game_id,
-                &finished_session.start_time,
-                finished_session.duration_seconds,
-            ) {
-                tracing::error!("保存旧游戏会话失败 (game_id: {}): {}", finished_session.game_id, e);
+    // 阶段 3：开始追踪（独立获取 Tracker 锁）
+    //
+    // 平台游戏走 armed 待命而非即时计时：进程由客户端异步拉起（还要过 DRM 校验、云存档同步），
+    // 在进程现身之前无法确认游戏真的跑起来了，先待命可避免"点了启动但没起来"记下一笔假时长。
+    // Steam 游戏的 exe_name 为空（acf 不记录 exe 名），照样能靠 install_path 前缀匹配识别。
+    let exe_name = game.exe_name.clone().unwrap_or_default();
+    let mut tracker_guard = lock_or_recover(&tracker);
+
+    let finished_session = match outcome {
+        LaunchOutcome::Spawned(pid) => {
+            // 既无 exe 名也无安装目录 → 无从追踪（与旧行为一致：不启动追踪）
+            if exe_name.is_empty() && game.install_path.is_none() {
+                tracing::warn!("游戏 {} 缺少 exe 名与安装目录，无法追踪时长", game.name);
+                None
+            } else {
+                tracker_guard.start_tracking(
+                    &game_id,
+                    &exe_name,
+                    game.exe_path.as_deref(),
+                    Some(pid),
+                    game.install_path.as_deref(),
+                )
             }
+        }
+        LaunchOutcome::Delegated { uri } => {
+            tracing::info!("已委托 {} 客户端拉起「{}」: {}", game.platform, game.name, uri);
+            tracker_guard.arm_session(
+                &game_id,
+                &exe_name,
+                game.exe_path.as_deref(),
+                game.install_path.as_deref(),
+            )
+        }
+    };
+
+    if let Some(finished_session) = finished_session {
+        // 有旧会话结束 → 释放 Tracker 锁再获取 DB 锁持久化
+        drop(tracker_guard);
+        let db_guard = lock_or_recover(&db);
+        if let Err(e) = db_guard.add_play_session(
+            &finished_session.game_id,
+            &finished_session.start_time,
+            finished_session.duration_seconds,
+        ) {
+            tracing::error!("保存旧游戏会话失败 (game_id: {}): {}", finished_session.game_id, e);
         }
     }
 
@@ -155,44 +183,23 @@ pub fn delete_game(
     Ok(())
 }
 
-/// 手动添加游戏
-#[tauri::command]
-pub fn add_game_manual(
-    db: State<'_, Arc<Mutex<Database>>>,
-    name: String,
-    exe_path: String,
-) -> Result<Game, String> {
-    let db = lock_or_recover(&db);
-
-    let mut game = Game::new(name);
-    game.exe_path = Some(exe_path.clone());
-    game.exe_name = Some(std::path::Path::new(&exe_path)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string());
-    game.install_path = Some(std::path::Path::new(&exe_path)
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .to_string_lossy()
-        .to_string());
-    // 从 exe 文件读取版本号
-    game.exe_version = utils::path::read_exe_version(&exe_path);
-
-    // 获取并保存文件元数据（用于后续缓存判断）
-    if let Some(metadata) = utils::path::get_file_metadata(&exe_path) {
-        game.exe_modified_at = Some(metadata.modified_at);
-        game.exe_file_size = Some(metadata.file_size);
-    }
-
-    // 重装认领（2026-09-06）：若存在匹配的墓碑（即之前删除过、又装回来了的游戏），
-    // 复用其旧 id 入库——play_stats_daily/hourly 与 achievement_unlocks 里留存的孤儿历史
-    // 凭这个 id 自动续接（热力图/时长/成就原样回归）。匹配键刻意不含路径，换盘重装也能认领。
-    //
-    // 两段式：① 名字 + exe 文件名双键（能区分同名不同游戏就尽量区分）；
-    // ② 双键未命中且**库中已无同名活条目**时按名字兜底，且**不限 exe 名**
-    //   （2026-09-12 修订）——覆盖换安装程序重装（Steam 版删了装 GOG 版）、原条目无安装路径
-    //   等双键对不上的真实场景；前置的"无同名活条目"由这里把关，故不存在同名不同游戏的歧义。
+/// 入库收尾（供「手动添加」与「平台导入」共用）
+///
+/// 流程：墓碑认领（可选）→ upsert → **入库成功后**清墓碑 → 回填累计时长/次数 → 恢复留档封面。
+/// 抽成公用函数是为了让两条入口的历史续接语义完全一致——平台导入若绕过认领，
+/// "删掉再装回来"就会生成新 id，留档的历史统计与成就再也接不上。
+///
+/// 重装认领（2026-09-06）：若存在匹配的墓碑（即之前删除过、又装回来了的游戏），
+/// 复用其旧 id 入库——play_stats_daily/hourly 与 achievement_unlocks 里留存的孤儿历史
+/// 凭这个 id 自动续接（热力图/时长/成就原样回归）。匹配键刻意不含路径，换盘重装也能认领。
+///
+/// 两段式：① 名字 + exe 文件名双键（能区分同名不同游戏就尽量区分）；
+/// ② 双键未命中且**库中已无同名活条目**时按名字兜底，且**不限 exe 名**
+///   （2026-09-12 修订）——覆盖换安装程序重装（Steam 版删了装 GOG 版）、原条目无安装路径
+///   等双键对不上的真实场景；前置的"无同名活条目"由这里把关，故不存在同名不同游戏的歧义。
+///
+/// Steam 平台条目 `exe_name` 为 None，自然落到第二段（名字兜底），语义正确。
+pub(crate) fn insert_game_with_reclaim(db: &Database, mut game: Game) -> Result<Game, String> {
     let mut claimed_tombstone = false;
     let mut tombstone_id = match game.exe_name.as_deref() {
         Some(exe_name) => db
@@ -251,7 +258,7 @@ pub fn add_game_manual(
             tracing::warn!("回填认领游戏累计时长失败: {}", e);
         }
         // 封面一并回归：留档在 archive/ 的封面挪回正式目录（与历史时长同一套续接语义）
-        match cover_store::restore(&db, OWNER_GAME, &game.id) {
+        match cover_store::restore(db, OWNER_GAME, &game.id) {
             Ok(true) => tracing::info!("已恢复「{}」的留档封面", game.name),
             Ok(false) => {}
             Err(e) => tracing::warn!("恢复留档封面失败: {}", e),
@@ -259,6 +266,39 @@ pub fn add_game_manual(
     }
 
     Ok(game)
+}
+
+/// 手动添加游戏
+#[tauri::command]
+pub fn add_game_manual(
+    db: State<'_, Arc<Mutex<Database>>>,
+    name: String,
+    exe_path: String,
+) -> Result<Game, String> {
+    let db = lock_or_recover(&db);
+
+    let mut game = Game::new(name);
+    game.exe_path = Some(exe_path.clone());
+    game.exe_name = Some(std::path::Path::new(&exe_path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string());
+    game.install_path = Some(std::path::Path::new(&exe_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_string_lossy()
+        .to_string());
+    // 从 exe 文件读取版本号
+    game.exe_version = utils::path::read_exe_version(&exe_path);
+
+    // 获取并保存文件元数据（用于后续缓存判断）
+    if let Some(metadata) = utils::path::get_file_metadata(&exe_path) {
+        game.exe_modified_at = Some(metadata.modified_at);
+        game.exe_file_size = Some(metadata.file_size);
+    }
+
+    insert_game_with_reclaim(&db, game)
 }
 
 /// 启动时批量刷新所有游戏的 exe 版本号

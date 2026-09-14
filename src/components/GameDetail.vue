@@ -63,6 +63,14 @@ const preventMaskContextMenu = (e: MouseEvent) => {
 onMounted(() => document.addEventListener("contextmenu", preventMaskContextMenu));
 onUnmounted(() => document.removeEventListener("contextmenu", preventMaskContextMenu));
 
+/** 平台展示名（本地游戏不显示此行） */
+const platformLabel = computed(() => {
+  const p = props.game?.platform;
+  if (p === "steam") return "Steam";
+  if (p === "epic") return "Epic";
+  return "";
+});
+
 const store = useGamesStore();
 const message = useMessage();
 const fetchingLlm = ref(false);
@@ -597,6 +605,10 @@ async function handleRemoveSavePath(index: number) {
 
       <!-- 游戏信息 -->
       <div class="info-section">
+        <div class="info-row" v-if="platformLabel">
+          <span class="info-label">平台</span>
+          <span class="info-value">{{ platformLabel }}</span>
+        </div>
         <div class="info-row" v-if="game.developer">
           <span class="info-label">开发商</span>
           <span class="info-value">{{ game.developer }}</span>

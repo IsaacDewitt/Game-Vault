@@ -297,19 +297,22 @@ pub fn run() {
                 while running_clone.load(Ordering::Acquire) {
                     std::thread::sleep(std::time::Duration::from_secs(utils::constants::PROCESS_POLL_INTERVAL_SECS));
 
-                    // 快速检查是否有活跃会话；没有则跳过进程扫描，避免空转 CPU 开销
+                    // 快速检查是否有待处理工作（活跃会话或待命会话）；
+                    // 两者皆空则跳过进程扫描，避免空转 CPU 开销。
+                    // 注意：待命会话（平台游戏刚发起启动请求）也必须纳入判断，
+                    // 否则它永远等不到转正的机会。
                     {
                         let tracker = match tracker_arc.lock() {
                             Ok(guard) => guard,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        if tracker.get_active_games().is_empty() {
+                        if !tracker.has_pending_work() {
                             continue;
                         }
                     }
 
-                    // 阶段 1：检查活跃会话，收集已结束的会话数据，然后释放 Tracker 锁
-                    let finished = {
+                    // 阶段 1：检查会话，收集本轮产出，然后释放 Tracker 锁
+                    let tick = {
                         match tracker_arc.lock() {
                             Ok(mut tracker) => tracker.check_active_sessions(),
                             Err(poisoned) => {
@@ -322,8 +325,8 @@ pub fn run() {
                     // Tracker 锁已释放
 
                     // 阶段 2：持久化已结束的会话到数据库（独立获取 DB 锁）
-                    if !finished.is_empty() {
-                        core::PlayTimeTracker::persist_finished_sessions(&db_arc, &finished);
+                    if !tick.finished.is_empty() {
+                        core::PlayTimeTracker::persist_finished_sessions(&db_arc, &tick.finished);
 
                         // 会话结束后检测成就（时长/次数类成就），新解锁通过事件通知前端
                         let mut new_unlocks = Vec::new();
@@ -338,8 +341,16 @@ pub fn run() {
                         }
                     }
 
+                    // 平台游戏：待命转正 / 超时未启动，通知前端以便给出反馈
+                    if !tick.activated.is_empty() {
+                        let _ = app_handle.emit("platform-game-started", &tick.activated);
+                    }
+                    for game_id in &tick.arm_timeouts {
+                        let _ = app_handle.emit("platform-launch-timeout", game_id);
+                    }
+
                     // 通知前端
-                    for session in &finished {
+                    for session in &tick.finished {
                         let _ = app_handle.emit("game-stopped", &session.game_id);
                     }
                 }
@@ -395,6 +406,7 @@ pub fn run() {
                 let hotkey_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
                 app.manage(hotkey_error.clone());
 
+                let mut hotkey_registered = true;
                 if let Err(e) = commands::screenshots::register_screenshot_hotkey(
                     app.handle(),
                     &hotkey,
@@ -403,6 +415,61 @@ pub fn run() {
                 ) {
                     tracing::error!("注册全局截图热键失败: {e}");
                     *hotkey_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                    hotkey_registered = false;
+                } else {
+                    tracing::info!("全局截图热键已注册: {hotkey}");
+                }
+
+                // ---- 键盘钩子兜底通道（2026-09-14 实测必需）----
+                // 全屏游戏在前台时，上面的注册热键**收不到 WM_HOTKEY**（同进程对照热键 F7 同样收不到，
+                // 而 WH_KEYBOARD_LL 钩子能稳定看到按键）。故截图必须再挂一条键盘钩子通道，
+                // 两条通道由 SHOT_IN_FLIGHT 去重；详见 core/hotkey_hook.rs 的实测记录。
+                {
+                    let hook_app = app.handle().clone();
+                    let hook_db = db.clone();
+                    let hook_tracker = tracker.clone();
+                    if let Err(e) = core::hotkey_hook::install(move || {
+                        // 【约束】钩子回调内只投递，不做日志/抓屏（它同步阻塞全系统输入）
+                        commands::screenshots::dispatch_screenshot_async(
+                            hook_app.clone(),
+                            hook_db.clone(),
+                            hook_tracker.clone(),
+                            "键盘钩子",
+                        );
+                    }) {
+                        tracing::error!(
+                            "安装截图键盘钩子失败: {e}（游戏内截图将不可用；桌面场景不受影响）"
+                        );
+                    }
+
+                    // 只有注册热键成功（= 该键确实是我们的）才启用钩子键位：
+                    // 否则会在"快捷键被别的程序占用"时替别人响应按键（例如 F12 被 Steam 占用）。
+                    match (hotkey_registered, core::hotkey_hook::parse_key_spec(&hotkey)) {
+                        (true, Some(spec)) => {
+                            core::hotkey_hook::set_spec(Some(spec));
+                            tracing::info!(
+                                "截图键盘钩子已就绪: vk=0x{:02X} ctrl={} shift={} alt={} win={}",
+                                spec.vk,
+                                spec.ctrl,
+                                spec.shift,
+                                spec.alt,
+                                spec.win
+                            );
+                        }
+                        (true, None) => {
+                            core::hotkey_hook::set_spec(None);
+                            tracing::warn!(
+                                "截图热键 {hotkey} 无法解析为钩子键位，仅注册热键通道生效"
+                            );
+                        }
+                        (false, _) => {
+                            core::hotkey_hook::set_spec(None);
+                            tracing::warn!(
+                                "截图热键 {hotkey} 注册失败（多半被其他程序占用），钩子通道一并停用，\
+                                 避免替别的程序响应按键；请在设置里换一个快捷键"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -489,6 +556,9 @@ pub fn run() {
             commands::games::update_game_meta,
             commands::games::export_saves_backup,
             commands::games::import_saves_backup,
+            // 平台（Steam / Epic）扫描与导入
+            commands::platform::scan_platform_games,
+            commands::platform::import_platform_games,
             // 鉴赏相关
             commands::reviews::get_reviews,
             commands::reviews::get_review_detail,

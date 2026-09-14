@@ -37,6 +37,10 @@ export interface Game {
   exe_modified_at: number | null;
   /** exe 文件大小（字节），用于缓存判断 */
   exe_file_size: number | null;
+  /** 来源平台："local"（本地/手动添加）、"steam"、"epic" */
+  platform: string;
+  /** 平台侧标识：Steam=appid；Epic="CatalogNamespace:CatalogItemId:AppName"；local=null */
+  platform_id: string | null;
 }
 
 export interface GameFilter {
@@ -193,6 +197,41 @@ export async function deleteGame(gameId: string, keepCover = true): Promise<void
 
 export async function addGameManual(name: string, exePath: string): Promise<Game> {
   return invoke("add_game_manual", { name, exePath });
+}
+
+/** 平台游戏候选（扫描结果） */
+export interface PlatformGame {
+  platform: string;
+  platform_id: string;
+  name: string;
+  install_path: string;
+  exe_path: string | null;
+  exe_name: string | null;
+  size_bytes: number | null;
+  version: string | null;
+  /** 安装路径已在库中（前端应禁止重复勾选） */
+  already_added: boolean;
+  /** 库中有同名条目但路径不同（仅提示，不阻止导入） */
+  same_name_in_library: boolean;
+}
+
+/** 平台批量导入结果 */
+export interface ImportSummary {
+  imported: number;
+  skipped: number;
+  reclaimed: number;
+  failed: number;
+  errors: string[];
+}
+
+/** 扫描本机已安装的平台游戏（platform: "steam" | "epic"） */
+export async function scanPlatformGames(platform: string): Promise<PlatformGame[]> {
+  return invoke("scan_platform_games", { platformName: platform });
+}
+
+/** 批量导入平台游戏 */
+export async function importPlatformGames(items: PlatformGame[]): Promise<ImportSummary> {
+  return invoke("import_platform_games", { items });
 }
 
 /** 启动时批量刷新所有游戏的 exe 版本号，返回更新数量 */
@@ -434,6 +473,8 @@ export type ScreenshotOutcome =
     }
   | { outcome: "no_active_game" }
   | { outcome: "foreground_mismatch" }
+  /** Steam 游戏：本应用静默退让（Steam 自带截图，且默认热键同为 F12） */
+  | { outcome: "platform_excluded" }
   | { outcome: "failed"; message: string };
 
 /** 截图目录信息（路径 / 是否存在 / 已有截图数量 / 定位来源） */

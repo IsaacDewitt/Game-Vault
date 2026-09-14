@@ -11,6 +11,8 @@ pub mod tonemap;
 pub mod sdr_white;
 pub mod screenshot;
 pub mod boot_guard;
+pub mod platform;
+pub mod hotkey_hook;
 
 pub use database::Database;
 pub use tracker::PlayTimeTracker;

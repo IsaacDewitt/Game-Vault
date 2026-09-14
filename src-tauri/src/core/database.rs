@@ -191,6 +191,9 @@ impl Database {
         // 迁移：为旧数据库添加 exe 文件元数据缓存字段
         self.migrate_add_exe_metadata_columns()?;
 
+        // 迁移：为旧数据库添加来源平台字段（platform / platform_id）
+        self.migrate_add_platform_columns()?;
+
         // 迁移：为旧数据库添加 abandoned_at 字段（弃坑重玩成就判定用）
         self.migrate_add_abandoned_at_column()?;
 
@@ -584,7 +587,7 @@ impl Database {
         // 11:release_date 12:genres 13:play_time_seconds 14:last_played
         // 15:play_count 16:is_favorite 17:status 18:added_at 19:updated_at
         // 20:hltb_main_story 21:hltb_main_extra 22:hltb_completionist 23:save_paths
-        // 24:exe_modified_at 25:exe_file_size
+        // 24:exe_modified_at 25:exe_file_size 26:platform 27:platform_id
         let genres_str: String = row.get(12)?;
         let genres: Vec<String> = serde_json::from_str(&genres_str).unwrap_or_default();
 
@@ -620,6 +623,9 @@ impl Database {
             },
             exe_modified_at: row.get(24)?,
             exe_file_size: row.get(25)?,
+            // 兜底 "local"：理论上迁移保证列存在，防御性保留
+            platform: row.get(26).unwrap_or_else(|_| "local".to_string()),
+            platform_id: row.get(27)?,
         })
     }
 
@@ -629,7 +635,8 @@ impl Database {
         genres, play_time_seconds, last_played, play_count,
         is_favorite, status, added_at, updated_at,
         hltb_main_story, hltb_main_extra, hltb_completionist,
-        save_paths, exe_modified_at, exe_file_size
+        save_paths, exe_modified_at, exe_file_size,
+        platform, platform_id
     ";
 
     // ==================== 游戏 CRUD ====================
@@ -643,9 +650,10 @@ impl Database {
                 genres, play_time_seconds, last_played, play_count,
                 is_favorite, status, added_at, updated_at,
                 hltb_main_story, hltb_main_extra, hltb_completionist,
-                save_paths, exe_modified_at, exe_file_size
+                save_paths, exe_modified_at, exe_file_size,
+                platform, platform_id
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -671,7 +679,9 @@ impl Database {
                 hltb_completionist = COALESCE(excluded.hltb_completionist, games.hltb_completionist),
                 save_paths = excluded.save_paths,
                 exe_modified_at = excluded.exe_modified_at,
-                exe_file_size = excluded.exe_file_size
+                exe_file_size = excluded.exe_file_size,
+                platform = excluded.platform,
+                platform_id = excluded.platform_id
             ",
             params![
                 game.id,
@@ -700,6 +710,8 @@ impl Database {
                 serde_json::to_string(&game.save_paths)?,
                 game.exe_modified_at,
                 game.exe_file_size,
+                game.platform,
+                game.platform_id,
             ],
         )?;
         Ok(())
@@ -1117,8 +1129,9 @@ impl Database {
                 developer = ?9, publisher = ?10, release_date = ?11,
                 genres = ?12, is_favorite = ?13, status = ?14, updated_at = ?15,
                 hltb_main_story = ?16, hltb_main_extra = ?17, hltb_completionist = ?18,
-                save_paths = ?19, exe_modified_at = ?20, exe_file_size = ?21
-             WHERE id = ?22",
+                save_paths = ?19, exe_modified_at = ?20, exe_file_size = ?21,
+                platform = ?22, platform_id = ?23
+             WHERE id = ?24",
             params![
                 game.name,
                 game.install_path,
@@ -1141,6 +1154,8 @@ impl Database {
                 serde_json::to_string(&game.save_paths)?,
                 game.exe_modified_at,
                 game.exe_file_size,
+                game.platform,
+                game.platform_id,
                 game.id,
             ],
         )?;
@@ -2410,6 +2425,41 @@ impl Database {
         Ok(())
     }
 
+    /// 迁移：添加来源平台字段到旧数据库
+    ///
+    /// `platform` 决定启动方式与截图策略（local=直接 spawn / steam·epic=URI 交由客户端拉起），
+    /// `platform_id` 存平台侧标识（Steam=appid，Epic=`CatalogNamespace:CatalogItemId:AppName`）。
+    ///
+    /// 默认 `'local'`，保证既有条目语义不变——老库升级后行为与升级前完全一致。
+    fn migrate_add_platform_columns(&self) -> Result<()> {
+        if !self.has_column("games", "platform")? {
+            tracing::info!("platform 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE games ADD COLUMN platform TEXT DEFAULT 'local'",
+                [],
+            )?;
+            tracing::info!("已添加 platform 字段到 games 表");
+        }
+
+        if !self.has_column("games", "platform_id")? {
+            tracing::info!("platform_id 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE games ADD COLUMN platform_id TEXT",
+                [],
+            )?;
+            tracing::info!("已添加 platform_id 字段到 games 表");
+        }
+
+        // 防御性回填：ALTER ADD COLUMN 的 DEFAULT 只对后续插入生效，
+        // 显式补齐历史行的 NULL/空值，避免下游按空串走错分支。
+        self.conn.execute(
+            "UPDATE games SET platform = 'local' WHERE platform IS NULL OR platform = ''",
+            [],
+        )?;
+
+        Ok(())
+    }
+
     /// 迁移：启用 WAL 日志模式
     /// journal_mode 是数据库的持久属性（写入文件头），重复执行无副作用。
     /// 意义：清理过期明细等批量写操作不再独占写锁阻塞前台统计查询。
@@ -2796,6 +2846,87 @@ impl SessionBuckets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 平台字段（0.8.0）：默认 local、平台条目写入/读回往返、列存在、迁移幂等、历史 NULL 回填。
+    #[test]
+    fn platform_columns_roundtrip_and_default() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+
+        // 1. 迁移后列必须存在（老库升级路径的基石）
+        assert!(db.has_column("games", "platform").unwrap(), "platform 列缺失");
+        assert!(db.has_column("games", "platform_id").unwrap(), "platform_id 列缺失");
+
+        // 2. Game::new 默认必须是 local（既有行为不变）
+        let mut local = Game::new("Celeste".to_string());
+        local.id = "g-local".to_string();
+        local.install_path = Some("H:\\Celeste".to_string());
+        db.upsert_game(&local).unwrap();
+        let got = db.get_game_by_id("g-local").unwrap().expect("local 条目应存在");
+        assert_eq!(got.platform, "local");
+        assert!(got.platform_id.is_none());
+
+        // 3. Epic 条目写入 → 读回（走 GAME_COLUMNS，索引对齐一并验证）
+        let epic_id = "g-epic";
+        let epic_pid = "45e7cf3c49054f2fb20b673d9b0ae69e:f08663635fd84c33bfc62ea3bac000e6:818447bb519b46d48d365d5753362796";
+        let mut epic = Game::new("Sonic Mania".to_string());
+        epic.id = epic_id.to_string();
+        epic.platform = "epic".to_string();
+        epic.platform_id = Some(epic_pid.to_string());
+        epic.install_path = Some("H:\\SonicMania".to_string());
+        db.upsert_game(&epic).unwrap();
+        let got = db.get_game_by_id(epic_id).unwrap().expect("epic 条目应存在");
+        assert_eq!(got.platform, "epic");
+        assert_eq!(got.platform_id.as_deref(), Some(epic_pid));
+
+        // 4. get_games 列表查询同样带上平台字段
+        let all = db.get_games(&GameFilter::default()).unwrap();
+        let listed = all.iter().find(|g| g.id == epic_id).expect("列表应含 epic 条目");
+        assert_eq!(listed.platform, "epic");
+
+        // 5. update_game 往返（改名不改平台）
+        let mut renamed = got.clone();
+        renamed.name = "Sonic Mania Plus".to_string();
+        db.update_game(&renamed).unwrap();
+        let after = db.get_game_by_id(epic_id).unwrap().unwrap();
+        assert_eq!(after.name, "Sonic Mania Plus");
+        assert_eq!(after.platform, "epic");
+        assert_eq!(after.platform_id.as_deref(), Some(epic_pid));
+
+        // 6. 迁移幂等：重复执行无副作用
+        db.migrate_add_platform_columns().unwrap();
+        db.migrate_add_platform_columns().unwrap();
+        assert!(db.has_column("games", "platform").unwrap());
+    }
+
+    /// 平台迁移回填：历史行 platform 为 NULL/空串时必须被补齐为 'local'，
+    /// 否则下游会按空串走错分支（既非 local 也非平台）。
+    #[test]
+    fn platform_backfill_null_and_empty_to_local() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+
+        db.conn
+            .execute(
+                "INSERT INTO games (id, name, added_at, platform) VALUES ('n1', 'NullGame', '2026-01-01', NULL)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO games (id, name, added_at, platform) VALUES ('n2', 'EmptyGame', '2026-01-01', '')",
+                [],
+            )
+            .unwrap();
+
+        db.migrate_add_platform_columns().unwrap();
+
+        for id in ["n1", "n2"] {
+            let p: String = db
+                .conn
+                .query_row("SELECT platform FROM games WHERE id = ?1", params![id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(p, "local", "历史行 {} 应回填为 local", id);
+        }
+    }
 
     /// 墓碑认领闭环（2026-09-06）：删除留档 → 按 名字+exe文件名（大小写/空格不敏感）命中 →
     /// 复用旧 id 入库 → 从预聚合回填累计时长/次数；exe 文件名不同则防误接；认领后墓碑清除。

@@ -4,6 +4,7 @@ pub mod settings;
 pub mod achievements;
 pub mod reviews;
 pub mod screenshots;
+pub mod platform;
 
 use std::sync::{Arc, Mutex};
 

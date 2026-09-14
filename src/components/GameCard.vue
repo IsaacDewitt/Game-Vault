@@ -142,6 +142,15 @@ function handleContextMenu(e: MouseEvent) {
         </button>
       </div>
 
+      <!-- 平台角标：本地游戏不显示，平台游戏标出出处 -->
+      <div
+        v-if="game.platform === 'steam' || game.platform === 'epic'"
+        class="platform-badge"
+        :class="game.platform"
+      >
+        {{ game.platform === "steam" ? "Steam" : "Epic" }}
+      </div>
+
       <!-- 正在游玩 -->
       <div v-if="isActive" class="playing-badge">
         <span class="pulse"></span> 游玩中
@@ -285,6 +294,32 @@ function handleContextMenu(e: MouseEvent) {
 
 .fav-btn.favorited {
   color: #ef4444;
+}
+
+/* 平台角标：左下角（避开左上的「已通关」与右上的「游玩中」） */
+.platform-badge {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  padding: 2px 7px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.66);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.platform-badge.steam {
+  background: linear-gradient(135deg, #1b2838 0%, #2a475e 100%);
+  border: 1px solid rgba(102, 192, 244, 0.55);
+}
+
+.platform-badge.epic {
+  background: linear-gradient(135deg, #202020 0%, #454545 100%);
+  border: 1px solid rgba(255, 255, 255, 0.4);
 }
 
 .playing-badge {

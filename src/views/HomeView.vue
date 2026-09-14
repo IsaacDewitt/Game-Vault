@@ -27,6 +27,7 @@ import { DEBOUNCE_MS } from "../lib/constants";
 import GameCard from "../components/GameCard.vue";
 import GameDetail from "../components/GameDetail.vue";
 import GameInfoEditModal from "../components/GameInfoEditModal.vue";
+import PlatformImportModal from "../components/PlatformImportModal.vue";
 import ContextMenu from "../components/ContextMenu.vue";
 import type { ContextMenuItem } from "../components/ContextMenu.vue";
 import { formatPlayTime } from "../lib/format";
@@ -79,6 +80,10 @@ onUnmounted(() => {
 const showNameModal = ref(false);
 const pendingExePath = ref("");
 const gameNameInput = ref("");
+// 游戏来源选择 + 平台导入（Steam / Epic）
+const showPlatformPicker = ref(false);
+const showPlatformImport = ref(false);
+const importPlatform = ref("steam");
 // 重命名游戏弹窗状态
 const showRenameModal = ref(false);
 const renamingGameId = ref("");
@@ -195,7 +200,26 @@ const homeContextMenuItems = computed<ContextMenuItem[]>(() => [
   },
 ]);
 
-async function handleAddGame() {
+/** 点击「添加游戏」：先让老爷选游戏来源（本地 / Steam / Epic） */
+function handleAddGame() {
+  showPlatformPicker.value = true;
+}
+
+/** 来源选「本地游戏」→ 走原有的选择 exe 流程 */
+function handlePickLocalExe() {
+  showPlatformPicker.value = false;
+  pickExeFile();
+}
+
+/** 来源选 Steam / Epic → 打开平台导入弹窗 */
+function handlePickPlatform(platform: string) {
+  showPlatformPicker.value = false;
+  importPlatform.value = platform;
+  showPlatformImport.value = true;
+}
+
+/** 选择本地游戏的 exe 文件（原「添加游戏」流程） */
+async function pickExeFile() {
   try {
     const selected = await open({
       multiple: false,
@@ -243,6 +267,15 @@ function handleCancelAddGame() {
   showNameModal.value = false;
   pendingExePath.value = "";
   gameNameInput.value = "";
+}
+
+/** 平台导入完成后刷新列表（导入是后端批量入库，前端需重新拉取） */
+async function handlePlatformImported() {
+  try {
+    await store.loadGames();
+  } catch (e) {
+    console.error("刷新游戏列表失败:", e);
+  }
 }
 
 function handleRenameGame(gameId: string) {
@@ -675,6 +708,51 @@ function handleDeleteGame(gameId: string) {
       @set-status="handleSetGameStatus(store.selectedGame!.id, $event)"
     />
 
+    <!-- 游戏来源选择弹窗：本地 / Steam / Epic -->
+    <n-modal
+      :show="showPlatformPicker"
+      preset="card"
+      title="添加游戏"
+      class="source-picker-modal"
+      :closable="true"
+      @close="showPlatformPicker = false"
+    >
+      <p style="margin-bottom: 14px; color: #999; font-size: 13px;">
+        请选择游戏来源：
+      </p>
+      <div class="source-list">
+        <button class="source-item" @click="handlePickLocalExe()">
+          <span class="source-icon">🖥️</span>
+          <span class="source-text">
+            <span class="source-title">本地游戏</span>
+            <span class="source-desc">手动选择游戏 exe，由本应用直接启动</span>
+          </span>
+        </button>
+        <button class="source-item" @click="handlePickPlatform('steam')">
+          <span class="source-icon">🎮</span>
+          <span class="source-text">
+            <span class="source-title">Steam 游戏</span>
+            <span class="source-desc">扫描本机 Steam 库，交由 Steam 启动并记录时长</span>
+          </span>
+        </button>
+        <button class="source-item" @click="handlePickPlatform('epic')">
+          <span class="source-icon">🕹️</span>
+          <span class="source-text">
+            <span class="source-title">Epic 游戏</span>
+            <span class="source-desc">扫描本机 Epic 库，交由 Epic 启动、记录时长并支持截图</span>
+          </span>
+        </button>
+      </div>
+    </n-modal>
+
+    <!-- 平台游戏导入弹窗 -->
+    <PlatformImportModal
+      :show="showPlatformImport"
+      :platform="importPlatform"
+      @close="showPlatformImport = false"
+      @imported="handlePlatformImported()"
+    />
+
     <!-- 输入游戏名称弹窗 -->
     <n-modal
       :show="showNameModal"
@@ -745,10 +823,71 @@ function handleDeleteGame(gameId: string) {
   </div>
 </template>
 
+<!-- 非 scoped：弹窗被 teleport 到 body，scoped 选择器无法命中内部卡片 -->
+<style>
+/* 「添加游戏」来源选择弹窗宽度：Modal 会把 class 透传到内部卡片 .n-modal 上
+   （与 .n-modal 同属一个元素，故此处用复合选择器）。卡片默认按内容撑满全宽，须显式定宽。 */
+.n-modal.source-picker-modal {
+  width: 440px;
+  max-width: 92vw;
+}
+</style>
+
 <style scoped>
 .home-view {
   position: relative;
   height: calc(100vh - 48px);
+}
+
+/* 游戏来源选择弹窗 */
+.source-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.source-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  text-align: left;
+  background: rgba(128, 128, 128, 0.08);
+  border: 1px solid rgba(128, 128, 128, 0.18);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: inherit;
+  color: inherit;
+}
+
+.source-item:hover {
+  border-color: #6366f1;
+  background: rgba(99, 102, 241, 0.1);
+}
+
+.source-icon {
+  font-size: 22px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.source-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.source-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.source-desc {
+  font-size: 11.5px;
+  color: #888;
+  line-height: 1.4;
 }
 
 /* 最近游玩区域 */
