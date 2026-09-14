@@ -184,21 +184,20 @@ pub fn trigger_screenshot(
         (id, archive_name)
     };
 
-    // 3. 平台分流 + 读取截图目录设置（一次 DB 锁做两件事）
+    // 3. 平台分流 + 解析落盘目标（一次 DB 锁完成）
     //
     // Steam 自带截图，且其默认截图键同为 F12：本应用必须**静默退让**——
     // 不截图、也**不发提示音**，否则每次 Steam 截图都会被我们"跟一声"。
     // 判定必须显式按 platform 来，不能指望"Steam 条目没有 exe 名所以匹配不上"这种巧合——
     // 一旦将来 exe_name 被填上，就会误触发。
     // （Epic 无此冲突：其覆盖层热键是 Shift+F2，故 Epic 游戏照常支持截图。）
-    let screenshot_dir = {
+    let target = {
         let db_guard = lock_or_recover(db);
 
-        let platform = db_guard
-            .get_game_by_id(&matched_game_id)
-            .ok()
-            .flatten()
-            .map(|g| g.platform)
+        let game = db_guard.get_game_by_id(&matched_game_id).ok().flatten();
+        let platform = game
+            .as_ref()
+            .map(|g| g.platform.clone())
             .unwrap_or_default();
         if platform == crate::core::platform::PLATFORM_STEAM {
             tracing::info!(
@@ -208,24 +207,63 @@ pub fn trigger_screenshot(
             return Some(ScreenshotOutcome::PlatformExcluded);
         }
 
-        match Settings::load_from_db(&db_guard) {
-            Ok(s) => {
-                tracing::info!(
-                    "[截图] 准备抓屏：游戏 {matched_game_id}（platform={platform}），目录 {}",
-                    s.screenshot_dir
-                );
-                s.screenshot_dir
-            }
+        let settings = match Settings::load_from_db(&db_guard) {
+            Ok(s) => s,
             Err(e) => {
                 tracing::error!("[截图] 读取截图目录设置失败: {e}");
                 screenshot::play_feedback(screenshot::FeedbackTone::Error);
                 return Some(ScreenshotOutcome::Failed { message: format!("读取设置失败: {e}") });
             }
+        };
+
+        // 手账条目（按游戏名 / 英文名命中）有两重用处：
+        // ① 它可能带"手动指定的截图目录"——用户自己整理过的命名，最权威（如 SILENT HILL 2）；
+        // ② 它的英文题名可作为候选名——用户库里目录多为英文标题，中文名对不上时靠它兜。
+        let review = game.as_ref().and_then(|g| {
+            let id = db_guard
+                .find_review_id_by_game_name(&g.name)
+                .ok()
+                .flatten()?;
+            db_guard.get_review_by_id(&id).ok().flatten()
+        });
+        let journal_dir = review.as_ref().and_then(|r| r.screenshot_dir.clone());
+
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(en) = review
+            .as_ref()
+            .and_then(|r| r.name_en.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            candidates.push(en.to_string());
         }
+        if let Some(g) = game.as_ref() {
+            if !g.name.trim().is_empty() {
+                candidates.push(g.name.clone());
+            }
+        }
+
+        let root = std::path::PathBuf::from(crate::utils::path::expand_env_vars(
+            &settings.screenshot_dir,
+        ));
+        let target = screenshot::resolve_capture_target(
+            &root,
+            &candidates,
+            journal_dir.as_deref(),
+            // 兜底：会话 exe 名（题名全空时才用得上）
+            &archive_name,
+        );
+        tracing::info!(
+            "[截图] 落盘 {}（命名来源：{}；候选名 {:?}）",
+            target.dir.display(),
+            target.source.label(),
+            candidates
+        );
+        target
     };
 
-    // 4. WGC 同步抓屏（按会话 exe 名归档：目录与手账/详情页口径一致）
-    match screenshot::capture_and_save(hwnd, &archive_name, &screenshot_dir) {
+    // 4. WGC 抓屏
+    match screenshot::capture_and_save(hwnd, &target.dir, &target.stem) {
         Ok(r) => {
             screenshot::play_feedback(screenshot::FeedbackTone::Success);
             Some(ScreenshotOutcome::Captured {

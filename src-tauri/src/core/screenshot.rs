@@ -13,10 +13,29 @@ use crate::core::tonemap::{self, ToneMapPath};
 #[derive(Debug, Clone)]
 pub struct ScreenshotResult {
     pub path: String,
+    /// 归档文件夹名（题名或会话 exe 名，取决于 `resolve_capture_target` 的判定来源），
+    /// 前端据此提示"截图已保存到「X」文件夹"。
     pub process_name: String,
     pub width: u32,
     pub height: u32,
     pub tone_map_path: ToneMapPath,
+}
+
+/// 目录 / 文件名分量消毒：把 Windows 非法字符换成**空格**（与用户库里既有的
+/// `Call of Duty  Black Ops`、`Assassin's Creed  Brotherhood` 这类目录命名一致），再去首尾空白。
+///
+/// 题名（如 `Mafia: The Old Country`）也要走这里——既可作目录名，也保证不会因 `:` `/` 越出截图根目录。
+/// 非法字符换成空格后可能出现连续空格，这是有意保留的（跟随既有目录的习惯，便于肉眼对应）。
+pub fn sanitize_component(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            _ => c,
+        })
+        .collect();
+    cleaned.trim().to_string()
 }
 
 /// 从进程名中提取文件 stem（去掉 .exe 扩展名），用于目录与文件命名
@@ -28,20 +47,131 @@ pub fn process_stem(exe_name: &str) -> String {
     } else {
         name
     };
-    let cleaned: String = stem
-        .chars()
-        .map(|c| match c {
-            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => c,
-        })
-        .collect();
-    cleaned.trim().to_string()
+    sanitize_component(stem)
 }
 
 /// 计算某个游戏（进程）的截图目录：`{screenshot_dir}/{process_stem}`
 pub fn screenshot_dir_for_process(screenshot_dir: &str, exe_name: &str) -> std::path::PathBuf {
     let expanded = crate::utils::path::expand_env_vars(screenshot_dir);
     std::path::PathBuf::from(expanded).join(process_stem(exe_name))
+}
+
+// ==================== 截图落盘目标解析（2026-09-14，改前必读） ====================
+
+/// 落盘目录的命名来源（只用于日志与排查）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureDirSource {
+    /// 手账里手动指定的截图目录
+    Journal,
+    /// 截图根目录下已存在的同名目录
+    ExistingDir,
+    /// 按游戏标题新建
+    GameTitle,
+    /// 按会话 exe 名兜底
+    SessionExe,
+}
+
+impl CaptureDirSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Journal => "手账指定",
+            Self::ExistingDir => "已有同名目录",
+            Self::GameTitle => "游戏标题新建",
+            Self::SessionExe => "会话 exe 名兜底",
+        }
+    }
+}
+
+/// 一次截图的落盘目标：目录 + 文件名前缀 + 命名来源
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureTarget {
+    pub dir: std::path::PathBuf,
+    pub stem: String,
+    pub source: CaptureDirSource,
+}
+
+/// 解析截图落盘目录与文件名前缀（纯逻辑，便于单测）。
+///
+/// # 为什么不能简单按 exe 名建目录（用户库实测，2026-09-14）
+///
+/// `H:\GameCapture` 是多年积累的库，188 个目录绝大多数按**游戏标题**命名
+/// （`God of War` 569 张、`Alan Wake 2` 453 张……），而按 exe 名会建出 `GoW`（0 张）这类
+/// 第二摊目录：图截进去了，详情页与手账（都按老目录统计）却看不到，用户以为没截上。
+///
+/// # 优先级
+///
+/// 1. `journal_dir`：手账里手动指定的截图目录（单层目录名）——用户自己整理过的，最权威，
+///    也覆盖 `SILENT HILL 2` 这种与标题对不上的特殊命名；
+/// 2. 根目录下与任一候选名（英文名 → 中文名）**对得上**的已存在目录：复用其原始名字，
+///    既不新建也不改名（保留用户目录里的大小写与空格）；
+/// 3. 都没有：按第一个可用候选名（游戏标题）新建；标题全空时退回 `fallback`（会话 exe 名）。
+///
+/// 比较统一走 `match_key`（只留字母数字小写、精确相等），与手账回填同口径，
+/// 因此 `Assassin's Creed: Brotherhood` 与 `Assassin's Creed  Brotherhood`（双空格）能对上，
+/// 而 `II` / `III` 不会互相误配。
+pub fn resolve_capture_target(
+    root: &std::path::Path,
+    candidates: &[String],
+    journal_dir: Option<&str>,
+    fallback_exe: &str,
+) -> CaptureTarget {
+    // 1) 手账手动指定（单层目录名，挡路径穿越）
+    if let Some(dir) = journal_dir.and_then(sanitize_dir_name) {
+        return CaptureTarget {
+            stem: dir.clone(),
+            dir: root.join(dir),
+            source: CaptureDirSource::Journal,
+        };
+    }
+
+    // 2) 复用根目录下已存在的同名目录
+    let existing = list_subdir_names(root);
+    for candidate in candidates {
+        let key = match_key(candidate);
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(hit) = existing.iter().find(|dir| match_key(dir) == key) {
+            return CaptureTarget {
+                dir: root.join(hit),
+                stem: hit.clone(),
+                source: CaptureDirSource::ExistingDir,
+            };
+        }
+    }
+
+    // 3) 新建：游戏标题优先，空则退回会话 exe 名
+    let from_title = candidates
+        .iter()
+        .map(|c| sanitize_component(c))
+        .find(|c| !c.is_empty() && c != "." && c != "..");
+    match from_title {
+        Some(name) => CaptureTarget {
+            dir: root.join(&name),
+            stem: name,
+            source: CaptureDirSource::GameTitle,
+        },
+        None => {
+            let name = process_stem(fallback_exe);
+            CaptureTarget {
+                dir: root.join(&name),
+                stem: name,
+                source: CaptureDirSource::SessionExe,
+            }
+        }
+    }
+}
+
+/// 列出根目录下的子目录名（不递归；根目录不存在则空）
+fn list_subdir_names(root: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect()
 }
 
 // ==================== 截图目录枚举 / 匹配（手账自持截图目录用，2026-09-12） ====================
@@ -138,38 +268,36 @@ fn build_unique_path(dir: &std::path::Path, stem: &str) -> std::path::PathBuf {
 }
 
 /// 通用保存：把已 tonemap 好的 sRGB RGBA8 帧编码为 PNG 并归档。
-/// WGC 与注入两条路径共用。
+/// WGC 与注入两条路径共用。目录与前缀由 `resolve_capture_target` 解析后传入。
 pub fn save_srgb_png(
     srgb: &[u8],
     width: u32,
     height: u32,
-    process_name: &str,
-    screenshot_dir: &str,
+    dir: &std::path::Path,
+    stem: &str,
     tone_path: ToneMapPath,
 ) -> anyhow::Result<ScreenshotResult> {
-    let stem = process_stem(process_name);
-    let dir = screenshot_dir_for_process(screenshot_dir, process_name);
-    std::fs::create_dir_all(&dir)
+    std::fs::create_dir_all(dir)
         .map_err(|e| anyhow::anyhow!("创建截图目录失败 {}: {e}", dir.display()))?;
-    let path = build_unique_path(&dir, &stem);
+    let path = build_unique_path(dir, stem);
 
     tonemap::encode_png(srgb, width, height, &path)?;
 
     tracing::info!("截图已保存: {} (tonemap: {:?})", path.display(), tone_path);
     Ok(ScreenshotResult {
         path: path.to_string_lossy().to_string(),
-        process_name: stem,
+        process_name: stem.to_string(),
         width,
         height,
         tone_map_path: tone_path,
     })
 }
 
-/// 方案 A：从指定 HWND 抓取一帧并保存（WGC 路径）。
+/// 方案 A：从指定 HWND 抓取一帧并保存到指定目录（WGC 路径）。
 pub fn capture_and_save(
     hwnd: isize,
-    process_name: &str,
-    screenshot_dir: &str,
+    dir: &std::path::Path,
+    stem: &str,
 ) -> anyhow::Result<ScreenshotResult> {
     let frame = crate::core::capture::capture_window_fp16(hwnd)?;
 
@@ -192,7 +320,7 @@ pub fn capture_and_save(
         white_level_scale,
     );
 
-    save_srgb_png(&srgb, frame.width, frame.height, process_name, screenshot_dir, tone_path)
+    save_srgb_png(&srgb, frame.width, frame.height, dir, stem, tone_path)
 }
 
 /// 截图反馈音效（内嵌合成 wav，经 winmm PlaySound 播放，零外部文件依赖）。
@@ -302,5 +430,126 @@ mod tests {
 
         // 根目录不存在：返回空而非 panic
         assert!(list_image_subdirs(&root.join("nope")).is_empty());
+    }
+
+    fn temp_root(tag: &str) -> (std::path::PathBuf, TempDirGuard) {
+        let root = std::env::temp_dir().join(format!("gv_target_{tag}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let guard = TempDirGuard(root.clone());
+        (root, guard)
+    }
+
+    /// 落盘目标优先级：手账指定 > 已有同名目录 > 标题新建 > 会话 exe 名兜底
+    #[test]
+    fn capture_target_priority() {
+        let (root, _g) = temp_root("prio");
+        std::fs::create_dir_all(root.join("God of War")).unwrap();
+        std::fs::create_dir_all(root.join("Alan Wake 2")).unwrap();
+
+        // 1) 手账指定最权威：即便根目录下已有"同名目录"也听手账的
+        let t = resolve_capture_target(
+            &root,
+            &["God of War".to_string()],
+            Some("GoW"),
+            "GoW.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::Journal);
+        assert_eq!(t.dir, root.join("GoW"));
+        assert_eq!(t.stem, "GoW");
+
+        // 2) 复用已存在目录：保留它原始的大小写与空格
+        let t = resolve_capture_target(
+            &root,
+            &["God of War".to_string()],
+            None,
+            "GoW.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::ExistingDir);
+        assert_eq!(t.dir, root.join("God of War"));
+        assert_eq!(t.stem, "God of War");
+
+        // 3) 标题对不上任何已有目录 → 按标题新建
+        let t = resolve_capture_target(
+            &root,
+            &["Cyberpunk 2077".to_string()],
+            None,
+            "Cyberpunk2077.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::GameTitle);
+        assert_eq!(t.dir, root.join("Cyberpunk 2077"));
+
+        // 4) 标题全空 → 退回会话 exe 名
+        let t = resolve_capture_target(&root, &["".to_string(), "  ".to_string()], None, "Frostpunk.exe");
+        assert_eq!(t.source, CaptureDirSource::SessionExe);
+        assert_eq!(t.dir, root.join("Frostpunk"));
+    }
+
+    /// 英文名优先于中文名，且两侧都按 match_key 精确比对（标点/空格差异可抹平，II 与 III 不混）
+    #[test]
+    fn capture_target_matches_existing_dir_by_normalized_name() {
+        let (root, _g) = temp_root("match");
+        std::fs::create_dir_all(root.join("Death Stranding Director's Cut")).unwrap();
+        std::fs::create_dir_all(root.join("Assassin's Creed  Brotherhood")).unwrap();
+        std::fs::create_dir_all(root.join("Assassin's Creed III")).unwrap();
+
+        // 英文名全大写也能对上已有目录（Windows 目录名不区分大小写，这里连标点差异一起抹平）
+        let t = resolve_capture_target(
+            &root,
+            &[
+                "DEATH STRANDING DIRECTOR'S CUT".to_string(),
+                "死亡搁浅：导演剪辑版".to_string(),
+            ],
+            None,
+            "DeathStranding.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::ExistingDir);
+        assert_eq!(t.dir, root.join("Death Stranding Director's Cut"));
+
+        // 英文名对不上时继续试中文名（这里都没有 → 新建，且冒号被消毒）
+        let t = resolve_capture_target(
+            &root,
+            &[
+                "MAFIA: THE OLD COUNTRY".to_string(),
+                "四海兄弟：故乡".to_string(),
+            ],
+            None,
+            "MafiaTheOldCountry.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::GameTitle);
+        assert_eq!(t.dir, root.join("MAFIA  THE OLD COUNTRY"), "非法字符换空格，与既有目录习惯一致");
+
+        // 标点差异抹平（双空格版本可被单冒号版本命中）
+        let t = resolve_capture_target(
+            &root,
+            &["Assassin's Creed: Brotherhood".to_string()],
+            None,
+            "ACB.exe",
+        );
+        assert_eq!(t.dir, root.join("Assassin's Creed  Brotherhood"));
+
+        // 数字后缀不得互相误配：II 不该命中 III
+        let t = resolve_capture_target(
+            &root,
+            &["Assassin's Creed II".to_string()],
+            None,
+            "AC2.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::GameTitle);
+        assert_eq!(t.dir, root.join("Assassin's Creed II"));
+    }
+
+    /// 手账目录值非法（路径穿越 / 绝对路径）时忽略，继续走后续推断
+    #[test]
+    fn capture_target_ignores_illegal_journal_dir() {
+        let (root, _g) = temp_root("evil");
+        for evil in [r"..\..\Windows", r"C:\Windows", "a/b", "   "] {
+            let t = resolve_capture_target(&root, &["Some Game".to_string()], Some(evil), "sg.exe");
+            assert_ne!(
+                t.source,
+                CaptureDirSource::Journal,
+                "非法手账目录 {evil} 不该被采用"
+            );
+            assert_eq!(t.dir, root.join("Some Game"));
+        }
     }
 }
