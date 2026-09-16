@@ -459,6 +459,11 @@ export async function setWindowSize(width: number, height: number): Promise<void
   return invoke("set_window_size", { width, height });
 }
 
+/** 前端诊断信息写入后端日志文件（如视口看门狗的自愈记录） */
+export async function logDiag(message: string): Promise<void> {
+  return invoke("log_frontend_diag", { message });
+}
+
 // ==================== 截图 ====================
 
 /** 截图触发结果（后端事件 screenshot-taken 的 payload） */

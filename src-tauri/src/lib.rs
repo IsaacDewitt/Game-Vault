@@ -135,6 +135,14 @@ fn frontend_ready() {
     core::boot_guard::mark_frontend_ready();
 }
 
+/// 前端诊断信息落日志（如视口看门狗检测到 WebView2 渲染进程丢失 resize 并自愈的记录）。
+///
+/// 该类竞态在应用侧无任何异常痕迹，唯有此处主动落盘，事后才有据可查。
+#[tauri::command]
+fn log_frontend_diag(message: String) {
+    tracing::warn!("[前端诊断] {message}");
+}
+
 /// 退出应用程序（优雅关闭后台线程，持久化活跃会话）
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
@@ -600,6 +608,7 @@ pub fn run() {
             // 应用
             quit_app,
             frontend_ready,
+            log_frontend_diag,
         ])
         .build(context)
         .expect("error while building tauri application");

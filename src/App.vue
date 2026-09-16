@@ -9,6 +9,7 @@ import AchievementToast from "./components/AchievementToast.vue";
 import { useGamesStore } from "./stores/games";
 import * as api from "./lib/tauri";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { PhysicalSize } from "@tauri-apps/api/dpi";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { DEFAULT_ACCENT_COLOR } from "./lib/constants";
@@ -157,6 +158,57 @@ watch([accentColor, isDark], () => {
 // 监听窗口关闭事件，弹出自定义确认对话框
 let unlistenClose: (() => void) | null = null;
 
+// ---- 视口看门狗：自愈 WebView2 渲染进程偶发丢失 resize 的竞态 ----
+//
+// 症状（2026-09-16 实拍）：点最大化后窗口本体已铺满，但页面布局停在旧视口
+// （DOM 卡在左上角，其余区域露出网页背景色）。实测 14 种窗口路径无法在开发
+// 环境复现：窗口 HWND 全部正确拉伸（wry WM_SIZE → SetBounds 链路完好），
+// 唯 Chromium 渲染进程没收到 resize —— 属 WebView2 内部竞态，应用层无根因
+// 可修，只能检测 + 重放 resize 自愈，并把证据落日志（log_frontend_diag）。
+let vpToken = 0; // 防抖令牌：resize 风暴中只保留最新一次检测
+let vpRepairCount = 0; // 同一段 resize 内的自愈次数（上限 2，防循环折腾）
+
+async function viewportGuardCheck(expectW: number, expectH: number) {
+  const token = ++vpToken;
+  // 给正常链路留出完成时间（拖动边缘的连续 resize 期间，令牌失效的旧检查直接让位）
+  await new Promise((r) => setTimeout(r, 160));
+  if (token !== vpToken) return;
+
+  const dw = Math.abs(window.innerWidth - expectW);
+  const dh = Math.abs(window.innerHeight - expectH);
+  if (dw <= 2 && dh <= 2) {
+    vpRepairCount = 0; // 视口健康（或自愈成功），清零计数
+    return;
+  }
+  if (vpRepairCount >= 2) return; // 两轮自愈仍卡死：放弃，避免无限循环
+  vpRepairCount += 1;
+
+  const win = getCurrentWindow();
+  const detail = `视口未跟随窗口尺寸: 页面=${window.innerWidth}x${window.innerHeight} 期望=${expectW}x${expectH}（自愈第 ${vpRepairCount}/2 次）`;
+  console.error("[viewport-guard]", detail);
+  api.logDiag(detail).catch(() => {});
+
+  if (await win.isMaximized()) {
+    // 最大化态：重放一次「还原 → 最大化」，整条 resize 链路重走一遍
+    await win.unmaximize();
+    await new Promise((r) => setTimeout(r, 250));
+    await win.maximize();
+  } else {
+    // 普通态：物理尺寸抖动 1px，强制 wry 重新 SetBounds
+    const size = await win.outerSize();
+    await win.setSize(new PhysicalSize(size.width - 1, size.height - 1));
+    await new Promise((r) => setTimeout(r, 120));
+    await win.setSize(new PhysicalSize(size.width, size.height));
+  }
+  // 自愈动作本身会再触发 onResized → 由下一轮回调复查；同步标题栏图标状态
+  isMaximized.value = await win.isMaximized();
+}
+
+function expectViewportFrom(physical: { width: number; height: number }) {
+  const dpr = window.devicePixelRatio || 1;
+  return viewportGuardCheck(Math.round(physical.width / dpr), Math.round(physical.height / dpr));
+}
+
 onMounted(async () => {
   await gamesStore.setupEventListeners();
   await gamesStore.loadGames();
@@ -178,6 +230,12 @@ onMounted(async () => {
   // 监听最大化状态变化
   const win = getCurrentWindow();
   isMaximized.value = await win.isMaximized();
+
+  // 视口看门狗：注册 resize 监听 + 启动时主动查一次（竞态也可能发生在启动路径）
+  unlistenResize = await win.onResized(({ payload }) => {
+    void expectViewportFrom(payload);
+  });
+  void expectViewportFrom(await win.innerSize());
 
   // 每次弹出时使用当前主题创建 discrete API，确保主题实时同步
   unlistenClose = await listen("close-requested", () => {
@@ -204,9 +262,11 @@ onMounted(async () => {
 });
 
 // 清理事件监听器
+let unlistenResize: (() => void) | null = null;
 onUnmounted(() => {
   gamesStore.cleanupEventListeners();
   unlistenClose?.();
+  unlistenResize?.();
 });
 </script>
 
