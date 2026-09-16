@@ -363,7 +363,7 @@ impl LlmFetcher {
 
     /// 判断 Anthropic 响应中是否包含 tool_use 块
     fn has_anthropic_tool_use(resp: &serde_json::Value) -> bool {
-        resp["content"].as_array().map_or(false, |arr| {
+        resp["content"].as_array().is_some_and(|arr| {
             arr.iter().any(|b| b["type"].as_str() == Some("tool_use"))
         })
     }
@@ -749,7 +749,7 @@ fn parse_chinese_date(date: &str) -> Option<String> {
     let day_end = date[day_start..].find('日')? + day_start;
     let day: u32 = date[day_start..day_end].parse().ok()?;
 
-    if year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+    if year > 0 && (1..=12).contains(&month) && (1..=31).contains(&day) {
         Some(format!("{:04}-{:02}-{:02}", year, month, day))
     } else {
         None

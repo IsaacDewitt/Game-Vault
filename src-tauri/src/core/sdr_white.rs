@@ -83,12 +83,14 @@ fn query_sdr_white_scale(hwnd: isize) -> f32 {
 
         // 3. 按 GDI 设备名匹配路径，再查该路径的 SDR 白电平
         for path in &paths[..num_paths as usize] {
-            let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
-            src.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
-                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
-                size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
-                adapterId: path.sourceInfo.adapterId,
-                id: path.sourceInfo.id,
+            let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                    size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                    adapterId: path.sourceInfo.adapterId,
+                    id: path.sourceInfo.id,
+                },
+                ..Default::default()
             };
             if DisplayConfigGetDeviceInfo(&mut src.header) != 0 {
                 continue;
@@ -97,14 +99,16 @@ fn query_sdr_white_scale(hwnd: isize) -> f32 {
                 continue;
             }
 
-            let mut white = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
-            white.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
-                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
-                size: std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32,
-                // 官方文档明确要求 target 标识符（source id 与 target id 在多屏
-                // 拓扑下不同，用错会查错屏或失败回落 1.0）
-                adapterId: path.targetInfo.adapterId,
-                id: path.targetInfo.id,
+            let mut white = DISPLAYCONFIG_SDR_WHITE_LEVEL {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
+                    size: std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32,
+                    // 官方文档明确要求 target 标识符（source id 与 target id 在多屏
+                    // 拓扑下不同，用错会查错屏或失败回落 1.0）
+                    adapterId: path.targetInfo.adapterId,
+                    id: path.targetInfo.id,
+                },
+                ..Default::default()
             };
             if DisplayConfigGetDeviceInfo(&mut white.header) != 0 {
                 continue;

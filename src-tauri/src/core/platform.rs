@@ -315,6 +315,48 @@ fn kv_value(text: &str, key: &str) -> Option<String> {
     None
 }
 
+/// 把 Steam acf 的 `StateFlags` 文本解析为 u32，兼容十进制与 `0x` 前缀。
+/// 空值或无法解析（异常格式）时返回 `None`，由调用方决定放行而非误杀。
+fn parse_steam_state_flags(text: &str) -> Option<u32> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let t = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    t.parse::<u32>().ok()
+}
+
+/// 判定是否为 Valve 工具/运行库条目（非玩家可游玩的游戏），导入扫描应排除。
+///
+/// - `appid` 黑名单：Steamworks Common Redistributables 与各类 Steam Linux Runtime；
+/// - `installdir` 前缀黑名单（大小写不敏感）：Steamworks / Proton / Steam Linux Runtime /
+///   Steam Controller Configs 等。
+fn is_steam_tool(appid: &str, installdir: &str) -> bool {
+    const BLOCKED_APPIDS: &[&str] = &[
+        "228980",  // Steamworks Common Redistributables
+        "1070560", // Steam Linux Runtime
+        "1391110", // Steam Linux Runtime - Soldier
+        "1628350", // Steam Linux Runtime - Sniper
+        "2180100", // Steam Linux Runtime - Sniper 变体
+    ];
+    if BLOCKED_APPIDS.iter().any(|b| b.eq_ignore_ascii_case(appid)) {
+        return true;
+    }
+    let dir = installdir.to_lowercase();
+    const BLOCKED_PREFIXES: &[&str] = &[
+        "steamworks shared",
+        "steamworks",
+        "steamlinuxruntime",
+        "steamlinuxruntime_",
+        "proton",
+        "steam controller configs",
+    ];
+    BLOCKED_PREFIXES.iter().any(|p| dir.starts_with(p))
+}
+
 /// 解析单个 `appmanifest_<appid>.acf`
 fn parse_steam_acf(path: &Path, lib_root: &Path) -> Result<Option<PlatformGame>> {
     let text = std::fs::read_to_string(path)?;
@@ -329,6 +371,42 @@ fn parse_steam_acf(path: &Path, lib_root: &Path) -> Result<Option<PlatformGame>>
         Some(d) if !d.trim().is_empty() => d,
         _ => return Ok(None),
     };
+
+    // 排除 Valve 工具/运行库（Steamworks / Proton / Linux Runtime 等），它们不是可游玩游戏
+    if is_steam_tool(&appid, &installdir) {
+        tracing::debug!(
+            "Steam 工具/运行库条目，跳过导入: name={} appid={}",
+            name,
+            appid
+        );
+        return Ok(None);
+    }
+
+    // 校验安装状态：StateFlags 的 bit 4（值 4，"Fully Installed"）必须置起；
+    // 未完全安装（更新中/部分安装/已卸载残留）一律跳过。字段缺失（旧格式/异常 acf）则放行。
+    if let Some(sf) = kv_value(&text, "StateFlags") {
+        match parse_steam_state_flags(&sf) {
+            Some(state) => {
+                if state & 4 == 0 {
+                    tracing::debug!(
+                        "Steam 条目未完全安装(StateFlags={}), 跳过导入: name={} appid={}",
+                        sf,
+                        name,
+                        appid
+                    );
+                    return Ok(None);
+                }
+            }
+            None => {
+                tracing::debug!(
+                    "Steam 条目 StateFlags 无法解析({}), 放行: name={} appid={}",
+                    sf,
+                    name,
+                    appid
+                );
+            }
+        }
+    }
 
     let install_path = lib_root.join("steamapps").join("common").join(&installdir);
     // 目录不存在（已卸载残留 / 库盘未挂载）→ 跳过，避免入库后既不能启动也不能追踪
@@ -422,5 +500,106 @@ mod tests {
         assert_eq!(libs[1].to_string_lossy(), "E:\\SteamLibrary");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 在 base 下写出一个 `appmanifest_<appid>.acf` 并创建其 install 目录
+    /// （`parse_steam_acf` 要求 install 目录存在才放行）。
+    fn write_steam_acf(
+        base: &Path,
+        appid: &str,
+        installdir: &str,
+        state_flags: Option<&str>,
+    ) -> PathBuf {
+        let common = base.join("steamapps").join("common");
+        let _ = std::fs::create_dir_all(common.join(installdir));
+        let sf = match state_flags {
+            Some(s) => format!("\t\"StateFlags\"\t\t\"{}\"\n", s),
+            None => String::new(),
+        };
+        let content = format!(
+            "\"AppState\"\n{{\n\t\"appid\"\t\t\"{}\"\n\t\"name\"\t\t\"Game {}\"\n\t\"installdir\"\t\t\"{}\"\n{}\t\"buildid\"\t\t\"1\"\n}}\n",
+            appid, appid, installdir, sf
+        );
+        let path = base.join(format!("appmanifest_{}.acf", appid));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// state=4（Fully Installed 位）应放行
+    #[test]
+    fn parse_steam_acf_passes_fully_installed() {
+        let base = std::env::temp_dir().join(format!("gv_acf_t1_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&base);
+        let p = write_steam_acf(&base, "550", "Left4Dead2", Some("4"));
+        let g = parse_steam_acf(&p, &base).unwrap();
+        assert!(g.is_some(), "StateFlags=4 应视为完全安装并放行");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// state=2（未完全安装）应跳过
+    #[test]
+    fn parse_steam_acf_skips_not_fully_installed() {
+        let base = std::env::temp_dir().join(format!("gv_acf_t2_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&base);
+        let p = write_steam_acf(&base, "551", "HalfInstalled", Some("2"));
+        let g = parse_steam_acf(&p, &base).unwrap();
+        assert!(g.is_none(), "StateFlags=2（未完全安装）应跳过");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 缺失 StateFlags 字段（旧格式/异常 acf）应放行，不误杀
+    #[test]
+    fn parse_steam_acf_passes_without_stateflags() {
+        let base = std::env::temp_dir().join(format!("gv_acf_t3_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&base);
+        let p = write_steam_acf(&base, "552", "NoStateGame", None);
+        let g = parse_steam_acf(&p, &base).unwrap();
+        assert!(g.is_some(), "缺失 StateFlags 的旧格式 acf 应放行");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 十六进制 StateFlags（0x4）应兼容解析为完全安装并放行
+    #[test]
+    fn parse_steam_acf_parses_hex_stateflags() {
+        let base = std::env::temp_dir().join(format!("gv_acf_t4_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&base);
+        let p = write_steam_acf(&base, "553", "HexGame", Some("0x4"));
+        let g = parse_steam_acf(&p, &base).unwrap();
+        assert!(g.is_some(), "十六进制 StateFlags=0x4 应视为完全安装并放行");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 工具/运行库判定：appid 黑名单 + installdir 前缀黑名单（大小写不敏感）
+    #[test]
+    fn is_steam_tool_detects_valve_tools() {
+        // appid 黑名单
+        assert!(is_steam_tool("228980", "Steamworks Shared"));
+        assert!(is_steam_tool("1070560", "SteamLinuxRuntime"));
+        assert!(is_steam_tool("1391110", "SteamLinuxRuntime-soldier"));
+        assert!(is_steam_tool("1628350", "SteamLinuxRuntime_sniper"));
+        assert!(is_steam_tool("2180100", "SteamLinuxRuntime"));
+        // installdir 前缀黑名单（前缀命中，appid 任意）
+        assert!(is_steam_tool("99999", "Steamworks Common"), "installdir 前缀命中");
+        assert!(is_steam_tool("99999", "Proton 8.0"), "Proton 前缀命中");
+        assert!(
+            is_steam_tool("99999", "Steam Controller Configs"),
+            "Steam Controller Configs 前缀命中"
+        );
+
+        // 正常游戏不应命中
+        assert!(!is_steam_tool("2358720", "BlackMythWukong"));
+        assert!(!is_steam_tool("550", "Left 4 Dead 2"));
+    }
+
+    /// 工具/运行库条目即使 StateFlags 合法也应在 parse 阶段被排除
+    #[test]
+    fn parse_steam_acf_skips_steam_tools() {
+        let base = std::env::temp_dir().join(format!("gv_acf_t5_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&base);
+        // 228980 = Steamworks Common Redistributables，本机实测会混入导入弹窗
+        let p = write_steam_acf(&base, "228980", "Steamworks Shared", Some("4"));
+        let g = parse_steam_acf(&p, &base).unwrap();
+        assert!(g.is_none(), "Steamworks Common Redistributables 应被排除");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

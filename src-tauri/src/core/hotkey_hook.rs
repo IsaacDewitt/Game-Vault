@@ -68,6 +68,9 @@ static SPEC: AtomicU32 = AtomicU32::new(0);
 static KEY_DOWN: AtomicBool = AtomicBool::new(false);
 /// 触发回调（进程内只装一次）
 static TRIGGER: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+/// 钩子是否已成功安装：防止重复 `install()` 叠加出多个全局钩子
+/// （每多一个：按键被处理 N 次，且旧线程的消息循环永不退出、句柄也不回收）
+static INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// 键名 → 虚拟键码。**只覆盖设置页录制器会产出的键名**
 /// （见 `SettingsView.vue::normalizeHotkeyKey`），未知键名返回 None：
@@ -168,6 +171,13 @@ pub fn parse_key_spec(spec: &str) -> Option<KeySpec> {
 ///
 /// `on_trigger` 会在**钩子回调线程**上被调用，必须极轻（只投递，不做日志/IO/锁）。
 pub fn install(on_trigger: impl Fn() + Send + Sync + 'static) -> Result<(), String> {
+    // 幂等：已经装过就直接返回成功。`TRIGGER` 是 `OnceLock`，第二次的闭包本就会被静默丢弃，
+    // 但若真去重装钩子，系统里会多挂一条 LL 钩子并多起一个消息循环线程 —— 得不偿失。
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        tracing::warn!("键盘钩子已安装过，忽略重复安装请求");
+        return Ok(());
+    }
+
     let _ = TRIGGER.set(Box::new(on_trigger));
 
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -180,8 +190,16 @@ pub fn install(on_trigger: impl Fn() + Send + Sync + 'static) -> Result<(), Stri
                 Ok(h) => {
                     let _ = tx.send(Ok(()));
                     let mut msg = MSG::default();
-                    // 低级钩子必须有消息循环才会被系统回调
-                    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {}
+                    // 低级钩子必须有消息循环才会被系统回调。
+                    // 这里必须用原始 i32 判定：`GetMessageW` 返回 0 表示 WM_QUIT，
+                    // 返回 **-1 表示出错**；而 `BOOL::as_bool()` 对 -1 也判为 true，
+                    // 一旦持续报错就会变成不阻塞的死循环空转（占满一核）且永远走不到 Unhook。
+                    loop {
+                        let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;
+                        if ret <= 0 {
+                            break;
+                        }
+                    }
                     let _ = unsafe { UnhookWindowsHookEx(h) };
                 }
                 Err(e) => {
@@ -191,11 +209,20 @@ pub fn install(on_trigger: impl Fn() + Send + Sync + 'static) -> Result<(), Stri
         })
         .map_err(|e| format!("启动键盘钩子线程失败: {e}"))?;
 
-    rx.recv().map_err(|e| e.to_string())?
+    let result = rx.recv().map_err(|e| e.to_string())?;
+    if result.is_err() {
+        // 安装失败（如被安全软件拦下）→ 复位，允许以后重试
+        INSTALLED.store(false, Ordering::SeqCst);
+    }
+    result
 }
 
 /// 更新当前生效的截图键（`None` = 停用钩子通道，例如用户清空了快捷键）
 pub fn set_spec(spec: Option<KeySpec>) {
+    // 【必须一并复位"已按下"状态】KEYUP 分支只在键码等于当前 `spec.vk` 时执行，而换键瞬间
+    // 旧键完全可能正被按住：它的 KEYUP 会被 vk 不匹配跳过 → 标志残留 true → 新键的第一次
+    // 按下被当成"自动重复"吞掉（第二次起才正常）。在提权窗口里松键同样会残留。
+    KEY_DOWN.store(false, Ordering::Release);
     SPEC.store(spec.map(KeySpec::encode).unwrap_or(0), Ordering::Release);
 }
 

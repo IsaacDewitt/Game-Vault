@@ -282,8 +282,8 @@ fn find_version_resource(data: &[u8], base: usize, dir_file: usize, depth: u32) 
         return None;
     }
 
-    let named = read_u16(&data, dir_file + 12)? as usize;
-    let id_cnt = read_u16(&data, dir_file + 14)? as usize;
+    let named = read_u16(data, dir_file + 12)? as usize;
+    let id_cnt = read_u16(data, dir_file + 14)? as usize;
     let entries = dir_file + 16;
 
     for i in 0..(named + id_cnt) {
@@ -297,8 +297,8 @@ fn find_version_resource(data: &[u8], base: usize, dir_file: usize, depth: u32) 
             continue;
         }
 
-        let id = read_u32(&data, e)?;
-        let val = read_u32(&data, e + 4)? as usize;
+        let id = read_u32(data, e)?;
+        let val = read_u32(data, e + 4)? as usize;
 
         if depth == 0 && id != 16 {
             continue;
@@ -325,9 +325,9 @@ fn rva_to_offset(data: &[u8], sections_start: usize, num_sections: usize, rva: u
         if s.checked_add(40)? > data.len() {
             break;
         }
-        let va = read_u32(&data, s + 12)? as usize;
-        let vsize = read_u32(&data, s + 8)? as usize;
-        let raw = read_u32(&data, s + 20)? as usize;
+        let va = read_u32(data, s + 12)? as usize;
+        let vsize = read_u32(data, s + 8)? as usize;
+        let raw = read_u32(data, s + 20)? as usize;
         if rva >= va && rva < va + vsize {
             return Some(raw + (rva - va));
         }

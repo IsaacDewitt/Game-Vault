@@ -100,15 +100,15 @@ pub struct CaptureTarget {
 ///
 /// # 优先级
 ///
-/// 1. `journal_dir`：手账里手动指定的截图目录（单层目录名）——用户自己整理过的，最权威，
-///    也覆盖 `SILENT HILL 2` 这种与标题对不上的特殊命名；
-/// 2. 根目录下与任一候选名（英文名 → 中文名）**对得上**的已存在目录：复用其原始名字，
-///    既不新建也不改名（保留用户目录里的大小写与空格）；
+/// 1. `journal_dir`：手账里指定的截图目录（单层目录名），要求**目录要么不存在、要么含图片**；
+///    覆盖 `SILENT HILL 2` 这种与标题对不上的特殊命名。存在却是空壳的视为失效（理由见函数内注释）；
+/// 2. 根目录下与任一候选名（手账英文名 → 库内题名 → exe 名 / 安装目录名）对得上、**且含图片**
+///    的既有目录：复用其原始名字，既不新建也不改名（保留用户目录里的大小写与空格）；
 /// 3. 都没有：按第一个可用候选名（游戏标题）新建；标题全空时退回 `fallback`（会话 exe 名）。
 ///
-/// 比较统一走 `match_key`（只留字母数字小写、精确相等），与手账回填同口径，
-/// 因此 `Assassin's Creed: Brotherhood` 与 `Assassin's Creed  Brotherhood`（双空格）能对上，
-/// 而 `II` / `III` 不会互相误配。
+/// 比较统一走 `match_key`（只留字母数字、转小写，并**把拉丁重音折叠到 ASCII 基字母**），
+/// 与手账回填同口径，因此 `Assassin's Creed: Brotherhood` 与 `Assassin's Creed  Brotherhood`（双空格）能对上，
+/// `God of War Ragnarök` 与用户目录 `God of War Ragnarok` 也能对上，而 `II` / `III` 不会互相误配。
 pub fn resolve_capture_target(
     root: &std::path::Path,
     candidates: &[String],
@@ -116,25 +116,45 @@ pub fn resolve_capture_target(
     fallback_exe: &str,
 ) -> CaptureTarget {
     // 1) 手账手动指定（单层目录名，挡路径穿越）
+    //
+    // 【为何要校验"含图"】手账的 `screenshot_dir` 未必是用户手填——它可能是
+    // `migrate_backfill_review_screenshot_dir` 按 exe 名自动回填的历史值，指向一个如今
+    // 只剩空壳的目录（用户整理时清空过，或当初就只建了目录）。若无条件采信它的最高优先级，
+    // 新截图会继续被塞进那个没人看的空目录，正是本次要修的病症。故：
+    //   目录存在但一张图都没有 → 视为失效，继续往下按标题推断；
+    //   目录不存在 → 仍采信（用户手填了一个待创建的目录，应予尊重并创建）。
     if let Some(dir) = journal_dir.and_then(sanitize_dir_name) {
-        return CaptureTarget {
-            stem: dir.clone(),
-            dir: root.join(dir),
-            source: CaptureDirSource::Journal,
-        };
+        let path = root.join(&dir);
+        if !path.is_dir() || count_images(&path) > 0 {
+            return CaptureTarget {
+                stem: dir,
+                dir: path,
+                source: CaptureDirSource::Journal,
+            };
+        }
+        tracing::info!(
+            "[截图] 手账指定的目录 '{}' 存在但一张图都没有，视为失效，改按标题推断",
+            dir
+        );
     }
 
-    // 2) 复用根目录下已存在的同名目录
+    // 2) 复用根目录下**含图片**的同名目录
     let existing = list_subdir_names(root);
     for candidate in candidates {
         let key = match_key(candidate);
         if key.is_empty() {
             continue;
         }
-        if let Some(hit) = existing.iter().find(|dir| match_key(dir) == key) {
+        if let Some((hit, count)) = pick_existing_dir(root, &existing, &key) {
+            tracing::info!(
+                "[截图] 复用既有目录 '{}'（命中候选 '{}'，该目录 {} 张图）",
+                hit,
+                candidate,
+                count
+            );
             return CaptureTarget {
-                dir: root.join(hit),
-                stem: hit.clone(),
+                dir: root.join(&hit),
+                stem: hit,
                 source: CaptureDirSource::ExistingDir,
             };
         }
@@ -172,6 +192,50 @@ fn list_subdir_names(root: &std::path::Path) -> Vec<String> {
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect()
+}
+
+/// 在既有子目录里挑出与 `key` 匹配、且**确实含图片**的那一个。
+///
+/// 只认含图片的目录：空目录不算"既有目录"，否则 `GoW`（0 张）这种历史空壳会被 exe 名一类的
+/// 候选重新变成落盘目标。
+///
+/// 【性能】命中唯一时只对该目录做一次计数。`H:\GameCapture` 是多年积累的机械盘目录（189 个子
+/// 目录、单目录上千张图），若对每个子目录都计数，详情页与"打开截图文件夹"会明显变慢；
+/// 同键多目录（`Assassin's Creed IV  Black Flag (SP)` 与 `... IV Black Flag (SP)`）才逐个计数，
+/// 取图片最多者、并列时按名字排序取首，保证结果不随 `read_dir` 顺序漂移。
+fn pick_existing_dir(
+    root: &std::path::Path,
+    names: &[String],
+    key: &str,
+) -> Option<(String, usize)> {
+    let hits: Vec<&String> = names.iter().filter(|n| dir_matches_key(n, key)).collect();
+    match hits.len() {
+        0 => None,
+        1 => {
+            let name = hits[0];
+            let count = count_images(&root.join(name));
+            (count > 0).then(|| (name.clone(), count))
+        }
+        _ => {
+            let mut scored: Vec<(String, usize)> = hits
+                .iter()
+                .map(|n| ((*n).clone(), count_images(&root.join(n))))
+                .filter(|(_, count)| *count > 0)
+                .collect();
+            scored.sort_by_key(|(name, count)| (std::cmp::Reverse(*count), name.to_lowercase()));
+            scored.into_iter().next()
+        }
+    }
+}
+
+/// 目录名是否算命中候选键：目录名本身、以及**去掉 `.exe` 后缀后**的名字都参与比较
+/// （用户库里存在 `GhostOfTsushima.exe`（190 张）、`tll.exe` 这类拿启动器名当目录名的历史命名）。
+fn dir_matches_key(dir_name: &str, key: &str) -> bool {
+    if match_key(dir_name) == key {
+        return true;
+    }
+    let stem = process_stem(dir_name);
+    stem != dir_name && match_key(&stem) == key
 }
 
 // ==================== 截图目录枚举 / 匹配（手账自持截图目录用，2026-09-12） ====================
@@ -224,20 +288,52 @@ pub fn list_image_subdirs(root: &std::path::Path) -> Vec<(String, usize)> {
             }
         })
         .collect();
-    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out.sort_by_key(|(name, _)| name.to_lowercase());
     out
 }
 
-/// 名称 → 匹配键：仅保留字母数字并转小写。
+/// 名称 → 匹配键：仅保留字母数字、转小写，并把拉丁重音字母折叠到 ASCII 基字母。
 ///
 /// 用于「手账名 vs 截图目录名」的对齐（`Assassin's Creed II` → `assassinscreedii`，
 /// 与目录 `Assassin's Creed  Brotherhood` 这类双空格、全角符号差异一并抹平）。
 /// 只做精确相等判定，不做包含匹配——避免 II / III 这类前缀互相误配。
+///
+/// 【为什么必须折叠重音，2026-09-14 实测】库内题名 `God of War Ragnarök`（带 ö），
+/// 而用户盘上既有目录是 `God of War Ragnarok`（312 张）。此前只按 `is_alphanumeric()`
+/// 过滤，`ö` 是字母会被原样留下，两个键不等 → 判定"没有既有目录" → 按标题另建一个
+/// `God of War Ragnarök` 空目录，把「图截进了用户看不见的地方」原样重演一遍。
+/// CJK 等非拉丁字符照常保留（`心灵杀手2` 与中文目录名仍能精确相等）。
 pub fn match_key(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
+    s.chars().filter_map(fold_char).collect()
+}
+
+/// 单字符归一：字母数字保留（拉丁转小写），拉丁重音折叠为基字母，其余符号丢弃。
+fn fold_char(c: char) -> Option<char> {
+    if c.is_ascii_alphanumeric() {
+        return Some(c.to_ascii_lowercase());
+    }
+    // 先取小写（`İ`.to_lowercase() 会产出两个 char，这里取首个基字母即可）
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    let mapped = match lower {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
+        'ç' | 'ć' | 'č' => 'c',
+        'ď' | 'đ' => 'd',
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ę' | 'ě' => 'e',
+        'ğ' => 'g',
+        'ì' | 'í' | 'î' | 'ï' | 'ī' | 'į' => 'i',
+        'ł' => 'l',
+        'ñ' | 'ń' | 'ň' => 'n',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ő' => 'o',
+        'ř' => 'r',
+        'ś' | 'š' | 'ş' | 'ß' => 's',
+        'ť' | 'ţ' => 't',
+        'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' => 'u',
+        'ý' | 'ÿ' => 'y',
+        'ź' | 'ż' | 'ž' => 'z',
+        // 非拉丁字母（CJK 等）原样保留；标点与符号丢弃
+        _ => return lower.is_alphanumeric().then_some(lower),
+    };
+    Some(mapped)
 }
 
 /// 校验并规范化用户指定的截图子目录名；非法（路径穿越 / 绝对路径 / 空）返回 None。
@@ -439,12 +535,20 @@ mod tests {
         (root, guard)
     }
 
-    /// 落盘目标优先级：手账指定 > 已有同名目录 > 标题新建 > 会话 exe 名兜底
+    /// 往目录里放 n 张假 PNG —— 落盘目标解析只认"含图片"的目录，空目录不算既有目录
+    fn put_pngs(dir: &std::path::Path, n: usize) {
+        std::fs::create_dir_all(dir).unwrap();
+        for i in 0..n {
+            std::fs::write(dir.join(format!("shot_{i}.png")), b"x").unwrap();
+        }
+    }
+
+    /// 落盘目标优先级：手账指定（且确实有图/目录不存在）> 已有含图同名目录 > 标题新建 > 会话 exe 名兜底
     #[test]
     fn capture_target_priority() {
         let (root, _g) = temp_root("prio");
-        std::fs::create_dir_all(root.join("God of War")).unwrap();
-        std::fs::create_dir_all(root.join("Alan Wake 2")).unwrap();
+        put_pngs(&root.join("God of War"), 3);
+        put_pngs(&root.join("Alan Wake 2"), 2);
 
         // 1) 手账指定最权威：即便根目录下已有"同名目录"也听手账的
         let t = resolve_capture_target(
@@ -488,9 +592,9 @@ mod tests {
     #[test]
     fn capture_target_matches_existing_dir_by_normalized_name() {
         let (root, _g) = temp_root("match");
-        std::fs::create_dir_all(root.join("Death Stranding Director's Cut")).unwrap();
-        std::fs::create_dir_all(root.join("Assassin's Creed  Brotherhood")).unwrap();
-        std::fs::create_dir_all(root.join("Assassin's Creed III")).unwrap();
+        put_pngs(&root.join("Death Stranding Director's Cut"), 2);
+        put_pngs(&root.join("Assassin's Creed  Brotherhood"), 3);
+        put_pngs(&root.join("Assassin's Creed III"), 1);
 
         // 英文名全大写也能对上已有目录（Windows 目录名不区分大小写，这里连标点差异一起抹平）
         let t = resolve_capture_target(
@@ -551,5 +655,106 @@ mod tests {
             );
             assert_eq!(t.dir, root.join("Some Game"));
         }
+    }
+
+    /// 匹配键折叠拉丁重音：库内题名与用户盘上的 ASCII 目录名必须等价；CJK 原样保留
+    #[test]
+    fn match_key_folds_latin_accents() {
+        assert_eq!(match_key("God of War Ragnarök"), "godofwarragnarok");
+        assert_eq!(
+            match_key("God of War Ragnarök"),
+            match_key("God of War Ragnarok"),
+            "ö 与 o 必须归一，否则会另建一个新目录"
+        );
+        assert_eq!(match_key("心灵杀手2"), "心灵杀手2", "CJK 不得被折叠掉");
+        assert_eq!(match_key("Assassin's Creed® IV"), "assassinscreediv");
+        assert_ne!(match_key("Assassin's Creed II"), match_key("Assassin's Creed III"));
+    }
+
+    /// 重音题名要命中用户盘上 ASCII 写法的既有目录（实机：`God of War Ragnarök` vs `God of War Ragnarok` 312 张）
+    #[test]
+    fn capture_target_matches_accented_title_to_ascii_dir() {
+        let (root, _g) = temp_root("accent");
+        put_pngs(&root.join("God of War Ragnarok"), 2);
+
+        let t = resolve_capture_target(
+            &root,
+            &["God of War Ragnarök".to_string()],
+            None,
+            "GoWR.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::ExistingDir);
+        assert_eq!(t.dir, root.join("God of War Ragnarok"));
+        assert_eq!(t.stem, "God of War Ragnarok", "沿用目录原名，不另建带 ö 的新目录");
+    }
+
+    /// 手账指定了一个空目录（多为历史自动回填的失效值）时不得采信，应继续按标题落进有图的目录
+    #[test]
+    fn capture_target_skips_empty_journal_dir() {
+        let (root, _g) = temp_root("emptyjournal");
+        std::fs::create_dir_all(root.join("GoW")).unwrap(); // 历史空壳：0 张
+        put_pngs(&root.join("God of War"), 5);
+
+        let t = resolve_capture_target(&root, &["God of War".to_string()], Some("GoW"), "GoW.exe");
+        assert_eq!(t.source, CaptureDirSource::ExistingDir, "空手账目录应判为失效");
+        assert_eq!(t.dir, root.join("God of War"));
+
+        // 手账指定的目录不存在时仍予采信：用户手填的就是一个待创建的目录（如 SILENT HILL 2）
+        let t = resolve_capture_target(
+            &root,
+            &["God of War".to_string()],
+            Some("SILENT HILL 2"),
+            "sh2.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::Journal);
+        assert_eq!(t.dir, root.join("SILENT HILL 2"));
+    }
+
+    /// 空目录永不被当作"既有目录"复用（否则 exe 名一类候选会把 `GoW` 这种历史空壳重新变成落盘目标）
+    #[test]
+    fn capture_target_never_reuses_empty_dir() {
+        let (root, _g) = temp_root("emptydir");
+        std::fs::create_dir_all(root.join("GoW")).unwrap();
+
+        let t = resolve_capture_target(&root, &["GoW".to_string()], None, "GoW.exe");
+        assert_eq!(
+            t.source,
+            CaptureDirSource::GameTitle,
+            "唯一的同名目录是空目录 → 不算既有目录，按标题新建"
+        );
+    }
+
+    /// 带 `.exe` 后缀的历史目录名也要能命中（实机：`GhostOfTsushima.exe` 190 张、`tll.exe`）
+    #[test]
+    fn capture_target_matches_dir_named_with_exe_suffix() {
+        let (root, _g) = temp_root("exedir");
+        put_pngs(&root.join("GhostOfTsushima.exe"), 4);
+
+        let t = resolve_capture_target(
+            &root,
+            &["Ghost of Tsushima".to_string()],
+            None,
+            "GhostOfTsushima.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::ExistingDir);
+        assert_eq!(t.dir, root.join("GhostOfTsushima.exe"));
+    }
+
+    /// 同键多目录：取图片最多者（实机 `Assassin's Creed IV  Black Flag (SP)` 与 `... IV Black Flag (SP)` 并存，
+    /// 命中结果不得随 read_dir 顺序漂移）
+    #[test]
+    fn capture_target_picks_richest_same_key_dir() {
+        let (root, _g) = temp_root("samekey");
+        put_pngs(&root.join("Assassin's Creed IV  Black Flag (SP)"), 2);
+        put_pngs(&root.join("Assassin's Creed IV Black Flag (SP)"), 7);
+
+        let t = resolve_capture_target(
+            &root,
+            &["Assassin's Creed IV Black Flag (SP)".to_string()],
+            None,
+            "ac4.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::ExistingDir);
+        assert_eq!(t.dir, root.join("Assassin's Creed IV Black Flag (SP)"), "取图片多的那摊");
     }
 }

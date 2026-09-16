@@ -335,7 +335,7 @@ impl Database {
                 if trimmed.is_empty() || !trimmed.is_ascii() {
                     continue;
                 }
-                let filled = name_en.as_deref().map_or(true, |v| v.trim().is_empty());
+                let filled = name_en.as_deref().is_none_or(|v| v.trim().is_empty());
                 if !filled {
                     continue;
                 }
@@ -566,14 +566,13 @@ impl Database {
             "column name must be alphanumeric: {}", column);
         let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({})", table))?;
         let columns = stmt.query_map([], |row| {
-            Ok(row.get::<_, String>(1)?)
+            row.get::<_, String>(1)
         })?;
 
         for col in columns {
-            if let Ok(name) = col {
-                if name == column {
-                    return Ok(true);
-                }
+            let Ok(name) = col else { continue; };
+            if name == column {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -1449,6 +1448,7 @@ impl Database {
     /// - 时长 ≥ SESSION_MIN_DURATION_SECS：独立成条，play_count +1
     /// - 时长不足且距同游戏上一条结束 ≤ SESSION_MERGE_WINDOW_SECS：并入上一条，不计次数
     /// - 其余：不写明细行、不计次数
+    ///
     /// 三种情况都会把时长累加进 games.play_time_seconds，避免真实游玩时间流失
     ///
     /// 返回独立成条的会话数（合并与丢弃不计入）
@@ -1696,7 +1696,7 @@ impl Database {
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
         let mut rows = stmt.query_map(params![key], |row| {
-            Ok(row.get::<_, String>(0)?)
+            row.get::<_, String>(0)
         })?;
 
         match rows.next() {
@@ -1731,6 +1731,7 @@ impl Database {
     /// - 正常追踪的游戏两个账本恒等（add_play_sessions_batch 同事务双写）；
     /// - 已删除的游戏只在 play_stats_daily 留档（games 行已移除）→ 取 daily，总时长不随删除缩水；
     /// - 备份导入 / 预聚合迁移前的老游戏只在 games 有累计值 → 取 games，不因缺明细而少算。
+    ///
     /// 只查 games 会让「总时长」与同页的本月/今日/热力图（均出自 daily）自相矛盾。
     pub fn get_total_play_time(&self) -> Result<u64> {
         let total: i64 = self.conn.query_row(
@@ -1780,7 +1781,7 @@ impl Database {
             })
             .collect();
 
-        stats.sort_by(|a, b| b.total_seconds.cmp(&a.total_seconds));
+        stats.sort_by_key(|s| std::cmp::Reverse(s.total_seconds));
         Ok(stats)
     }
 
@@ -1841,6 +1842,7 @@ impl Database {
     /// - completed：用户手动标记已通关（优先判定，通关但从未启动也算已通关）
     /// - played：启动过（play_time_seconds > 0）且未通关
     /// - unplayed：从未启动（无时长）且未通关
+    ///
     /// 收藏是独立维度不参与互斥；不再产出 playing / abandoned 桶
     /// （前端筛选已从四态精简为三态，见 stores/games.ts 与 HomeView statusOptions）。
     pub fn get_status_stats(&self) -> Result<StatusStats> {
@@ -1884,7 +1886,7 @@ impl Database {
     pub fn get_all_genres(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT genres FROM games")?;
         let rows = stmt.query_map([], |row| {
-            Ok(row.get::<_, String>(0)?)
+            row.get::<_, String>(0)
         })?;
 
         let mut genre_set = std::collections::HashSet::new();
@@ -2022,9 +2024,10 @@ impl Database {
 
     /// 聚合全局成就检测所需的统计
     pub fn get_achievement_global_stats(&self) -> Result<AchievementGlobalStats> {
-        let mut s = AchievementGlobalStats::default();
-
-        s.game_count = self.conn.query_row("SELECT COUNT(*) FROM games", [], |r| r.get::<_, i64>(0))? as u64;
+        let mut s = AchievementGlobalStats {
+            game_count: self.conn.query_row("SELECT COUNT(*) FROM games", [], |r| r.get::<_, i64>(0))? as u64,
+            ..Default::default()
+        };
         // 累计时长（G-04「废寝忘食」/ G-05「游戏人生」）与统计页「总游玩时长」同口径：
         // 删除游戏只移除库内条目，玩家已经玩过的小时数不该因此缩水，否则被锁成就的进度条会随删除倒退。
         s.total_play_time = self.get_total_play_time()?;
@@ -2125,11 +2128,10 @@ impl Database {
             let mut stmt = self.conn.prepare("SELECT release_date FROM games WHERE release_date IS NOT NULL")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             for row in rows {
-                if let Ok(rd) = row {
-                    if let Some(y) = rd.split('-').next().and_then(|s| s.trim().parse::<i32>().ok()) {
-                        if y > 0 && y <= current_year - 20 {
-                            old_count += 1;
-                        }
+                let Ok(rd) = row else { continue; };
+                if let Some(y) = rd.split('-').next().and_then(|s| s.trim().parse::<i32>().ok()) {
+                    if y > 0 && y <= current_year - 20 {
+                        old_count += 1;
                     }
                 }
             }
@@ -2142,12 +2144,11 @@ impl Database {
             let mut stmt = self.conn.prepare("SELECT genres FROM games")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             for row in rows {
-                if let Ok(g) = row {
-                    let genres: Vec<String> = serde_json::from_str(&g).unwrap_or_default();
-                    for genre in genres {
-                        if !genre.is_empty() {
-                            genre_set.insert(genre);
-                        }
+                let Ok(g) = row else { continue; };
+                let genres: Vec<String> = serde_json::from_str(&g).unwrap_or_default();
+                for genre in genres {
+                    if !genre.is_empty() {
+                        genre_set.insert(genre);
                     }
                 }
             }
@@ -2160,9 +2161,8 @@ impl Database {
             let mut stmt = self.conn.prepare("SELECT developer FROM games WHERE developer IS NOT NULL AND developer != ''")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             for row in rows {
-                if let Ok(d) = row {
-                    *dev_map.entry(d).or_insert(0) += 1;
-                }
+                let Ok(d) = row else { continue; };
+                *dev_map.entry(d).or_insert(0) += 1;
             }
             s.max_dev_count = dev_map.values().copied().max().unwrap_or(0);
         }
@@ -2325,10 +2325,9 @@ impl Database {
             )?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             for row in rows {
-                if let Ok(gid) = row {
-                    if let Some(stats) = stats_map.get_mut(&gid) {
-                        stats.night_session = true;
-                    }
+                let Ok(gid) = row else { continue; };
+                if let Some(stats) = stats_map.get_mut(&gid) {
+                    stats.night_session = true;
                 }
             }
         }
@@ -2523,6 +2522,7 @@ impl Database {
     /// 迁移：创建游玩时长预聚合表
     /// - play_stats_daily：日粒度，统计页 / 热力图 / 成就的历史底座，永久保留
     /// - play_stats_hourly：时段粒度（游戏 × 小时 × 星期），供时段热力图与深夜类成就
+    ///
     /// 两张表均按「会话开始时刻」整段归入对应桶，与原有 DATE(start_time) 口径完全一致
     fn migrate_create_play_stats_tables(&self) -> Result<()> {
         self.conn.execute_batch(
@@ -2562,6 +2562,7 @@ impl Database {
     /// - 时长 ≥ 阈值：保留
     /// - 时长不足且距保留列表中同游戏最近一条结束 ≤ 合并窗口：并入该条，删除自身
     /// - 其余：删除自身
+    ///
     /// 被并入/删除的时长仍累计进日汇总（dropped_seconds），保证
     /// SUM(play_stats_daily.total_seconds) 与 SUM(games.play_time_seconds) 恒等。
     /// 通过 settings 表标记，只执行一次；之后新写入的数据本就走新规则。

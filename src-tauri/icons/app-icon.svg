@@ -1,0 +1,63 @@
+<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tile" x1="120" y1="80" x2="900" y2="960" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2e2e5e"/>
+      <stop offset="0.55" stop-color="#1c1c3a"/>
+      <stop offset="1" stop-color="#111124"/>
+    </linearGradient>
+    <!-- 库门环：沿 135° 笔势 -->
+    <linearGradient id="ring" x1="230" y1="210" x2="800" y2="820" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#a7abff"/>
+      <stop offset="0.48" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#3a3ec8"/>
+    </linearGradient>
+    <!-- 手柄：白 → 浅靛，光源左上 -->
+    <linearGradient id="pad" x1="370" y1="390" x2="670" y2="690" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#b6baf9"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 圆角方砖（内缩 4%） -->
+  <rect x="42" y="42" width="940" height="940" rx="204" fill="url(#tile)"/>
+  <rect x="42" y="42" width="940" height="940" rx="204" fill="none"
+        stroke="#ffffff" stroke-opacity="0.10" stroke-width="4"/>
+
+  <!-- ① 库门环 r=332 粗 62 → 内沿 301；底部留缺口，门盘下方透出方砖底 -->
+  <g transform="rotate(120 512 512)">
+    <circle cx="512" cy="512" r="332" fill="none" stroke="url(#ring)" stroke-width="62"
+            stroke-linecap="round" stroke-dasharray="1890 196"/>
+  </g>
+  <!-- ② 铆钉：上下两枚嵌在环上（左右两枚落在缺口外，保对称） -->
+  <circle cx="512" cy="180" r="30" fill="#b0b4ff"/>
+  <circle cx="512" cy="844" r="30" fill="#3c40cb"/>
+  <circle cx="180" cy="512" r="30" fill="#8b8ff9"/>
+  <circle cx="844" cy="512" r="30" fill="#373bbf"/>
+
+  <!-- ③ 门盘：填满环内沿，与环留 5px 缝隙形成纵深 -->
+  <circle cx="512" cy="512" r="296" fill="#1f1f46"/>
+
+  <!-- ④ 手柄：完整收在门盘内（r≤285） -->
+  <g transform="translate(512,504) scale(0.90) translate(-512,-504)">
+    <path fill="url(#pad)" d="
+      M 512 404
+      C 600 404 674 425 716 470
+      C 758 515 782 588 793 654
+      C 803 716 792 767 760 780
+      C 728 793 697 766 662 725
+      C 634 692 605 671 577 664
+      C 554 659 530 657 514 657
+      C 498 657 474 659 451 664
+      C 423 671 394 692 366 725
+      C 331 766 300 793 268 780
+      C 236 767 225 716 235 654
+      C 246 588 270 515 312 470
+      C 354 425 424 404 512 404 Z"/>
+    <g fill="#1e1e42">
+      <rect x="347" y="565" width="83" height="28" rx="14"/>
+      <rect x="374" y="538" width="28" height="83" rx="14"/>
+      <circle cx="611" cy="550" r="18"/>
+      <circle cx="660" cy="592" r="18"/>
+    </g>
+  </g>
+</svg>

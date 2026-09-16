@@ -7,6 +7,7 @@ use windows_capture::window::Window;
 use crate::core::tonemap::ToneMapPath;
 use crate::core::{Database, PlayTimeTracker};
 use crate::core::screenshot;
+use crate::models::Game;
 use crate::models::settings::Settings;
 use super::lock_or_recover;
 
@@ -48,6 +49,80 @@ fn tone_path_str(p: ToneMapPath) -> &'static str {
         ToneMapPath::DivideWhiteLevel => "divide_white_level",
         ToneMapPath::Reinhard => "reinhard",
     }
+}
+
+/// 组装某游戏的**落盘候选名**与**手账指定目录**（写入与查看两条路共用）。
+///
+/// 【为什么要共用，2026-09-14 实机教训】截图实际写进哪个目录（`trigger_screenshot`）与
+/// 界面显示/打开哪个目录（`resolve_screenshot_dir`）必须永远同口径。此前写入侧已改成
+/// 「手账指定 → 标题既有目录 → 标题新建」，而查看侧仍按 `games.exe_name` 定位 —— 于是
+/// `God of War`（exe 名 `GoW.exe`）出现"图截进了 `God of War`（569 张），详情页却盯着空的
+/// `GoW` 显示暂无截图"，用户再次以为没截上。
+///
+/// 候选顺序即命中优先级：**手账英文名 → 库内题名 → 安装程序名 → 安装目录名**。
+/// 后两个是兜底：用户盘上的目录常按其一命名（`GhostOfTsushima.exe`、`Mafia The Old Country`），
+/// 而库里若只有中文题名（如《死亡搁浅：导演剪辑版》），中文键永远对不上英文目录。
+/// 兜底候选只在"候选目录确实含图片"时才会被采用（见 `screenshot::pick_existing_dir`），
+/// 因此不会把 `GoW` 这种空壳目录重新激活。
+fn capture_target_inputs(db: &Database, game: &Game) -> (Vec<String>, Option<String>) {
+    let review = db
+        .find_review_id_by_game_name(&game.name)
+        .ok()
+        .flatten()
+        .and_then(|id| db.get_review_by_id(&id).ok().flatten());
+
+    let journal_dir = review.as_ref().and_then(|r| r.screenshot_dir.clone());
+
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(en) = review
+        .as_ref()
+        .and_then(|r| r.name_en.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        candidates.push(en.to_string());
+    }
+    if !game.name.trim().is_empty() {
+        candidates.push(game.name.clone());
+    }
+    if let Some(exe) = game.exe_name.as_deref() {
+        let stem = screenshot::process_stem(exe);
+        if !stem.is_empty() {
+            candidates.push(stem);
+        }
+    }
+    if let Some(install) = game.install_path.as_deref() {
+        let trimmed = install.trim_end_matches(['\\', '/']);
+        if let Some(base) = std::path::Path::new(trimmed)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+        {
+            let base = base.trim();
+            if !base.is_empty() {
+                if is_generic_dir_name(base) {
+                    // 安装路径末级常是 `...\Binaries\Win32` 这类技术目录名，而截图根目录下
+                    // 恰有同名目录（用户库里 `Content` 123 张、`Common` 51 张），一旦命中就会把
+                    // 图截进无关目录 —— 这类名字不作为候选。
+                    tracing::debug!("[截图] 安装目录名 '{}' 属技术性通用名，不作为候选", base);
+                } else {
+                    candidates.push(base.to_string());
+                }
+            }
+        }
+    }
+    (candidates, journal_dir)
+}
+
+/// 明显是技术性/通用名的目录名（安装路径的末级常见形态），不得当作截图目录候选：
+/// 截图根目录是人工整理的，理论上不会有这类名字的**游戏**目录，但可能残留同名目录
+/// （实机：`Content` 123 张、`Common` 51 张），误命中就会把截图落进无关目录。
+fn is_generic_dir_name(name: &str) -> bool {
+    const GENERIC: &[&str] = &[
+        "win32", "win64", "windows", "bin", "binaries", "x64", "x86", "x86_64", "content",
+        "common", "data", "game", "games", "system", "shipping", "retail", "build", "dist",
+        "app", "src", "assets", "engine", "support", "installer",
+    ];
+    GENERIC.contains(&name.trim().to_ascii_lowercase().as_str())
 }
 
 /// 截图执行体（由 `dispatch_screenshot_async` 在独立线程里调用）。
@@ -216,32 +291,12 @@ pub fn trigger_screenshot(
             }
         };
 
-        // 手账条目（按游戏名 / 英文名命中）有两重用处：
-        // ① 它可能带"手动指定的截图目录"——用户自己整理过的命名，最权威（如 SILENT HILL 2）；
-        // ② 它的英文题名可作为候选名——用户库里目录多为英文标题，中文名对不上时靠它兜。
-        let review = game.as_ref().and_then(|g| {
-            let id = db_guard
-                .find_review_id_by_game_name(&g.name)
-                .ok()
-                .flatten()?;
-            db_guard.get_review_by_id(&id).ok().flatten()
-        });
-        let journal_dir = review.as_ref().and_then(|r| r.screenshot_dir.clone());
-
-        let mut candidates: Vec<String> = Vec::new();
-        if let Some(en) = review
-            .as_ref()
-            .and_then(|r| r.name_en.as_deref())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            candidates.push(en.to_string());
-        }
-        if let Some(g) = game.as_ref() {
-            if !g.name.trim().is_empty() {
-                candidates.push(g.name.clone());
-            }
-        }
+        // 手账条目（含其指定的截图目录与英文题名）与候选名统一由 capture_target_inputs 组装，
+        // 与「详情页显示 / 打开截图文件夹」走同一套口径。
+        let (candidates, journal_dir) = match game.as_ref() {
+            Some(g) => capture_target_inputs(&db_guard, g),
+            None => (Vec::new(), None),
+        };
 
         let root = std::path::PathBuf::from(crate::utils::path::expand_env_vars(
             &settings.screenshot_dir,
@@ -314,16 +369,32 @@ pub fn dispatch_screenshot_async(
     if SHOT_IN_FLIGHT.swap(true, Ordering::SeqCst) {
         return;
     }
+    // 【守卫必须在 spawn 之前构造】`std::thread::spawn` 在线程创建失败时会 panic：
+    // 若把 `ShotInFlightGuard` 放在闭包里，闭包就永不执行、守卫永不构造 —— 闸门永久卡在
+    // true，全局热键与键盘钩子**两条通道一起失效**，用户看到的是"截图键彻底不灵了"。
+    // 守卫提前持有、随闭包 move 进子线程：闭包内 panic、或线程压根没起来（闭包被丢弃），
+    // 两种情况都由 Drop 复位。
+    let guard = ShotInFlightGuard;
     // 【关键】独立线程执行：trigger_screenshot 里的 WGC 抓帧（最长 8s 超时）
     // + tonemap + PNG 编码都是秒级阻塞操作，热键回调跑在 tauri 主事件循环线程上，
     // 直接执行会让整个应用 UI 假死。
-    std::thread::spawn(move || {
-        let _guard = ShotInFlightGuard;
-        tracing::info!("[截图] {source} 触发");
-        if let Some(outcome) = trigger_screenshot(&db, &tracker) {
-            let _ = app_handle.emit("screenshot-taken", &outcome);
-        }
-    });
+    // 用 `Builder::spawn` 而非 `thread::spawn`：线程创建失败时前者返回 Err（可记日志），
+    // 后者直接 panic，而调用方可能是键盘钩子回调 —— 绝不能在那里展开。
+    let spawned = std::thread::Builder::new()
+        .name("gv-screenshot".to_string())
+        .spawn(move || {
+            let _guard = guard;
+            tracing::info!("[截图] {source} 触发");
+            if let Some(outcome) = trigger_screenshot(&db, &tracker) {
+                let _ = app_handle.emit("screenshot-taken", &outcome);
+            }
+        });
+    if let Err(e) = spawned {
+        // 双保险：Err 时闭包已被丢弃、守卫的 Drop 已复位过；这里再显式复位一次，
+        // 保证任何未来的改法都不会让闸门卡死。
+        SHOT_IN_FLIGHT.store(false, Ordering::SeqCst);
+        tracing::error!("[截图] 无法创建截图线程，本次触发放弃: {e}");
+    }
 }
 
 /// 注册全局截图热键并绑定处理器（on_shortcut 同时完成注册 + 绑定）。
@@ -378,14 +449,16 @@ const SRC_GAME: &str = "game";
 const SRC_TOMBSTONE: &str = "tombstone";
 const SRC_ROOT: &str = "root";
 
-/// 解析截图目录，返回 (目录, 来源标记)：
-/// - 传 `Some(game_id)`：定位到该游戏的进程目录 `{截图目录}/{进程名}`；
-///   游戏没有 exe_name 时退回截图根目录；
-/// - 传 `Some(review_id)`：手账条目——按下列优先级定位（2026-09-12 起手账自持）：
-///   1. `reviews.screenshot_dir` 手动指定（最权威，删游戏/改名都不受影响）；
-///   2. 同名活条目（games.name）借 exe_name；
-///   3. 同名墓碑（game_tombstones.name）借 exe_name —— 游戏已从游戏库删除但留档的情形；
-///   三条都不中时返回错误（前端引导用户手动指定目录，不再只说"没有截图"）；
+/// 解析截图目录，返回 (目录, 来源标记)。
+///
+/// **与截图落盘同口径**（2026-09-14 统一）：两条路都经由 `capture_target_inputs` +
+/// `screenshot::resolve_capture_target`，即「手账指定（空壳除外）→ 候选名命中的既有含图目录 →
+/// 按题名新建」，保证"截图写进哪个目录，界面就看哪个目录"。
+///
+/// - 传 `Some(game_id)`：候选名依次为 手账英文名 → 库内题名 → exe 名 → 安装目录名；
+/// - 传 `Some(review_id)`：候选名依次为 手账英文名 → 手账题名 → 同名游戏 exe 名 → 同名墓碑 exe 名
+///   （游戏已从游戏库删除、只留墓碑的情形靠最后一项兜底）；
+///   候选名与手账指定都取不到时才返回错误，引导用户手动指定目录；
 /// - 都不传：直接返回截图根目录（设置页用）。
 fn resolve_screenshot_dir(
     db: &Arc<Mutex<Database>>,
@@ -405,52 +478,76 @@ fn resolve_screenshot_dir(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "手账条目不存在".to_string())?;
 
-        // 1) 手账手动指定（单层目录名，防路径穿越）
-        if let Some(dir) = review
-            .screenshot_dir
+        // 候选名与"手账指定目录"按 **截图落盘同一规则** 解析（`resolve_capture_target`）。
+        //
+        // 旧实现是「手动指定 → 同名游戏 exe 目录 → 同名墓碑 exe 目录」直接把目录返回，
+        // 与写入侧的新规则（手账指定 → 标题既有目录 → 标题新建）口径不同：手账指定的目录若已只剩
+        // 空壳、或 exe 名目录是空的，界面就会盯着一个永远不会有图的目录，而新截图其实落在按标题
+        // 命中的目录里 —— 又是一次"以为没截上"。现在两侧共用同一套解析。
+        //
+        // 候选名顺序：手账英文名 → 手账题名 → 同名游戏 exe 名 → 同名墓碑 exe 名。
+        // （后两者取代了旧实现"直接返回 exe 名目录"的做法：现在必须目录确实含图才算命中。）
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(en) = review
+            .name_en
             .as_deref()
-            .and_then(screenshot::sanitize_dir_name)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
         {
-            return Ok((root().join(dir), SRC_MANUAL));
+            candidates.push(en.to_string());
+        }
+        if !review.name.trim().is_empty() {
+            candidates.push(review.name.clone());
         }
 
-        let mut unresolved = format!(
-            "未找到《{}》的截图目录，可在下方手动指定截图文件夹",
-            review.name
-        );
-
-        // 2) 同名活条目借 exe_name
+        let mut has_live_exe = false;
         if let Some(game) = db_guard
             .find_game_by_name(&review.name)
             .map_err(|e| e.to_string())?
         {
-            match game.exe_name.as_deref() {
-                Some(name) => {
-                    return Ok((
-                        screenshot::screenshot_dir_for_process(&settings.screenshot_dir, name),
-                        SRC_GAME,
-                    ))
+            if let Some(exe) = game.exe_name.as_deref() {
+                has_live_exe = true;
+                let stem = screenshot::process_stem(exe);
+                if !stem.is_empty() {
+                    candidates.push(stem);
                 }
-                // 同名游戏存在但没填 exe 路径 → 继续往墓碑看
-                None => unresolved = format!(
-                    "游戏库中的《{}》未填写安装程序名，可在下方手动指定截图文件夹",
-                    review.name
-                ),
             }
         }
 
-        // 3) 同名墓碑借 exe_name（游戏已从游戏库删除，只留历史归档）
-        if let Some(exe) = db_guard
-            .find_tombstone_exe_by_name(&review.name)
-            .map_err(|e| e.to_string())?
-        {
-            return Ok((
-                screenshot::screenshot_dir_for_process(&settings.screenshot_dir, &exe),
-                SRC_TOMBSTONE,
+        // 同名活条目不存在（或它没填安装程序名）时，才借同名墓碑 —— 游戏已从库删除但留历史归档
+        let mut from_tombstone = false;
+        if !has_live_exe {
+            if let Some(exe) = db_guard
+                .find_tombstone_exe_by_name(&review.name)
+                .map_err(|e| e.to_string())?
+            {
+                let stem = screenshot::process_stem(&exe);
+                if !stem.is_empty() {
+                    candidates.push(stem);
+                    from_tombstone = true;
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return Err(format!(
+                "未找到《{}》的截图目录，可在下方手动指定截图文件夹",
+                review.name
             ));
         }
 
-        return Err(unresolved);
+        let target = screenshot::resolve_capture_target(
+            &root(),
+            &candidates,
+            review.screenshot_dir.as_deref(),
+            "",
+        );
+        let source = match target.source {
+            screenshot::CaptureDirSource::Journal => SRC_MANUAL,
+            _ if from_tombstone => SRC_TOMBSTONE,
+            _ => SRC_GAME,
+        };
+        return Ok((target.dir, source));
     }
 
     let Some(game_id) = game_id else {
@@ -462,13 +559,27 @@ fn resolve_screenshot_dir(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "游戏不存在".to_string())?;
 
-    Ok(match game.exe_name {
-        Some(name) => (
-            screenshot::screenshot_dir_for_process(&settings.screenshot_dir, &name),
-            SRC_GAME,
-        ),
-        None => (root(), SRC_ROOT),
-    })
+    // 【与截图写入同口径】此前这里只按 `games.exe_name` 定位，而写入侧已改成
+    // 「手账指定 → 标题既有目录 → 标题新建」：两边一分叉就会出现"图截进了 `God of War`（569 张），
+    // 详情页却盯着空的 `GoW` 说暂无截图"（实机案例，2026-09-14）。
+    // 现在两侧共用 `capture_target_inputs` + `resolve_capture_target`，写哪里、看哪里永远一致。
+    let (candidates, journal_dir) = capture_target_inputs(&db_guard, &game);
+    if !candidates.is_empty() {
+        let target = screenshot::resolve_capture_target(
+            &root(),
+            &candidates,
+            journal_dir.as_deref(),
+            game.exe_name.as_deref().unwrap_or_default(),
+        );
+        let source = match target.source {
+            screenshot::CaptureDirSource::Journal => SRC_MANUAL,
+            _ => SRC_GAME,
+        };
+        return Ok((target.dir, source));
+    }
+
+    // 题名、exe 名、安装目录都取不到（异常数据）→ 退回截图根目录
+    Ok((root(), SRC_ROOT))
 }
 
 /// 打开截图文件夹（在文件管理器中）
@@ -576,21 +687,44 @@ mod tests {
         id
     }
 
-    /// 手账截图目录解析优先级（2026-09-12 修）：手动指定 > 同名活条目 exe > 同名墓碑 exe。
+    /// 测试临时目录守卫：Drop 时清理
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 手账截图目录解析：**与截图落盘同口径**（2026-09-14 统一）。
     ///
-    /// 回归对象：Mafia: The Old Country 从游戏库删除后（只留墓碑），手账截图库曾整块失效。
+    /// 回归对象一：Mafia: The Old Country 从游戏库删除后（只留墓碑），手账截图库曾整块失效；
+    /// 回归对象二：手账里历史自动回填的**空壳目录**会把新截图一直吸走，而界面盯着它显示"暂无截图"。
+    ///
+    /// 全程在临时目录里造数据，绝不触碰用户真实的 `H:\GameCapture`。
     #[test]
     fn review_screenshot_dir_resolution_priority() {
-        let db = mem_db(r"H:\gv_test_root");
-        let root = std::path::PathBuf::from(r"H:\gv_test_root");
+        let tmp = std::env::temp_dir().join(format!("gv_rev_shot_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _guard = TempDirGuard(tmp.clone());
+        let db = mem_db(&tmp.to_string_lossy());
 
-        // 1) 手动指定最权威
+        let put_pngs = |name: &str, n: usize| {
+            let dir = tmp.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            for i in 0..n {
+                std::fs::write(dir.join(format!("s{i}.png")), b"x").unwrap();
+            }
+        };
+
+        // 1) 手动指定且该目录确实有图 → 最权威
+        put_pngs("MafiaTheOldCountry", 3);
         let manual = add_review(&db, "Mafia: The Old Country", Some("MafiaTheOldCountry"));
         let (path, source) = resolve_screenshot_dir(&db, None, Some(&manual)).unwrap();
         assert_eq!(source, SRC_MANUAL);
-        assert_eq!(path, root.join("MafiaTheOldCountry"));
+        assert_eq!(path, tmp.join("MafiaTheOldCountry"));
 
-        // 2) 游戏已从游戏库删除、仅墓碑留档 → 借墓碑 exe
+        // 2) 游戏已从游戏库删除、仅墓碑留档 → 借墓碑 exe 名对上既有含图目录
         {
             let guard = db.lock().unwrap();
             guard
@@ -605,9 +739,15 @@ mod tests {
         let tomb = add_review(&db, "四海兄弟：故乡", None);
         let (path, source) = resolve_screenshot_dir(&db, None, Some(&tomb)).unwrap();
         assert_eq!(source, SRC_TOMBSTONE);
-        assert_eq!(path, root.join("MafiaTheOldCountry"));
+        assert_eq!(
+            path,
+            tmp.join("MafiaTheOldCountry"),
+            "墓碑 exe 名要能对上既有目录（去掉 .exe 后缀后比对）"
+        );
 
-        // 3) 同名活条目借 exe（优先级高于墓碑）
+        // 3) 同名活条目借 exe（优先于墓碑）；题名目录有图 → 命中它，空的 `GoW` 不得被复用
+        put_pngs("God of War", 5);
+        put_pngs("GoW", 0); // 历史空壳：0 张
         {
             let guard = db.lock().unwrap();
             let mut game = crate::models::Game::new("God of War".to_string());
@@ -617,15 +757,48 @@ mod tests {
         let live = add_review(&db, "God of War", None);
         let (path, source) = resolve_screenshot_dir(&db, None, Some(&live)).unwrap();
         assert_eq!(source, SRC_GAME);
-        assert_eq!(path, root.join("GoW"));
+        assert_eq!(path, tmp.join("God of War"));
 
-        // 4) 三者皆无 → 报错引导手动指定（不静默退回截图根目录，避免"看起来有截图库"的假象）
-        let orphan = add_review(&db, "Bulletstorm", None);
+        // 4) 手账指定的目录是空壳 → 视为失效，改按标题落进有图目录（本次修复的核心行为）
+        let empty_journal = add_review(&db, "God of War", Some("GoW"));
+        let (path, source) = resolve_screenshot_dir(&db, None, Some(&empty_journal)).unwrap();
+        assert_ne!(source, SRC_MANUAL, "空壳手账目录不得被采信");
+        assert_eq!(path, tmp.join("God of War"));
+
+        // 5) 题名与 exe 名都取不到（名字全空）→ 报错引导手动指定
+        let orphan = add_review(&db, "   ", None);
         let err = resolve_screenshot_dir(&db, None, Some(&orphan)).unwrap_err();
         assert!(err.contains("手动指定"), "错误文案应可操作: {}", err);
 
-        // 5) 手动值含路径穿越 → 视为非法而忽略（不会越出截图根目录），退回后续推断
-        let evil = add_review(&db, "Bulletstorm", Some(r"..\..\Windows"));
-        assert!(resolve_screenshot_dir(&db, None, Some(&evil)).is_err());
+        // 6) 手动值含路径穿越 → 非法而忽略，改按题名推断，且绝不越出截图根目录
+        let evil = add_review(&db, "God of War", Some(r"..\..\Windows"));
+        let (path, _) = resolve_screenshot_dir(&db, None, Some(&evil)).unwrap();
+        assert!(
+            path.starts_with(&tmp),
+            "不得越出截图根目录: {}",
+            path.display()
+        );
+    }
+
+    /// 安装路径的末级常是技术性通用名，不得作为截图目录候选
+    /// （用户截图根目录里确有含图的 `Content`(123) / `Common`(51)，误命中会把图截进无关目录）
+    #[test]
+    fn generic_install_dir_names_are_rejected() {
+        for bad in [
+            "Win32", "Binaries", "content", "  Common ", "Data", "Shipping", "x64", "Retail",
+            "Support",
+        ] {
+            assert!(is_generic_dir_name(bad), "{bad} 应判为通用名");
+        }
+        for good in [
+            "Mafia The Old Country",
+            "DeathStrandingDC",
+            "Red Dead Redemption",
+            "H",
+            "God of War",
+            "MGSDelta",
+        ] {
+            assert!(!is_generic_dir_name(good), "{good} 不应判为通用名");
+        }
     }
 }

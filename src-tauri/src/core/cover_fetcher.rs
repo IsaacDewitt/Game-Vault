@@ -171,7 +171,7 @@ impl CoverFetcher {
         for entry in std::fs::read_dir(path).ok()? {
             let entry = entry.ok()?;
             let file_path = entry.path();
-            if file_path.extension().map_or(false, |e| {
+            if file_path.extension().is_some_and(|e| {
                 e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("png")
             }) {
                 // 检查文件名是否包含关键词

@@ -38,6 +38,11 @@ const dialog = useDialog();
 
 // 监听截图结果事件（全局热键触发截图后由后端推送）
 let unlistenScreenshot: (() => void) | null = null;
+// 平台游戏：待命转正 / 待命窗口内未现身（后端 lib.rs 的 tick.activated / tick.arm_timeouts）
+let unlistenPlatformStarted: (() => void) | null = null;
+let unlistenPlatformTimeout: (() => void) | null = null;
+// 与后端 PLATFORM_ARM_WINDOW_SECS（300 秒）保持一致，仅用于提示文案
+const PLATFORM_ARM_WINDOW_TEXT = "5 分钟";
 onMounted(async () => {
   try {
     unlistenScreenshot = await listen<api.ScreenshotOutcome>("screenshot-taken", (event) => {
@@ -54,6 +59,39 @@ onMounted(async () => {
     });
   } catch (e) {
     console.error("监听截图事件失败:", e);
+  }
+
+  // 平台游戏（Steam / Epic）由客户端异步拉起：待命转正后立刻把卡片标成"运行中"，
+  // 不必等下一次列表刷新；否则点了启动到游戏现身之间，界面一直像没反应。
+  try {
+    unlistenPlatformStarted = await listen<string[]>("platform-game-started", (event) => {
+      for (const id of event.payload) {
+        if (!store.activeGames.includes(id)) {
+          store.activeGames.push(id);
+        }
+      }
+    });
+  } catch (e) {
+    console.error("监听平台游戏启动事件失败:", e);
+  }
+
+  // 待命窗口内没等到游戏进程（正在更新 / 客户端未登录 / 用户取消）→ 必须给个交代：
+  // 此前后端只写了日志，界面毫无反馈，用户会以为"点了启动什么也没发生"。
+  try {
+    unlistenPlatformTimeout = await listen<string>("platform-launch-timeout", (event) => {
+      const gameId = event.payload;
+      const idx = store.activeGames.indexOf(gameId);
+      if (idx !== -1) {
+        store.activeGames.splice(idx, 1);
+      }
+      const name = store.games.find((g) => g.id === gameId)?.name ?? "该游戏";
+      message.warning(
+        `《${name}》启动超时：${PLATFORM_ARM_WINDOW_TEXT}内没等到游戏进程（可能正在更新、客户端未登录或已取消），本次不计入时长`,
+        { duration: 8000 }
+      );
+    });
+  } catch (e) {
+    console.error("监听平台启动超时事件失败:", e);
   }
 
   // 检测截图热键是否注册成功（如 F12 被 Steam 等程序占用，启动时提示换键）
@@ -73,6 +111,14 @@ onUnmounted(() => {
   if (unlistenScreenshot) {
     unlistenScreenshot();
     unlistenScreenshot = null;
+  }
+  if (unlistenPlatformStarted) {
+    unlistenPlatformStarted();
+    unlistenPlatformStarted = null;
+  }
+  if (unlistenPlatformTimeout) {
+    unlistenPlatformTimeout();
+    unlistenPlatformTimeout = null;
   }
 });
 

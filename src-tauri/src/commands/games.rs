@@ -775,6 +775,9 @@ pub async fn fetch_game_info_llm(
 
 /// 手动更新游戏元数据（与 LLM 获取的字段一致）
 /// hltb 参数用 Option<Option<u32>>：外层 Some 表示字段被提交，内层 Some(v) 设置值、None 表示清空
+// 参数对应前端 Tauri 命令调用契约（含 hltb 的 Option<Option<u32>> 清空语义），
+// 抽结构体重构会改变序列化签名、破坏前端调用，故此处放行。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn update_game_meta(
     db: State<'_, Arc<Mutex<Database>>>,
@@ -1117,23 +1120,19 @@ pub async fn open_save_path(path: String, app_handle: tauri::AppHandle) -> Resul
     } else {
         let mut current = path.as_path();
         let mut found = None;
-        loop {
-            if let Some(parent) = current.parent() {
-                if parent == current { break; }
-                // 遇到系统级大文件夹就停止
-                if let Some(name) = current.file_name().and_then(|n| n.to_str()) {
-                    if GENERIC_DIRS.iter().any(|g| g.eq_ignore_ascii_case(name)) {
-                        break;
-                    }
-                }
-                if parent.exists() {
-                    found = Some(parent.to_path_buf());
+        while let Some(parent) = current.parent() {
+            if parent == current { break; }
+            // 遇到系统级大文件夹就停止
+            if let Some(name) = current.file_name().and_then(|n| n.to_str()) {
+                if GENERIC_DIRS.iter().any(|g| g.eq_ignore_ascii_case(name)) {
                     break;
                 }
-                current = parent;
-            } else {
+            }
+            if parent.exists() {
+                found = Some(parent.to_path_buf());
                 break;
             }
+            current = parent;
         }
         match found {
             Some(p) => p,

@@ -72,7 +72,7 @@ fn normalize_review_name(review: &mut Review) {
         return;
     }
     review.name = name.clone();
-    if name.is_ascii() && review.name_en.as_deref().map_or(true, |v| v.trim().is_empty()) {
+    if name.is_ascii() && review.name_en.as_deref().is_none_or(|v| v.trim().is_empty()) {
         tracing::info!("名称为纯英文，同步填入英文名: '{}'", name);
         review.name_en = Some(name);
     }

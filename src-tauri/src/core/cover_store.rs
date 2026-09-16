@@ -931,8 +931,10 @@ pub fn migrate(db: &Database) -> Result<CoverMigrateReport> {
     }
     db.ensure_cover_storage()?;
 
-    let mut report = CoverMigrateReport::default();
-    report.bytes_before = dir_size(&path::get_covers_dir());
+    let mut report = CoverMigrateReport {
+        bytes_before: dir_size(&path::get_covers_dir()),
+        ..Default::default()
+    };
 
     // ---- 第 1 步：现有游戏 / 手账封面入索引 ----
     let mut owners: Vec<(String, String, Option<String>)> = Vec::new();

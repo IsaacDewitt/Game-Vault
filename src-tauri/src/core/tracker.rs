@@ -39,6 +39,15 @@ pub struct TrackerTick {
     pub arm_timeouts: Vec<String>,
 }
 
+/// 待检查活跃会话的快照（避免遍历时与 `&mut self` 借用冲突）
+type SessionCheckInfo = (
+    String,
+    String,
+    Option<String>,
+    Option<u32>,
+    Option<String>,
+);
+
 /// 游戏时长追踪器
 pub struct PlayTimeTracker {
     active_sessions: HashMap<String, ActiveSession>,
@@ -284,13 +293,7 @@ impl PlayTimeTracker {
         self.process_pending_sessions(&mut tick);
 
         // 收集需要检查的会话信息，避免借用冲突
-        let sessions_to_check: Vec<(
-            String,
-            String,
-            Option<String>,
-            Option<u32>,
-            Option<String>,
-        )> = self
+        let sessions_to_check: Vec<SessionCheckInfo> = self
             .active_sessions
             .iter()
             .map(|(id, session)| {
@@ -351,7 +354,7 @@ impl PlayTimeTracker {
                         let found_in_install = pid_to_exe.values().any(|exe| {
                             Self::exe_under_dir(exe, &install_lower)
                         }) || self.sys.processes().values().any(|p| {
-                            p.exe().map_or(false, |exe| {
+                            p.exe().is_some_and(|exe| {
                                 Self::exe_under_dir(&exe.to_string_lossy().to_lowercase(), &install_lower)
                             })
                         });
@@ -376,7 +379,7 @@ impl PlayTimeTracker {
                 if let Some(ref expected_path) = exe_path {
                     let expected_lower = expected_path.to_lowercase();
                     still_running = self.sys.processes().values().any(|p| {
-                        p.exe().map_or(false, |exe| {
+                        p.exe().is_some_and(|exe| {
                             exe.to_string_lossy().to_lowercase() == expected_lower
                         })
                     });
@@ -500,7 +503,7 @@ impl PlayTimeTracker {
         self.pending_sessions
             .iter()
             .find(|(_, s)| {
-                s.install_path.as_deref().map_or(false, |dir| {
+                s.install_path.as_deref().is_some_and(|dir| {
                     dir.len() >= 4 && Self::exe_under_dir(&full_lower, &dir.to_lowercase())
                 })
             })
@@ -594,7 +597,7 @@ impl PlayTimeTracker {
         self.active_sessions
             .iter()
             .find(|(_, s)| {
-                s.install_path.as_deref().map_or(false, |dir| {
+                s.install_path.as_deref().is_some_and(|dir| {
                     dir.len() >= 4 && Self::exe_under_dir(&full_lower, &dir.to_lowercase())
                 })
             })
