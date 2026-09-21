@@ -39,6 +39,7 @@ pub fn get_game_detail(
 pub fn launch_game(
     db: State<'_, Arc<Mutex<Database>>>,
     tracker: State<'_, Arc<Mutex<PlayTimeTracker>>>,
+    wakeup: State<'_, Arc<crate::PollWakeup>>,
     game_id: String,
 ) -> Result<(), String> {
     // 阶段 1：获取游戏数据，然后立即释放 DB 锁
@@ -104,6 +105,12 @@ pub fn launch_game(
             tracing::error!("保存旧游戏会话失败 (game_id: {}): {}", finished_session.game_id, e);
         }
     }
+
+    // 叫醒后台轮询线程（2026-09-19）。
+    // 空闲期它正阻塞在条件变量上；不叫醒就要等最多 PROCESS_POLL_IDLE_SECS（10 秒）
+    // 才会开始找进程——平台游戏那段等待最明显：点了启动，界面十几秒没反应。
+    // 本地游戏虽已即时计时，但退出检测同样要等它醒来才开始。
+    wakeup.notify();
 
     Ok(())
 }
@@ -791,6 +798,7 @@ pub fn update_game_meta(
     hltb_main_extra: Option<Option<u32>>,
     hltb_completionist: Option<Option<u32>>,
     save_paths: Option<Vec<String>>,
+    launch_args: Option<String>,
 ) -> Result<Game, String> {
     let db_guard = lock_or_recover(&db);
     let mut game = db_guard.get_game_by_id(&game_id)
@@ -826,6 +834,17 @@ pub fn update_game_meta(
     }
     if let Some(v) = save_paths {
         game.save_paths = v;
+    }
+    // 启动参数：空串/纯空白视为清空（前端清空输入框走这条），与 description 同款口径。
+    // 注意不能用 Option<Option<String>> 那套：serde 无法区分 JSON null 与字段缺失，
+    // 前端传 null 只会得到 None（= 不处理），清空就失效了。
+    if let Some(v) = launch_args {
+        let trimmed = v.trim();
+        game.launch_args = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
     }
 
     db_guard.update_game(&game).map_err(|e| e.to_string())?;

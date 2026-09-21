@@ -72,7 +72,10 @@ impl Database {
                 is_favorite INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'unplayed',
                 added_at TEXT NOT NULL,
-                updated_at TEXT
+                updated_at TEXT,
+                -- 自定义启动参数（0.8.3）：本地游戏启动时原样追加到 exe 之后。
+                -- NULL/空串 = 不带参数（与旧库升级前行为完全一致）。
+                launch_args TEXT
             );
 
             -- 逐场游玩明细（近期回看用，12 个月滚动窗口；启动后延迟清理超期行）
@@ -193,6 +196,9 @@ impl Database {
 
         // 迁移：为旧数据库添加来源平台字段（platform / platform_id）
         self.migrate_add_platform_columns()?;
+
+        // 迁移：为旧数据库添加自定义启动参数字段（launch_args）
+        self.migrate_add_launch_args_column()?;
 
         // 迁移：为旧数据库添加 abandoned_at 字段（弃坑重玩成就判定用）
         self.migrate_add_abandoned_at_column()?;
@@ -587,6 +593,7 @@ impl Database {
         // 15:play_count 16:is_favorite 17:status 18:added_at 19:updated_at
         // 20:hltb_main_story 21:hltb_main_extra 22:hltb_completionist 23:save_paths
         // 24:exe_modified_at 25:exe_file_size 26:platform 27:platform_id
+        // 28:launch_args
         let genres_str: String = row.get(12)?;
         let genres: Vec<String> = serde_json::from_str(&genres_str).unwrap_or_default();
 
@@ -625,6 +632,12 @@ impl Database {
             // 兜底 "local"：理论上迁移保证列存在，防御性保留
             platform: row.get(26).unwrap_or_else(|_| "local".to_string()),
             platform_id: row.get(27)?,
+            // 空串按 None 归一：前端清空输入框与「从未填过」在启动侧是同一语义，
+            // 在此处收敛，免得下游每处都判一次
+            launch_args: row
+                .get::<_, Option<String>>(28)?
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         })
     }
 
@@ -635,7 +648,7 @@ impl Database {
         is_favorite, status, added_at, updated_at,
         hltb_main_story, hltb_main_extra, hltb_completionist,
         save_paths, exe_modified_at, exe_file_size,
-        platform, platform_id
+        platform, platform_id, launch_args
     ";
 
     // ==================== 游戏 CRUD ====================
@@ -650,9 +663,9 @@ impl Database {
                 is_favorite, status, added_at, updated_at,
                 hltb_main_story, hltb_main_extra, hltb_completionist,
                 save_paths, exe_modified_at, exe_file_size,
-                platform, platform_id
+                platform, platform_id, launch_args
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -680,7 +693,11 @@ impl Database {
                 exe_modified_at = excluded.exe_modified_at,
                 exe_file_size = excluded.exe_file_size,
                 platform = excluded.platform,
-                platform_id = excluded.platform_id
+                platform_id = excluded.platform_id,
+                -- 与 cover/description 同一口径：excluded 为 NULL 时保留库里已有的参数。
+                -- 平台扫描重导入入口流（exe_path 覆盖式）不会抹掉手填的启动参数；
+                -- 用户主动清空走 update_game，不受此影响。
+                launch_args = COALESCE(excluded.launch_args, games.launch_args)
             ",
             params![
                 game.id,
@@ -711,6 +728,7 @@ impl Database {
                 game.exe_file_size,
                 game.platform,
                 game.platform_id,
+                game.launch_args,
             ],
         )?;
         Ok(())
@@ -1129,8 +1147,8 @@ impl Database {
                 genres = ?12, is_favorite = ?13, status = ?14, updated_at = ?15,
                 hltb_main_story = ?16, hltb_main_extra = ?17, hltb_completionist = ?18,
                 save_paths = ?19, exe_modified_at = ?20, exe_file_size = ?21,
-                platform = ?22, platform_id = ?23
-             WHERE id = ?24",
+                platform = ?22, platform_id = ?23, launch_args = ?24
+             WHERE id = ?25",
             params![
                 game.name,
                 game.install_path,
@@ -1155,6 +1173,7 @@ impl Database {
                 game.exe_file_size,
                 game.platform,
                 game.platform_id,
+                game.launch_args,
                 game.id,
             ],
         )?;
@@ -2459,6 +2478,25 @@ impl Database {
         Ok(())
     }
 
+    /// 迁移：添加自定义启动参数字段到旧数据库（0.8.3）
+    ///
+    /// 起因：《寂静岭 f》这类游戏必须带 `-savetouserdir` 才能启动（让存档写进用户目录），
+    /// 而 bat 启动器能跑、Game Vault 直接 spawn exe 会失败——只差这一个开关。
+    ///
+    /// 不设 DEFAULT：NULL 与空串在 `core::launcher` 侧统一按「无参数」处理，
+    /// 老库升级后启动行为与升级前逐字节一致（此列只影响显式填过参数的条目）。
+    fn migrate_add_launch_args_column(&self) -> Result<()> {
+        if !self.has_column("games", "launch_args")? {
+            tracing::info!("launch_args 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE games ADD COLUMN launch_args TEXT",
+                [],
+            )?;
+            tracing::info!("已添加 launch_args 字段到 games 表");
+        }
+        Ok(())
+    }
+
     /// 迁移：启用 WAL 日志模式
     /// journal_mode 是数据库的持久属性（写入文件头），重复执行无副作用。
     /// 意义：清理过期明细等批量写操作不再独占写锁阻塞前台统计查询。
@@ -2897,6 +2935,71 @@ mod tests {
         db.migrate_add_platform_columns().unwrap();
         db.migrate_add_platform_columns().unwrap();
         assert!(db.has_column("games", "platform").unwrap());
+    }
+
+    /// 启动参数（0.8.3）：默认 None、写入/读回往返、空白串归一、
+    /// update_game 清空、upsert 的 COALESCE 不抹掉手填值、迁移幂等。
+    ///
+    /// 重点在**列对齐**：launch_args 是 GAME_COLUMNS 的最后一列（索引 28），
+    /// 一旦列顺序或占位符写错，这里会立刻炸，而不是等到线上点启动才发现。
+    #[test]
+    fn launch_args_roundtrip_and_coalesce() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+
+        // 1. 迁移后列必须存在（老库升级路径的基石）
+        assert!(db.has_column("games", "launch_args").unwrap(), "launch_args 列缺失");
+
+        // 2. Game::new 默认无参数 —— 既有游戏启动行为不变的保证
+        let mut game = Game::new("SILENT HILL f".to_string());
+        game.id = "g-shf".to_string();
+        game.exe_path = Some("G:\\SHF\\SHf.exe".to_string());
+        db.upsert_game(&game).unwrap();
+        let got = db.get_game_by_id("g-shf").unwrap().expect("条目应存在");
+        assert!(got.launch_args.is_none(), "新条目不应带启动参数");
+
+        // 3. 写入 → 读回（get_game_by_id 走 GAME_COLUMNS，验证索引对齐）
+        let mut with_args = got.clone();
+        with_args.launch_args = Some("-savetouserdir".to_string());
+        db.update_game(&with_args).unwrap();
+        assert_eq!(
+            db.get_game_by_id("g-shf").unwrap().unwrap().launch_args.as_deref(),
+            Some("-savetouserdir")
+        );
+
+        // 4. 列表查询同样带出（与 get_game_by_id 共用 GAME_COLUMNS）
+        let listed = db.get_games(&GameFilter::default()).unwrap();
+        let row = listed.iter().find(|g| g.id == "g-shf").expect("列表应含该条目");
+        assert_eq!(row.launch_args.as_deref(), Some("-savetouserdir"));
+
+        // 5. update_game 传 None 可清空 —— 前端清空输入框的落库路径
+        let mut cleared = with_args.clone();
+        cleared.launch_args = None;
+        db.update_game(&cleared).unwrap();
+        assert!(db.get_game_by_id("g-shf").unwrap().unwrap().launch_args.is_none());
+
+        // 6. upsert 的 COALESCE：平台扫描重导入（不带参数）不得抹掉手填参数
+        db.update_game(&with_args).unwrap();
+        let mut rescan = Game::new("SILENT HILL f".to_string());
+        rescan.id = "g-shf".to_string();
+        rescan.exe_path = Some("G:\\SHF\\SHf.exe".to_string());
+        rescan.platform = "steam".to_string();
+        db.upsert_game(&rescan).unwrap();
+        assert_eq!(
+            db.get_game_by_id("g-shf").unwrap().unwrap().launch_args.as_deref(),
+            Some("-savetouserdir"),
+            "upsert 的 COALESCE 应保留已有启动参数"
+        );
+
+        // 7. 空白串在读取侧归一为 None（老库或手工 SQL 写进的 ""/"  " 一律按无参数处理）
+        db.conn
+            .execute("UPDATE games SET launch_args = '   ' WHERE id = 'g-shf'", [])
+            .unwrap();
+        assert!(db.get_game_by_id("g-shf").unwrap().unwrap().launch_args.is_none());
+
+        // 8. 迁移幂等
+        db.migrate_add_launch_args_column().unwrap();
+        db.migrate_add_launch_args_column().unwrap();
+        assert!(db.has_column("games", "launch_args").unwrap());
     }
 
     /// 平台迁移回填：历史行 platform 为 NULL/空串时必须被补齐为 'local'，

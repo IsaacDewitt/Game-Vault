@@ -369,6 +369,21 @@ body {
   background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
   color: #e0e0e0;
   transition: background 0.3s, color 0.3s;
+  /* 桌面应用观感：默认禁止拖选文字。网页式的"拖一下选中半屏字"很突兀，
+     而且误选后要连点好几下才清得掉 */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 放行真正需要选中的地方：输入类元素，以及显式标了 .selectable 的文本
+   （exe 路径、启动参数、存档路径这类是要能复制的） */
+input,
+textarea,
+[contenteditable="true"],
+.selectable,
+.selectable * {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 /* n-layout 本身有 Naive UI 主题背景色，需要覆盖 */

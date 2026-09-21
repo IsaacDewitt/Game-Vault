@@ -22,6 +22,14 @@ pub struct ActiveSession {
     /// 游戏安装目录，用于回退检测（进程不在进程树中但仍在同目录运行）
     pub install_path: Option<String>,
     pub start_time: chrono::DateTime<chrono::Utc>,
+    /// 单 PID 点查被证明不可信时的「全表确认冷却」截止时刻。
+    ///
+    /// 背景：计时期改走单 PID 点查（`refresh_process_specifics`，约 0.4 微秒）后，
+    /// 极少数受保护进程（内核级反作弊保护的游戏）句柄打不开，sysinfo 会恒返回
+    /// `false`——**假死**。此时只有全表三级判定才是权威口径。
+    /// 一旦「点查说死、全表说活」，就说明该会话的点查不可信，在冷却期内不再理会
+    /// 点查结果，避免在这种会话上每拍都做一次全表刷新（退化成旧行为）。
+    pub poll_cooldown_until: Option<std::time::Instant>,
 }
 
 /// 每日游玩统计

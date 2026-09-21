@@ -269,7 +269,23 @@ pub fn trigger_screenshot(
     let target = {
         let db_guard = lock_or_recover(db);
 
-        let game = db_guard.get_game_by_id(&matched_game_id).ok().flatten();
+        // 【不可用 .ok().flatten() 吞掉错误】那会把「查不到」与「查失败」归并成同一个 None，
+        // 后果有两条且都与设计意图相悖：
+        //   ① platform 退化为空串 → 与 PLATFORM_STEAM 比较必然不成立 → **Steam 静默退让失效**，
+        //      本应用会跟 Steam 抢拍一张（正下方 277-283 行的设计意图落空）；
+        //   ② candidates 变空 → 截图落到「前台进程名」目录而非游戏目录。
+        // 二者都是低概率但症状诡异（日志一片正常）。故显式区分：DB 出错即报错返回，
+        // 与紧随其后 15 行的 Settings::load_from_db 失败处理保持同一口径。
+        let game = match db_guard.get_game_by_id(&matched_game_id) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!("[截图] 查询游戏条目失败: {e}");
+                screenshot::play_feedback(screenshot::FeedbackTone::Error);
+                return Some(ScreenshotOutcome::Failed {
+                    message: format!("查询游戏失败: {e}"),
+                });
+            }
+        };
         let platform = game
             .as_ref()
             .map(|g| g.platform.clone())

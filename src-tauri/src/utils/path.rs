@@ -335,15 +335,20 @@ fn rva_to_offset(data: &[u8], sections_start: usize, num_sections: usize, rva: u
     None
 }
 
+/// 小端读 u16。边界检查用 `checked_add` 而非 `offset + 2`：偏移量全部由被解析文件
+/// 的内容推导，一旦将来放宽输入来源（如解析网络下发的文件），`usize` 溢出会**绕过**
+/// 边界检查（release 下静默 wrap 成小值、debug 下直接 panic）。当前调用链的偏移
+/// 均受 u32 约束而不可达，但改造成本为零，故按防御性写法收敛。
 fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
-    if offset + 2 > data.len() {
+    if offset.checked_add(2)? > data.len() {
         return None;
     }
     Some(u16::from_le_bytes([data[offset], data[offset + 1]]))
 }
 
+/// 小端读 u32（溢出防护理由同 `read_u16`）
 fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
-    if offset + 4 > data.len() {
+    if offset.checked_add(4)? > data.len() {
         return None;
     }
     Some(u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]))

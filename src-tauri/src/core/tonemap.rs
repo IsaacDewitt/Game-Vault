@@ -366,7 +366,7 @@ mod tests {
         // 亮度 l=0.0507 不变；k=l/(l-(-0.2)) 使 R 恰好归零
         let l = luminance(r, g, b);
         assert!((l - 0.0507).abs() < 1e-3, "亮度应保持不变，实际 {l}");
-        assert!(r >= 0.0 && r < 1e-4, "负分量应精确收敛到 0，实际 {r}");
+        assert!((0.0..1e-4).contains(&r), "负分量应精确收敛到 0，实际 {r}");
         assert!((0.0..=1.0).contains(&g) && (0.0..=1.0).contains(&b));
     }
 

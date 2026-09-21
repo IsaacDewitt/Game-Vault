@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, nextTick } from "vue";
+import { ref, onMounted, onUnmounted, nextTick, watch } from "vue";
 
 export interface ContextMenuItem {
   label: string;
@@ -33,40 +33,68 @@ function getActionableIndices(): number[] {
 
 onMounted(() => {
   nextTick(() => {
-    if (menuRef.value) {
-      const rect = menuRef.value.getBoundingClientRect();
-      const windowWidth = window.innerWidth;
-      const windowHeight = window.innerHeight;
-
-      if (props.x + rect.width > windowWidth) {
-        adjustedX.value = windowWidth - rect.width - 8;
-      }
-      if (props.y + rect.height > windowHeight) {
-        adjustedY.value = windowHeight - rect.height - 8;
-      }
-      // 防止菜单超出左边界和上边界
-      if (adjustedX.value < 8) adjustedX.value = 8;
-      if (adjustedY.value < 8) adjustedY.value = 8;
-
-      // 自动聚焦第一个可操作项
-      const actionable = getActionableIndices();
-      if (actionable.length > 0) {
-        focusedIndex.value = actionable[0];
-        focusItem(focusedIndex.value);
-      }
+    adjustPosition();
+    // 自动聚焦第一个可操作项（仅挂载时做一次，位置变化不该抢走焦点）
+    const actionable = getActionableIndices();
+    if (actionable.length > 0) {
+      focusedIndex.value = actionable[0];
+      focusItem(focusedIndex.value);
     }
   });
 
   document.addEventListener("click", handleOutsideClick);
   document.addEventListener("keydown", handleKeydown);
+  // 右键在菜单外发生 → 先关掉自己。
+  // 必须捕获取阶段：菜单是**每个卡片各持一个实例**（GameCard 内 v-if 渲染），
+  // 而右键只触发 contextmenu、不触发 click，光靠上面那条 click 监听关不掉旧菜单，
+  // 于是"右键 A 卡片、再右键 B 卡片"会两个菜单同时挂在屏幕上。
+  // 用捕获阶段可保证先关旧的、再由目标卡片的 @contextmenu 打开新的（时序天然正确）。
+  document.addEventListener("contextmenu", handleOutsideContextMenu, true);
 });
 
 onUnmounted(() => {
   document.removeEventListener("click", handleOutsideClick);
   document.removeEventListener("keydown", handleKeydown);
+  document.removeEventListener("contextmenu", handleOutsideContextMenu, true);
 });
 
+// 同一张卡片连续右键：Vue 会复用组件实例（v-if 未变），onMounted 不会再跑，
+// 位置必须跟着 props 重新算，否则菜单会停在上一次的落点
+watch(
+  () => [props.x, props.y],
+  () => nextTick(adjustPosition)
+);
+
+/** 贴边翻转 + 聚焦首个可操作项（挂载时与坐标变化时共用） */
+function adjustPosition() {
+  if (!menuRef.value) return;
+
+  adjustedX.value = props.x;
+  adjustedY.value = props.y;
+
+  const rect = menuRef.value.getBoundingClientRect();
+  const windowWidth = window.innerWidth;
+  const windowHeight = window.innerHeight;
+
+  if (props.x + rect.width > windowWidth) {
+    adjustedX.value = windowWidth - rect.width - 8;
+  }
+  if (props.y + rect.height > windowHeight) {
+    adjustedY.value = windowHeight - rect.height - 8;
+  }
+  // 防止菜单超出左边界和上边界
+  if (adjustedX.value < 8) adjustedX.value = 8;
+  if (adjustedY.value < 8) adjustedY.value = 8;
+}
+
 function handleOutsideClick() {
+  emit("close");
+}
+
+/** 菜单之外的右键：关闭本菜单（菜单内部的右键由模板上的 .stop.prevent 拦下） */
+function handleOutsideContextMenu(e: MouseEvent) {
+  const target = e.target as Node | null;
+  if (menuRef.value && target && menuRef.value.contains(target)) return;
   emit("close");
 }
 

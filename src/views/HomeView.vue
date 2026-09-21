@@ -27,6 +27,7 @@ import { DEBOUNCE_MS } from "../lib/constants";
 import GameCard from "../components/GameCard.vue";
 import GameDetail from "../components/GameDetail.vue";
 import GameInfoEditModal from "../components/GameInfoEditModal.vue";
+import LaunchArgsModal from "../components/LaunchArgsModal.vue";
 import PlatformImportModal from "../components/PlatformImportModal.vue";
 import ContextMenu from "../components/ContextMenu.vue";
 import type { ContextMenuItem } from "../components/ContextMenu.vue";
@@ -139,6 +140,12 @@ const showEditInfoModal = ref(false);
 const editingGameId = ref("");
 const editingGame = computed(() =>
   editingGameId.value ? store.games.find((g) => g.id === editingGameId.value) ?? null : null
+);
+// 启动参数弹窗状态（卡片右键菜单入口）
+const showLaunchArgsModal = ref(false);
+const launchArgsGameId = ref("");
+const launchArgsGame = computed(() =>
+  launchArgsGameId.value ? store.games.find((g) => g.id === launchArgsGameId.value) ?? null : null
 );
 // 封面获取 loading 状态
 const refreshingCovers = ref(false);
@@ -352,6 +359,11 @@ function handleCancelRename() {
   showRenameModal.value = false;
   renamingGameId.value = "";
   renameInput.value = "";
+}
+
+function handleSetLaunchArgs(gameId: string) {
+  launchArgsGameId.value = gameId;
+  showLaunchArgsModal.value = true;
 }
 
 /** 启动游戏并提示失败原因（不再静默吞错） */
@@ -733,6 +745,7 @@ function handleDeleteGame(gameId: string) {
           @favorite="store.toggleFav(game.id)"
           @delete="handleDeleteGame(game.id)"
           @rename="handleRenameGame(game.id)"
+          @set-launch-args="handleSetLaunchArgs(game.id)"
           @refresh-info="handleRefreshInfo(game.id)"
           @edit-info="handleEditInfo(game.id)"
           @remove-cover="handleRemoveCover(game.id)"
@@ -856,6 +869,15 @@ function handleDeleteGame(gameId: string) {
       :game="editingGame"
       @close="showEditInfoModal = false"
       @saved="showEditInfoModal = false"
+    />
+
+    <!-- 启动参数弹窗（卡片右键菜单入口；详情面板自持另一个入口） -->
+    <LaunchArgsModal
+      v-if="showLaunchArgsModal && launchArgsGame"
+      :show="showLaunchArgsModal"
+      :game="launchArgsGame"
+      @close="showLaunchArgsModal = false"
+      @saved="showLaunchArgsModal = false"
     />
 
     <!-- 主页右键菜单 -->

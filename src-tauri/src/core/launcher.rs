@@ -13,11 +13,33 @@ pub enum LaunchOutcome {
     Delegated { uri: String },
 }
 
+/// 原样把参数串追加到命令行（不经 shell）
+///
+/// 刻意用 `raw_arg` 而非 `args()`：`args()` 会按 Rust 自己的转义规则逐参数重排，
+/// 而这里要的恰恰是「用户在 bat 里怎么写就怎么传」——引号、空格、`=` 全部由用户负责，
+/// 我们不增不减。例如 `-savedir="D:\我的 存档"` 会连引号一起原样送出。
+///
+/// 因为不经 cmd.exe，`%USERPROFILE%` 这类环境变量**不会展开**，
+/// `& | > ^` 也无特殊含义（整串直接交给游戏进程）。
+#[cfg(windows)]
+fn append_raw_args(cmd: &mut std::process::Command, args: &str) {
+    use std::os::windows::process::CommandExt;
+    // raw_arg 会在命令行为空时直接追加、否则自带一个空格分隔，无需手工补空格
+    cmd.raw_arg(args);
+}
+
+/// 非 Windows 平台忽略自定义参数（本项目只出 Windows 便携版，仅为保持可编译）
+#[cfg(not(windows))]
+fn append_raw_args(_cmd: &mut std::process::Command, _args: &str) {}
+
 /// 游戏启动器
 pub struct GameLauncher;
 
 impl GameLauncher {
     /// 启动本地 exe，返回进程 PID 用于后续进程树追踪
+    ///
+    /// 若该条目填了 `launch_args`（0.8.3），**原样**追加到命令行之后——
+    /// 语义等价于用户自己在 bat 里手打那串（如《寂静岭 f》必须的 `-savetouserdir`）。
     pub fn launch(game: &Game) -> Result<u32> {
         let exe_path = game.exe_path.as_ref()
             .ok_or_else(|| anyhow::anyhow!("游戏没有可执行文件路径"))?;
@@ -32,10 +54,24 @@ impl GameLauncher {
             cmd.current_dir(install_path);
         }
 
+        // 原样透传：trim 后非空才追加，空串/None 与旧行为完全一致（不加任何参数）。
+        let launch_args = game
+            .launch_args
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(args) = launch_args {
+            append_raw_args(&mut cmd, args);
+        }
+
         let child = cmd.spawn()?;
         let pid = child.id();
 
-        tracing::info!("启动游戏: {} (PID: {})", game.name, pid);
+        // 参数一并打进日志：写错了能直接从日志里看出传的是什么
+        match launch_args {
+            Some(args) => tracing::info!("启动游戏: {} (PID: {}, 参数: {})", game.name, pid, args),
+            None => tracing::info!("启动游戏: {} (PID: {})", game.name, pid),
+        }
         Ok(pid)
     }
 
@@ -102,4 +138,36 @@ fn open_uri(uri: &str) -> Result<()> {
 #[cfg(not(windows))]
 fn open_uri(uri: &str) -> Result<()> {
     anyhow::bail!("仅 Windows 支持协议启动: {}", uri)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// 参数原样追加：raw_arg 挂上去的就是用户写的那一串，不做转义重排。
+    /// 只断言「挂上了、内容一致」，不真的 spawn —— 单测不起进程。
+    #[test]
+    fn raw_args_appended_verbatim() {
+        let mut cmd = std::process::Command::new("notepad.exe");
+        append_raw_args(&mut cmd, "-savetouserdir");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["-savetouserdir".to_string()]);
+    }
+
+    /// 带引号、空格、`&`、中文路径的整串原样保留：
+    /// 不切分、不转义、不因 `&` 被当成管道（这是 raw_arg 相对 args() 的核心价值）
+    #[test]
+    fn raw_args_keep_quotes_and_symbols() {
+        let raw = "-savedir=\"D:\\我的 存档\" & -windowed";
+        let mut cmd = std::process::Command::new("notepad.exe");
+        append_raw_args(&mut cmd, raw);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec![raw.to_string()]);
+    }
 }

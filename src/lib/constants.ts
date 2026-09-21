@@ -11,12 +11,6 @@ export const DEFAULT_ACCENT_COLOR = "#6366f1";
 /** 深色背景主色 */
 export const COLOR_DARK_BG = "#1a1a2e";
 
-/** 深色背景副色 */
-export const COLOR_DARK_BG_ALT = "#16213e";
-
-/** 深色卡片/表面色 */
-export const COLOR_SURFACE = "#2a2a3e";
-
 // ==================== 交互 ====================
 
 /** 搜索/输入防抖延迟（毫秒） */
@@ -48,11 +42,12 @@ export const TIME_MS = {
 // ==================== 游戏类型 ====================
 
 /**
- * 规范游戏类型表（分组展示）。
+ * 规范游戏类型表（分组展示）——前端录入/筛选候选的**唯一来源**。
  *
- * 唯一事实来源在后端 `src-tauri/src/core/genres.rs`（CANONICAL_GENRES），
- * 这里只是给前端录入/筛选用的副本——改类型表时**两边都要改**，
- * 否则前端候选与后端归一化口径会漂移。词表依据 Steam 官方中文标签。
+ * ⚠️ 后端另有一份归一化表 `src-tauri/src/core/genres.rs::CANONICAL_GENRES`，
+ * 职责不同：它把 LLM 返回的杂乱写法（动作/Action）归一到规范名，本表则给录入
+ * 与筛选下拉提供候选。**改类型表时两边都要改**，否则前端能选到的类型与后端
+ * 能归一到的类型会漂移。词表依据 Steam 官方中文标签。
  */
 export const GENRE_GROUPS: { group: string; genres: string[] }[] = [
   {
@@ -91,17 +86,3 @@ export const GENRE_GROUPS: { group: string; genres: string[] }[] = [
   { group: "平台", genres: ["平台游戏", "精确平台游戏"] },
   { group: "其他", genres: ["休闲", "独立", "大逃杀", "节奏", "街机", "多人", "文字游戏"] },
 ];
-
-/** 扁平化的规范类型列表 */
-export const CANONICAL_GENRES: string[] = GENRE_GROUPS.flatMap((g) => g.genres);
-
-// ==================== 游戏状态 ====================
-
-/** 游戏状态枚举值 */
-export const GAME_STATUS = {
-  UNPLAYED: "unplayed",
-  PLAYING: "playing",
-  COMPLETED: "completed",
-  ABANDONED: "abandoned",
-  FAVORITES: "favorites",
-} as const;

@@ -41,6 +41,9 @@ export interface Game {
   platform: string;
   /** 平台侧标识：Steam=appid；Epic="CatalogNamespace:CatalogItemId:AppName"；local=null */
   platform_id: string | null;
+  /** 自定义启动参数：本地游戏启动时原样追加到 exe 之后（如 -savetouserdir）。
+   *  未经 shell，环境变量不展开；Steam/Epic 游戏忽略此字段 */
+  launch_args: string | null;
 }
 
 export interface GameFilter {
@@ -396,16 +399,28 @@ export async function checkSavePaths(): Promise<Record<string, boolean>> {
   return invoke("check_save_paths");
 }
 
+/**
+ * update_game_meta 的入参
+ *
+ * ⚠️ 多词字段必须写成 **camelCase**：Tauri 在编译期把 Rust 参数名转成 camelCase 后才去
+ * JSON 里查找（tauri-macros 的 ArgumentCase 默认 Camel），键名对不上时，
+ * `Option<T>` 参数会走 `visitor.visit_none()` —— **静默当作"没提交"，不报错**。
+ * 0.8.3 修复前这里用的 snake_case，导致 releaseDate / HLTB / savePaths 一直写不进去：
+ * 界面提示"已保存"、命令返回成功，值却一个没变。
+ * （单词字段如 description / genres 两种写法形态相同，故一直正常。）
+ */
 export interface GameMetaInput {
   description?: string | null;
   developer?: string | null;
   publisher?: string | null;
-  release_date?: string | null;
+  releaseDate?: string | null;
   genres?: string[] | null;
-  hltb_main_story?: number | null;
-  hltb_main_extra?: number | null;
-  hltb_completionist?: number | null;
-  save_paths?: string[] | null;
+  hltbMainStory?: number | null;
+  hltbMainExtra?: number | null;
+  hltbCompletionist?: number | null;
+  savePaths?: string[] | null;
+  /** 空串 = 清空启动参数（后端按 trim 后为空处理） */
+  launchArgs?: string | null;
 }
 
 export async function updateGameMeta(gameId: string, meta: GameMetaInput): Promise<Game> {

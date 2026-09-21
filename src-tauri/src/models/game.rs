@@ -46,6 +46,14 @@ pub struct Game {
     /// 平台侧标识：Steam=appid（如 "550"）；Epic="CatalogNamespace:CatalogItemId:AppName"；local=None
     #[serde(default)]
     pub platform_id: Option<String>,
+    /// 自定义启动参数（0.8.3）：本地游戏启动时**原样**追加到 exe 命令行之后。
+    ///
+    /// 语义是「照 bat 里手打的那串抄进来」：不经 cmd.exe，故 `%USERPROFILE%` 这类
+    /// 环境变量**不会展开**，`& | > ^` 也无特殊含义（直接透传给游戏）。
+    /// 仅对 `platform = "local"` 生效；Steam/Epic 的参数由客户端自身设置，
+    /// 我们走 `steam://run/<appid>` 拉起时塞参数无效，故平台游戏忽略此字段。
+    #[serde(default)]
+    pub launch_args: Option<String>,
 }
 
 /// platform 字段的 serde 默认值（兼容不含该字段的旧备份 JSON）
@@ -85,6 +93,7 @@ impl Game {
             exe_file_size: None,
             platform: "local".to_string(),
             platform_id: None,
+            launch_args: None,
         }
     }
 

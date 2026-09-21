@@ -9,8 +9,25 @@ use crate::utils::constants::*;
 pub struct CoverFetcher {
     cache_dir: PathBuf,
     steamgriddb_api_key: String,
-    /// 复用 HTTP 客户端，避免每次请求都创建新的连接池
+    /// 复用 HTTP 客户端，避免每次请求都创建新的连接池（用于 SteamGridDB API 调用）
     client: Client,
+    /// 图片下载专用客户端：重定向策略比 API 客户端更严（见 `new` 内注释）
+    download_client: Client,
+}
+
+/// SteamGridDB 图源域名白名单（子域一并放行）
+const TRUSTED_COVER_HOSTS: &[&str] = &["steamgriddb.com"];
+
+/// URL 是否落在受信任的图源域名下（含子域，大小写不敏感）
+fn is_trusted_cover_host(url: &reqwest::Url) -> bool {
+    url.host_str()
+        .map(|h| h.to_ascii_lowercase())
+        .map(|h| {
+            TRUSTED_COVER_HOSTS
+                .iter()
+                .any(|t| h == *t || h.ends_with(&format!(".{t}")))
+        })
+        .unwrap_or(false)
 }
 
 impl CoverFetcher {
@@ -23,10 +40,23 @@ impl CoverFetcher {
             .build()
             .context("无法创建 HTTP 客户端")?;
 
+        // 下载客户端单独一份。图源 URL 有两个来源：SteamGridDB 的**第三方响应**，
+        // 以及用户在设置页**手动粘贴**的地址 —— 都不是本应用能控制的内容。
+        // reqwest 默认最多跟随 10 跳且允许跨主机，图源一旦用 302 把请求引向
+        // 内网/本机端点，就是一次 SSRF。这里收紧到 3 跳（正常图床 0~1 跳），
+        // 并配合 `download_image` 的 scheme 校验、域名白名单与体积上限三层防线。
+        // API 客户端保持默认策略：SteamGridDB 的 API 端点可能合法依赖重定向。
+        let download_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(COVER_FETCH_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::limited(3))
+            .build()
+            .context("无法创建图片下载 HTTP 客户端")?;
+
         Ok(Self {
             cache_dir,
             steamgriddb_api_key,
             client,
+            download_client,
         })
     }
 
@@ -61,7 +91,7 @@ impl CoverFetcher {
             // 用游戏名搜索
             match self.search_steamgriddb(&game.name).await {
                 Ok(Some(cover_url)) => {
-                    if let Ok(actual_path) = self.download_image(&cover_url, &cache_path).await {
+                    if let Ok(actual_path) = self.download_image(&cover_url, &cache_path, true).await {
                         return Ok(Some(actual_path.to_string_lossy().to_string()));
                     }
                 }
@@ -80,7 +110,7 @@ impl CoverFetcher {
                         tracing::info!("尝试用文件夹名搜索封面: {}", folder);
                         match self.search_steamgriddb(folder).await {
                             Ok(Some(cover_url)) => {
-                                if let Ok(actual_path) = self.download_image(&cover_url, &cache_path).await {
+                                if let Ok(actual_path) = self.download_image(&cover_url, &cache_path, true).await {
                                     return Ok(Some(actual_path.to_string_lossy().to_string()));
                                 }
                             }
@@ -109,7 +139,7 @@ impl CoverFetcher {
             let cache_path = self.get_cache_path(id);
             match self.search_steamgriddb(name).await {
                 Ok(Some(cover_url)) => {
-                    if let Ok(actual_path) = self.download_image(&cover_url, &cache_path).await {
+                    if let Ok(actual_path) = self.download_image(&cover_url, &cache_path, true).await {
                         return Ok(Some(actual_path.to_string_lossy().to_string()));
                     }
                 }
@@ -361,10 +391,13 @@ impl CoverFetcher {
         Ok(options)
     }
 
-    /// 从 URL 下载图片到指定路径（供外部调用）
-    /// 返回实际写入的文件路径（按图片内容决定扩展名）
+    /// 从 URL 下载图片到指定路径（**用户提供的地址**，供外部调用）
+    ///
+    /// 刻意**不施加域名白名单**：在设置页手动粘贴任意网图当封面是保留的既有功能。
+    /// 但仍受 scheme 校验、重定向跳数限制（3 跳）与体积上限（20MB）约束。
+    /// 返回实际写入的文件路径（按图片内容决定扩展名）。
     pub async fn download_from_url(&self, url: &str, save_path: &Path) -> Result<PathBuf> {
-        self.download_image(url, save_path).await
+        self.download_image(url, save_path, false).await
     }
 
     /// 根据文件头魔数检测图片格式，返回扩展名（jpg/png/webp）
@@ -385,16 +418,63 @@ impl CoverFetcher {
     }
 
     /// 下载图片（异步）
+    ///
+    /// `enforce_trusted_host`：是否要求 URL（含重定向后的最终 URL）落在 SteamGridDB
+    /// 域名下。SteamGridDB 返回的图源属**第三方响应**，必须校验；用户在设置页手动
+    /// 粘贴的地址不校验（保留「任选网图当封面」的既有自由度）。
+    ///
+    /// 三道防线：① 仅允许 http(s) 协议；② 体积硬上限，在流式读取中截断
+    /// （只预检 `Content-Length` 不够——服务端可以省略或谎报）；③ 可选域名白名单。
+    ///
     /// 校验内容魔数并按实际格式保存（避免 .jpg 扩展名存 PNG 导致 MIME 误判），
-    /// 返回实际写入的文件路径
-    async fn download_image(&self, url: &str, save_path: &Path) -> Result<PathBuf> {
-        let response = self.client.get(url).send().await?;
+    /// 返回实际写入的文件路径。
+    async fn download_image(
+        &self,
+        url: &str,
+        save_path: &Path,
+        enforce_trusted_host: bool,
+    ) -> Result<PathBuf> {
+        // ① 协议校验：reqwest 本身只支持 http(s)，显式拒绝是为了让日志给出确切原因
+        let parsed =
+            reqwest::Url::parse(url).with_context(|| format!("封面 URL 格式不合法: {url}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            anyhow::bail!("拒绝下载非 http(s) 协议的封面: {}", parsed.scheme());
+        }
+        if enforce_trusted_host && !is_trusted_cover_host(&parsed) {
+            anyhow::bail!("拒绝下载非 SteamGridDB 域名的图源: {url}");
+        }
+
+        let mut response = self.download_client.get(url).send().await?;
 
         if !response.status().is_success() {
             anyhow::bail!("下载失败: HTTP {}", response.status());
         }
 
-        let bytes = response.bytes().await?;
+        // 重定向后可能落到别的域名——白名单必须对**最终 URL** 再校验一次
+        if enforce_trusted_host && !is_trusted_cover_host(response.url()) {
+            anyhow::bail!("封面下载被重定向到非信任域名: {}", response.url());
+        }
+
+        // ② 体积上限：先按声明值快速拒绝，再在流式读取中硬性截断
+        if let Some(len) = response.content_length() {
+            if len > COVER_MAX_FILE_SIZE {
+                anyhow::bail!(
+                    "下载失败: 响应声明大小 {} 字节，超过上限 {} 字节",
+                    len,
+                    COVER_MAX_FILE_SIZE
+                );
+            }
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len() as u64 + chunk.len() as u64 > COVER_MAX_FILE_SIZE {
+                anyhow::bail!(
+                    "下载失败: 响应内容超过上限 {} 字节，已中断",
+                    COVER_MAX_FILE_SIZE
+                );
+            }
+            bytes.extend_from_slice(&chunk);
+        }
 
         // 检查下载的内容是否有效（至少 100 字节）
         if (bytes.len() as u64) < COVER_MIN_FILE_SIZE {

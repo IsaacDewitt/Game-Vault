@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import {
   NModal,
   NButton,
@@ -50,6 +50,11 @@ const hltbMainStory = ref<number | null>(null);
 const hltbMainExtra = ref<number | null>(null);
 const hltbCompletionist = ref<number | null>(null);
 const savePaths = ref<string[]>([]);
+const launchArgs = ref("");
+
+// 启动参数仅对本地游戏有意义：Steam/Epic 由客户端自己拉起并套用它自身的启动选项，
+// 我们塞参数过去也不会被转交（见 core/launcher.rs 的平台分流注释）
+const isLocalGame = computed(() => (props.game.platform ?? "local") === "local");
 
 // 从 game 初始化表单
 function initForm() {
@@ -68,6 +73,7 @@ function initForm() {
   hltbMainExtra.value = props.game.hltb_main_extra ?? null;
   hltbCompletionist.value = props.game.hltb_completionist ?? null;
   savePaths.value = [...(props.game.save_paths ?? [])];
+  launchArgs.value = props.game.launch_args ?? "";
 }
 
 watch(() => props.show, (val) => {
@@ -97,16 +103,20 @@ function formatTimestamp(ts: number | null): string | null {
 async function handleSave() {
   saving.value = true;
   try {
+    // 键名必须 camelCase：Tauri 按 camelCase 查键，snake_case 会被静默当成"没提交"
+    // （见 lib/tauri.ts 里 GameMetaInput 的说明——0.8.3 之前这里一直是写不进去的）
     await store.updateGameMeta(props.game.id, {
       description: description.value || null,
       developer: developer.value || null,
       publisher: publisher.value || null,
-      release_date: formatTimestamp(releaseDate.value),
+      releaseDate: formatTimestamp(releaseDate.value),
       genres: genres.value.length > 0 ? genres.value : null,
-      hltb_main_story: hltbMainStory.value,
-      hltb_main_extra: hltbMainExtra.value,
-      hltb_completionist: hltbCompletionist.value,
-      save_paths: savePaths.value.filter((p) => p.trim() !== ""),
+      hltbMainStory: hltbMainStory.value,
+      hltbMainExtra: hltbMainExtra.value,
+      hltbCompletionist: hltbCompletionist.value,
+      savePaths: savePaths.value.filter((p) => p.trim() !== ""),
+      // 空串即清空（后端按 trim 后为空处理）
+      launchArgs: launchArgs.value.trim(),
     });
     message.success("游戏信息已保存");
     emit("saved");
@@ -243,6 +253,21 @@ async function handleSave() {
           添加路径
         </n-button>
       </div>
+
+      <!-- 启动参数（仅本地游戏；平台游戏由客户端掌管启动选项） -->
+      <div v-if="isLocalGame" class="form-field">
+        <label>启动参数</label>
+        <n-input
+          v-model:value="launchArgs"
+          placeholder="例如 -savetouserdir"
+          clearable
+        />
+        <div class="form-hint">
+          原样追加到 exe 之后，等价于写进 bat 启动器（如《寂静岭 f》需要
+          <code>-savetouserdir</code>）。未经 cmd.exe，故环境变量
+          <code>%USERPROFILE%</code> 不会展开，需要路径请写绝对路径。
+        </div>
+      </div>
     </div>
 
     <template #footer>
@@ -315,5 +340,20 @@ async function handleSave() {
 
 .save-path-row .n-input {
   flex: 1;
+}
+
+.form-hint {
+  font-size: 12px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.form-hint code {
+  font-family: Consolas, Monaco, monospace;
+  font-size: 11px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.7);
 }
 </style>

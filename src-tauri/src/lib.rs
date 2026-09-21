@@ -3,11 +3,53 @@ mod core;
 mod models;
 mod utils;
 
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicBool, Ordering}};
 use tauri::{Emitter, Manager};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButtonState, MouseButton};
 use tauri::menu::{Menu, MenuItem};
 use tauri::webview::WebviewWindowBuilder;
+
+/// 后台轮询线程的唤醒信号。
+///
+/// 空闲期（无活跃会话也无待命会话）线程阻塞在此等待，`launch_game` 插入会话后
+/// 调 `notify()` 立刻叫醒它——因此「点击启动 → 开始找进程」之间没有等待空窗，
+/// 不必靠缩短空闲心跳来换取响应速度。
+///
+/// 用「标志位 + 条件变量」而不是裸 `Condvar`：通知方先置位再 signal，
+/// 等待方检查标志位后才睡，这样即使 signal 早于 wait 到达（线程正在跑上一轮、
+/// 尚未进入等待）也不会丢通知——裸 Condvar 的经典竞态。
+pub(crate) struct PollWakeup {
+    signaled: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl PollWakeup {
+    pub(crate) fn new() -> Self {
+        Self {
+            signaled: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// 通知后台线程立即醒一轮
+    pub(crate) fn notify(&self) {
+        let mut guard = self.signaled.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = true;
+        self.cv.notify_one();
+    }
+
+    /// 等待最多 `timeout`；期间被 `notify` 则立即返回
+    pub(crate) fn wait(&self, timeout: std::time::Duration) {
+        let mut guard = self.signaled.lock().unwrap_or_else(|e| e.into_inner());
+        if !*guard {
+            guard = match self.cv.wait_timeout(guard, timeout) {
+                Ok((g, _)) => g,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        *guard = false;
+    }
+}
 
 /// 双写日志：同时输出到 stderr（开发时终端可见）与日志文件（正式版可排查）
 struct MultiLogWriter {
@@ -96,6 +138,136 @@ fn create_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 把主窗口唤醒到最前（「二次双击 exe」/「托盘单击」/「托盘菜单显示」三处共用）。
+///
+/// 旧实现只有 `show() + set_focus()`，2026-09-17 实弹复现「双击 exe 全无反应」，原因有三：
+///
+/// 1. **`show()` 救不了最小化**：最小化不是隐藏，`ShowWindow(SW_SHOW)` 不会还原它，必须显式
+///    `unminimize()`（`SW_RESTORE`）。探针实测窗口 `iconic` 恒为 True —— 用户点过最小化按钮后
+///    再双击 exe，旧实现到此就断了。
+/// 2. **`set_focus()` 会被 Windows 前台锁拒绝**：底层 `SetForegroundWindow` 只放行前台进程
+///    （或被前台进程启动者），而执行它的是**后台已运行的老进程**，不满足条件，调用被静默拒绝
+///    （返回值仍可能为 Ok，无法靠返回值判断）。窗口还原了也跳不到最前，只会让任务栏按钮闪一下。
+///    兜底：置顶（TOPMOST）**不受前台锁约束**，短暂置顶即可把窗口强行推到 Z 序顶端，抢到后
+///    立刻撤销，不留副作用。
+/// 3. **tao 的窗口操作有「标志位缓存 + 异步投递」**（tao-0.35.3 `set_focus()` / `window_state.rs`）：
+///    `set_focus` 的前置条件是 `is_visible && !is_minimized`（读 **tao 内部标志**，非 Win32 实时
+///    状态），而 `set_visible()` 是 `execute_in_thread` 投递。若从非事件循环线程调用，`show()`
+///    还在排队、`set_focus()` 就读到过期的「不可见」标志而被**整段跳过** —— 窗口显示了却抢不到
+///    前台。故本函数把唤醒动作整体投递到主线程执行，使 `show/unminimize` 在事件循环线程上同步
+///    生效，消除竞态。
+///
+/// 策略：常规路径零副作用（`set_focus`），以 **Win32 实际前台窗口**校验；只有确认没抢到才抖置顶，
+/// 抖动前记下原置顶态、事后精确恢复。
+fn focus_main_window(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    // 见上文第 3 点：投递到主线程，保证 tao 标志位与 Win32 状态同步
+    if app.run_on_main_thread(move || wake_main_window(&handle)).is_err() {
+        tracing::warn!("[唤醒] 无法投递到主线程（事件循环已退出？），就地尝试");
+        wake_main_window(app);
+    }
+}
+
+/// 唤醒的实际动作，必须在事件循环线程上执行（由 `focus_main_window` 投递）。
+fn wake_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        tracing::warn!("[唤醒] 未找到主窗口（label=main），放弃");
+        return;
+    };
+
+    let mut used_on_top_fallback = false;
+    // 两轮：正常一轮即够；留一轮兜住「还原动画未结束 / 刚被别的窗口抢走前台」的偶发情况
+    for attempt in 0..2 {
+        // ① Win32 直达还原：**不经过 tao 的标志位缓存**。
+        //    tao 的 show() 走 `apply_diff`，标志无变化时直接 early return、根本不下发
+        //    ShowWindow；一旦 tao 内部标志与窗口真实状态不一致（外部工具/注入式覆盖层
+        //    改过窗口状态即可造成），标准的 show() 会变成空操作，窗口永远弹不出来。
+        //    这里以 Win32 实时状态为准兜底，确保「可见」这一硬目标一定达成。
+        force_show_window(&window);
+        // ② Tauri 侧同步（同时把 tao 的标志位拉回与真实状态一致）
+        let _ = window.unminimize();
+        let _ = window.show();
+        // ③ 常规抢前台：无副作用
+        let _ = window.set_focus();
+        if is_foreground(&window) {
+            break;
+        }
+
+        // ④ 前台锁兜底：置顶不受 SetForegroundWindow 的前台限制约束
+        used_on_top_fallback = true;
+        let was_on_top = window.is_always_on_top().unwrap_or(false);
+        let _ = window.set_always_on_top(true);
+        let _ = window.set_focus();
+        let _ = window.set_always_on_top(was_on_top);
+        if is_foreground(&window) {
+            break;
+        }
+        if attempt == 0 {
+            // 仅在真失败时等一小会儿再重试（唤醒场景下阻塞几十毫秒无感）
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+    }
+
+    tracing::info!(
+        "[唤醒] 主窗口已唤醒: 前台={} 置顶兜底={} 最小化={} 可见={}",
+        is_foreground(&window),
+        used_on_top_fallback,
+        window.is_minimized().unwrap_or(false),
+        window.is_visible().unwrap_or(false),
+    );
+}
+
+/// 以 Win32 实时状态为准，强制把窗口变得可见且非最小化。
+///
+/// 存在的理由：tao 的 `show()`/`unminimize()` 都是「先改内部标志位、再按 diff 决定是否调用
+/// Win32」的写法（见 `window_state.rs` 的 `apply_diff`：`if diff == empty { return }`）。
+/// 只要 tao 标志与窗口真实状态不一致——例如被外部工具改动过窗口状态——标准的 `show()` 就
+/// 会变成**空操作**，窗口永远弹不出来。此处直接查 `IsIconic`/`IsWindowVisible` 真实状态并
+/// 下发 `SW_RESTORE`/`SW_SHOW`，绕开标志缓存，保证「看得见」这个硬目标必达。
+///
+/// 非 Windows 平台无此隐患（也是 `is_foreground` 之外的唯一平台相关代码），直接返回。
+#[cfg(target_os = "windows")]
+fn force_show_window(window: &tauri::WebviewWindow) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, ShowWindow, SW_RESTORE, SW_SHOW};
+    let Ok(handle) = window.hwnd() else {
+        return;
+    };
+    let hwnd = HWND(handle.0);
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            // 最小化：SW_RESTORE 一步还原并激活
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        } else if !IsWindowVisible(hwnd).as_bool() {
+            // 仅被隐藏（关闭到托盘）：SW_SHOW 显示（不激活，激活交给后续 set_focus）
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
+        // 已可见且非最小化：什么都不做，保持零副作用
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn force_show_window(_window: &tauri::WebviewWindow) {}
+
+/// 窗口是否就是当前前台窗口。
+///
+/// 刻意查 **Win32 的 `GetForegroundWindow`** 而非 tao 的 `is_focused()`：后者读的是 tao 内部
+/// 标志，需等窗口处理完 `WM_ACTIVATE` 才更新，`force_window_active` 刚调用完时可能仍为 false，
+/// 会造成「明明成功却误判失败」而多抖一次置顶。
+#[cfg(target_os = "windows")]
+fn is_foreground(window: &tauri::WebviewWindow) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let Ok(handle) = window.hwnd() else {
+        return false;
+    };
+    unsafe { GetForegroundWindow().0 as isize == handle.0 as isize }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_foreground(window: &tauri::WebviewWindow) -> bool {
+    window.is_focused().unwrap_or(false)
+}
+
 /// 优雅退出：通知后台线程、持久化活跃会话、清除启动标记、退出进程
 fn graceful_exit(app: &tauri::AppHandle) {
     // 通知后台监控线程退出（Release 保证写入对后台线程可见）
@@ -172,11 +344,9 @@ pub fn run() {
             Some(vec![]),
         ))
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // 当用户尝试打开第二个实例时，将已有窗口显示到前台
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            // 用户再次双击 game-vault.exe：不新开实例，把已有窗口唤到最前
+            tracing::info!("[唤醒] 检测到第二个实例启动，唤醒已有窗口");
+            focus_main_window(app);
         }))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
@@ -221,9 +391,13 @@ pub fn run() {
             let tracker = core::PlayTimeTracker::new();
             let tracker = Arc::new(Mutex::new(tracker));
 
+            // 后台轮询线程的唤醒信号：空闲期靠它在「点击启动」时立刻醒来（见 PollWakeup）
+            let wakeup = Arc::new(PollWakeup::new());
+
             // 注册状态
             app.manage(db.clone());
             app.manage(tracker.clone());
+            app.manage(wakeup.clone());
 
             // 成就系统：启动结算存量数据（静默，不弹通知）
             // 挪到后台线程并稍作延迟 —— 该结算需独占 DB 锁，留在 setup 里既推迟
@@ -273,6 +447,7 @@ pub fn run() {
             let app_handle = app.handle().clone();
             let running = Arc::new(AtomicBool::new(true));
             let running_clone = running.clone();
+            let wakeup_thread = wakeup.clone();
 
             // 启动后延迟清理过期游玩明细（一次性后台任务，不阻塞启动）
             // 清理只删明细行，日/时段汇总表与 games 聚合字段不受影响
@@ -303,20 +478,29 @@ pub fn run() {
 
             std::thread::spawn(move || {
                 while running_clone.load(Ordering::Acquire) {
-                    std::thread::sleep(std::time::Duration::from_secs(utils::constants::PROCESS_POLL_INTERVAL_SECS));
-
-                    // 快速检查是否有待处理工作（活跃会话或待命会话）；
-                    // 两者皆空则跳过进程扫描，避免空转 CPU 开销。
-                    // 注意：待命会话（平台游戏刚发起启动请求）也必须纳入判断，
+                    // 两种节奏（2026-09-19）：
+                    // - 有活（活跃会话或待命会话）→ 1 秒一拍，检测要快；
+                    // - 空闲 → 阻塞等待唤醒，10 秒兜底（与旧版开销持平，不因改 1s 而变差）。
+                    // 待命会话（平台游戏刚发起启动请求）也必须算「有活」，
                     // 否则它永远等不到转正的机会。
-                    {
+                    let busy = {
                         let tracker = match tracker_arc.lock() {
                             Ok(guard) => guard,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        if !tracker.has_pending_work() {
-                            continue;
-                        }
+                        tracker.has_pending_work()
+                    };
+
+                    if busy {
+                        std::thread::sleep(std::time::Duration::from_secs(
+                            utils::constants::PROCESS_POLL_INTERVAL_SECS,
+                        ));
+                    } else {
+                        // 空闲期睡到「点击启动」把它叫醒，或 10 秒兜底。
+                        // 醒来后即使仍无活也无妨：check_active_sessions 对空状态零成本。
+                        wakeup_thread.wait(std::time::Duration::from_secs(
+                            utils::constants::PROCESS_POLL_IDLE_SECS,
+                        ));
                     }
 
                     // 阶段 1：检查会话，收集本轮产出，然后释放 Tracker 锁
@@ -492,12 +676,7 @@ pub fn run() {
                 .menu(&menu)
                 .on_menu_event(|app, event| {
                     match event.id.as_ref() {
-                        "show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
+                        "show" => focus_main_window(app),
                         "quit" => {
                             graceful_exit(app);
                         }
@@ -511,11 +690,7 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+                        focus_main_window(tray.app_handle());
                     }
                 })
                 .build(app)?;

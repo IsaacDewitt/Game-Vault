@@ -23,6 +23,7 @@ const emit = defineEmits<{
   rename: [];
   refreshInfo: [];
   editInfo: [];
+  setLaunchArgs: [];
   removeCover: [];
   toggleCompleted: [];
   openScreenshots: [];
@@ -34,62 +35,69 @@ const contextMenuY = ref(0);
 
 const { coverImage, imgFailed, handleImageError } = useCoverImage(toRef(props, "game"));
 
-const contextMenuItems = computed<ContextMenuItem[]>(() => [
-  {
-    label: "启动游戏",
-    icon: "▶",
-    action: () => emit("launch"),
-  },
-  {
-    label: props.game.is_favorite ? "取消收藏" : "添加收藏",
-    icon: props.game.is_favorite ? "💔" : "❤️",
-    action: () => emit("favorite"),
-  },
-  { label: "", action: () => {}, divider: true },
-  {
-    label: props.game.status === "completed" ? "取消通关" : "标记为已通关",
-    icon: props.game.status === "completed" ? "🎮" : "🏆",
-    action: () => emit("toggleCompleted"),
-  },
-  { label: "", action: () => {}, divider: true },
-  {
-    label: "查看详情",
-    icon: "📋",
-    action: () => emit("click"),
-  },
-  {
-    label: "打开截图文件夹",
-    icon: "🖼️",
-    action: () => emit("openScreenshots"),
-  },
-  {
-    label: "重命名游戏",
-    icon: "✏️",
-    action: () => emit("rename"),
-  },
-  {
-    label: "使用 LLM 刷新",
-    icon: "🤖",
-    action: () => emit("refreshInfo"),
-  },
-  {
-    label: "手动填写信息",
-    icon: "✏️",
-    action: () => emit("editInfo"),
-  },
-  {
-    label: "删除封面",
-    icon: "🖼️",
-    action: () => emit("removeCover"),
-  },
-  { label: "", action: () => {}, divider: true },
-  {
-    label: "删除游戏",
-    icon: "🗑️",
-    action: () => emit("delete"),
-    danger: true,
-  },
-]);
+const contextMenuItems = computed<ContextMenuItem[]>(() => {
+  const items: ContextMenuItem[] = [
+    {
+      label: "启动游戏",
+      icon: "▶",
+      action: () => emit("launch"),
+    },
+    { label: "", action: () => {}, divider: true },
+    {
+      label: props.game.status === "completed" ? "取消通关" : "标记为已通关",
+      icon: props.game.status === "completed" ? "🎮" : "🏆",
+      action: () => emit("toggleCompleted"),
+    },
+    { label: "", action: () => {}, divider: true },
+  ];
+
+  // 启动参数只对本地游戏有意义：Steam/Epic 由客户端自己拉起并套用它自身的启动选项，
+  // 我们塞参数过去不会被转交，所以平台游戏不显示该项（避免填了以为生效）
+  if ((props.game.platform ?? "local") === "local") {
+    items.push({
+      label: "设置启动参数",
+      icon: "⚙️",
+      action: () => emit("setLaunchArgs"),
+    });
+  }
+
+  items.push(
+    {
+      label: "打开截图文件夹",
+      icon: "🖼️",
+      action: () => emit("openScreenshots"),
+    },
+    {
+      label: "重命名游戏",
+      icon: "✏️",
+      action: () => emit("rename"),
+    },
+    {
+      label: "使用 LLM 刷新",
+      icon: "🤖",
+      action: () => emit("refreshInfo"),
+    },
+    {
+      label: "手动填写信息",
+      icon: "✏️",
+      action: () => emit("editInfo"),
+    },
+    {
+      label: "删除封面",
+      icon: "🖼️",
+      action: () => emit("removeCover"),
+    },
+    { label: "", action: () => {}, divider: true },
+    {
+      label: "删除游戏",
+      icon: "🗑️",
+      action: () => emit("delete"),
+      danger: true,
+    }
+  );
+
+  return items;
+});
 
 function handleContextMenu(e: MouseEvent) {
   e.preventDefault();

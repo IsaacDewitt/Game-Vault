@@ -190,14 +190,27 @@ fn encode_lossless_webp(img: &image::DynamicImage) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// 生成缩略图字节：先等比缩到长边 ≤256，再按透明度选编码
-fn build_thumb(img: &image::DynamicImage) -> Result<Vec<u8>> {
+/// 生成缩略图：先等比缩到长边 ≤256，再按透明度选编码。
+///
+/// 返回 `(字节, 宽, 高, 扩展名)`——三者**都由真正落盘的那张缩略图导出**，一次算清：
+/// - 早前两个调用方拿到字节后各自又 `img.thumbnail()` 重算一遍，**只为读宽高**，
+///   白费一次原图重采样（缩略图必须从原图重采样，DynamicImage 不缓存中间结果）；
+/// - 扩展名判定也曾被逐字复制在 `prepare_bytes` 与 `register_in_place` 两处，
+///   一旦编码策略变更而漏改其一，索引里的 rel_path 就会与实际文件后缀不符，
+///   封面直接"凭空消失"。
+///
+/// 扩展名仍按**编码结果的容器魔数**判定（而非复述 has_real_alpha），与旧行为逐字节一致。
+fn build_thumb(img: &image::DynamicImage) -> Result<(Vec<u8>, u32, u32, &'static str)> {
     let thumb = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
-    if has_real_alpha(&thumb) {
-        encode_lossless_webp(&thumb)
+    let (width, height) = (thumb.width(), thumb.height());
+    let bytes = if has_real_alpha(&thumb) {
+        encode_lossless_webp(&thumb)?
     } else {
-        encode_jpeg(&thumb, THUMB_JPEG_QUALITY)
-    }
+        encode_jpeg(&thumb, THUMB_JPEG_QUALITY)?
+    };
+    // WebP 是 RIFF 容器（魔数 RIFF），JPEG 为 FFD8，二者不重叠
+    let ext = if bytes.starts_with(b"RIFF") { "webp" } else { "jpg" };
+    Ok((bytes, width, height, ext))
 }
 
 /// 主图落盘字节：不透明 PNG 转 JPEG 省体积，其余原样保留
@@ -263,8 +276,7 @@ pub fn prepare_bytes(owner_kind: &str, owner_id: &str, bytes: &[u8]) -> Result<P
     let (width, height) = (img.width(), img.height());
 
     let (main_bytes, main_ext) = build_main(&img, bytes, format)?;
-    let thumb_bytes = build_thumb(&img)?;
-    let thumb_ext = if thumb_bytes.starts_with(b"RIFF") { "webp" } else { "jpg" };
+    let (thumb_bytes, thumb_width, thumb_height, thumb_ext) = build_thumb(&img)?;
 
     let main_rel = format!("{}.{}", owner_id, main_ext);
     let thumb_rel = format!("thumb/{}.{}", owner_id, thumb_ext);
@@ -272,7 +284,6 @@ pub fn prepare_bytes(owner_kind: &str, owner_id: &str, bytes: &[u8]) -> Result<P
     write_atomic(&abs_path(&thumb_rel), &thumb_bytes)?;
 
     let now = now_rfc3339();
-    let thumb_img = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
     Ok(PreparedCover {
         rows: vec![
             CoverIndexRow {
@@ -293,8 +304,8 @@ pub fn prepare_bytes(owner_kind: &str, owner_id: &str, bytes: &[u8]) -> Result<P
                 kind: KIND_THUMB.to_string(),
                 rel_path: thumb_rel,
                 sha256: sha256_hex(&thumb_bytes),
-                width: thumb_img.width(),
-                height: thumb_img.height(),
+                width: thumb_width,
+                height: thumb_height,
                 bytes: thumb_bytes.len() as u64,
                 state: STATE_ACTIVE.to_string(),
                 updated_at: now,
@@ -404,15 +415,13 @@ pub fn register_in_place(
     };
     let bytes = std::fs::read(src)?;
     let img = image::load_from_memory(&bytes).context("无法解码图片")?;
-    let thumb_bytes = build_thumb(&img)?;
-    let thumb_ext = if thumb_bytes.starts_with(b"RIFF") { "webp" } else { "jpg" };
+    let (thumb_bytes, thumb_width, thumb_height, thumb_ext) = build_thumb(&img)?;
     let thumb_rel = format!("thumb/{}.{}", owner_id, thumb_ext);
     // 缩略图已存在且非空则不覆盖（幂等）
     let thumb_abs = abs_path(&thumb_rel);
     if !thumb_abs.exists() {
         write_atomic(&thumb_abs, &thumb_bytes)?;
     }
-    let thumb_img = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
 
     let now = now_rfc3339();
     let rows = vec![
@@ -434,8 +443,8 @@ pub fn register_in_place(
             kind: KIND_THUMB.to_string(),
             rel_path: thumb_rel.clone(),
             sha256: sha256_hex(&thumb_bytes),
-            width: thumb_img.width(),
-            height: thumb_img.height(),
+            width: thumb_width,
+            height: thumb_height,
             bytes: thumb_bytes.len() as u64,
             state: STATE_ACTIVE.to_string(),
             updated_at: now,
@@ -609,6 +618,116 @@ pub fn sync_owner_paths(db: &Database, owner_kind: &str, owner_id: &str) -> Resu
 const MIGRATION_FLAG: &str = "covers_index_v1_done";
 /// 强制重跑标记（置 1 → 下次启动重跑迁移）
 const MIGRATION_FLAG_AGAIN: &str = "covers_index_v1_rerun";
+
+
+
+/// 存量封面迁移（幂等，靠 settings 标记防重跑）：
+/// 1. 把 games/reviews 现有封面登记进索引表；在 covers 目录内的文件原样保留，只补缩略图；
+///    目录外的（历史手工路径）转码入库。
+/// 2. 已移除条目（墓碑）没有封面时，按同名/英文名从手账条目**共享**一张过来
+///    （这就是 Mafia: The Old Country 那类"游戏删了、手账里还留着图"的救图路径）。
+pub fn migrate(db: &Database) -> Result<CoverMigrateReport> {
+    let done = db.get_setting(MIGRATION_FLAG)?.as_deref() == Some("1");
+    let rerun = db.get_setting(MIGRATION_FLAG_AGAIN)?.as_deref() == Some("1");
+    if done && !rerun {
+        return Ok(CoverMigrateReport::default());
+    }
+    db.ensure_cover_storage()?;
+
+    let mut report = CoverMigrateReport {
+        bytes_before: dir_size(&path::get_covers_dir()),
+        ..Default::default()
+    };
+
+    // ---- 第 1 步：现有游戏 / 手账封面入索引 ----
+    let mut owners: Vec<(String, String, Option<String>)> = Vec::new();
+    for game in db.get_games(&Default::default())? {
+        owners.push((
+            OWNER_GAME.to_string(),
+            game.id,
+            game.cover_local.or(game.cover_url),
+        ));
+    }
+    for review in db.get_reviews(&Default::default())? {
+        owners.push((
+            OWNER_REVIEW.to_string(),
+            review.id,
+            review.cover_local.or(review.cover_url),
+        ));
+    }
+
+    for (kind, id, cover_path) in owners {
+        if !db.cover_rows(&kind, &id)?.is_empty() {
+            continue; // 已登记
+        }
+        let Some(path_str) = cover_path else { continue };
+        let src = Path::new(&path_str);
+        if !src.exists() {
+            report.missing_file += 1;
+            continue;
+        }
+        match migrate_existing_cover(db, &kind, &id, src) {
+            Ok(true) => report.indexed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!("封面迁移失败 {} {}: {}", kind, id, e);
+            }
+        }
+    }
+
+    // ---- 第 2 步：已移除条目回挂（墓碑 ← 同名手账） ----
+    for (tomb_id, name) in db.all_tombstones()? {
+        if !db.cover_rows(OWNER_GAME, &tomb_id)?.is_empty() {
+            continue;
+        }
+        let Some(review_id) = db.find_review_id_by_game_name(&name)? else {
+            continue;
+        };
+        match share_from(db, OWNER_REVIEW, &review_id, OWNER_GAME, &tomb_id, STATE_ARCHIVED) {
+            Ok(true) => {
+                report.relinked += 1;
+                tracing::info!("已移除条目「{}」从手账回挂封面", name);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!("回挂封面失败 {}: {}", name, e);
+            }
+        }
+    }
+
+    report.bytes_after = dir_size(&path::get_covers_dir());
+    db.set_setting(MIGRATION_FLAG, "1")?;
+    db.set_setting(MIGRATION_FLAG_AGAIN, "0")?;
+    tracing::info!(
+        "封面迁移完成：登记 {}，回挂 {}，缺文件 {}，失败 {}，目录 {} → {} 字节",
+        report.indexed,
+        report.relinked,
+        report.missing_file,
+        report.failed,
+        report.bytes_before,
+        report.bytes_after
+    );
+    Ok(report)
+}
+
+/// 目录占用（含子目录），用于迁移前后体积对比
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            total += dir_size(&p);
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
+}
 
 #[cfg(test)]
 mod tests {
@@ -916,112 +1035,4 @@ mod tests {
             println!("墓碑「{}」封面行数 = {}", name, rows.len());
         }
     }
-}
-
-/// 存量封面迁移（幂等，靠 settings 标记防重跑）：
-/// 1. 把 games/reviews 现有封面登记进索引表；在 covers 目录内的文件原样保留，只补缩略图；
-///    目录外的（历史手工路径）转码入库。
-/// 2. 已移除条目（墓碑）没有封面时，按同名/英文名从手账条目**共享**一张过来
-///    （这就是 Mafia: The Old Country 那类"游戏删了、手账里还留着图"的救图路径）。
-pub fn migrate(db: &Database) -> Result<CoverMigrateReport> {
-    let done = db.get_setting(MIGRATION_FLAG)?.as_deref() == Some("1");
-    let rerun = db.get_setting(MIGRATION_FLAG_AGAIN)?.as_deref() == Some("1");
-    if done && !rerun {
-        return Ok(CoverMigrateReport::default());
-    }
-    db.ensure_cover_storage()?;
-
-    let mut report = CoverMigrateReport {
-        bytes_before: dir_size(&path::get_covers_dir()),
-        ..Default::default()
-    };
-
-    // ---- 第 1 步：现有游戏 / 手账封面入索引 ----
-    let mut owners: Vec<(String, String, Option<String>)> = Vec::new();
-    for game in db.get_games(&Default::default())? {
-        owners.push((
-            OWNER_GAME.to_string(),
-            game.id,
-            game.cover_local.or(game.cover_url),
-        ));
-    }
-    for review in db.get_reviews(&Default::default())? {
-        owners.push((
-            OWNER_REVIEW.to_string(),
-            review.id,
-            review.cover_local.or(review.cover_url),
-        ));
-    }
-
-    for (kind, id, cover_path) in owners {
-        if !db.cover_rows(&kind, &id)?.is_empty() {
-            continue; // 已登记
-        }
-        let Some(path_str) = cover_path else { continue };
-        let src = Path::new(&path_str);
-        if !src.exists() {
-            report.missing_file += 1;
-            continue;
-        }
-        match migrate_existing_cover(db, &kind, &id, src) {
-            Ok(true) => report.indexed += 1,
-            Ok(false) => {}
-            Err(e) => {
-                report.failed += 1;
-                tracing::warn!("封面迁移失败 {} {}: {}", kind, id, e);
-            }
-        }
-    }
-
-    // ---- 第 2 步：已移除条目回挂（墓碑 ← 同名手账） ----
-    for (tomb_id, name) in db.all_tombstones()? {
-        if !db.cover_rows(OWNER_GAME, &tomb_id)?.is_empty() {
-            continue;
-        }
-        let Some(review_id) = db.find_review_id_by_game_name(&name)? else {
-            continue;
-        };
-        match share_from(db, OWNER_REVIEW, &review_id, OWNER_GAME, &tomb_id, STATE_ARCHIVED) {
-            Ok(true) => {
-                report.relinked += 1;
-                tracing::info!("已移除条目「{}」从手账回挂封面", name);
-            }
-            Ok(false) => {}
-            Err(e) => {
-                report.failed += 1;
-                tracing::warn!("回挂封面失败 {}: {}", name, e);
-            }
-        }
-    }
-
-    report.bytes_after = dir_size(&path::get_covers_dir());
-    db.set_setting(MIGRATION_FLAG, "1")?;
-    db.set_setting(MIGRATION_FLAG_AGAIN, "0")?;
-    tracing::info!(
-        "封面迁移完成：登记 {}，回挂 {}，缺文件 {}，失败 {}，目录 {} → {} 字节",
-        report.indexed,
-        report.relinked,
-        report.missing_file,
-        report.failed,
-        report.bytes_before,
-        report.bytes_after
-    );
-    Ok(report)
-}
-
-/// 目录占用（含子目录），用于迁移前后体积对比
-fn dir_size(dir: &Path) -> u64 {
-    let mut total = 0u64;
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            total += dir_size(&p);
-        } else if let Ok(meta) = entry.metadata() {
-            total += meta.len();
-        }
-    }
-    total
 }

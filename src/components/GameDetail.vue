@@ -32,6 +32,8 @@ import {
 } from "@vicons/ionicons5";
 import CoverPickerModal from "./CoverPickerModal.vue";
 import GameInfoEditModal from "./GameInfoEditModal.vue";
+import LaunchArgsModal from "./LaunchArgsModal.vue";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Game, PlaySessionDetail } from "../lib/tauri";
 import * as api from "../lib/tauri";
@@ -79,6 +81,26 @@ const fetchingLlm = ref(false);
 const showCoverPicker = ref(false);
 // 手动填写信息弹窗状态
 const showEditInfoModal = ref(false);
+const showLaunchArgsModal = ref(false);
+
+// ---- 抽屉顶部拖动窗口（2026-09-21） ----
+// 详情抽屉的遮罩铺满整窗，盖住了主标题栏，于是"打开详情就再也拖不动窗口"。
+// 让抽屉 header 承担同样职责：按住拖动移动窗口、双击最大化，手感与主标题栏一致。
+// （header 里目前只有标题文字；将来若加图标按钮，记得给按钮挂 @mousedown.stop）
+let lastHeaderMouseUpTime = 0;
+
+async function handleHeaderDrag(e: MouseEvent) {
+  if (e.button !== 0) return; // 只响应左键
+
+  const now = Date.now();
+  if (now - lastHeaderMouseUpTime < 300) {
+    // 与主标题栏同款：300ms 内再次按下视为双击 → 最大化/还原
+    await getCurrentWindow().toggleMaximize();
+    return;
+  }
+  await getCurrentWindow().startDragging();
+  lastHeaderMouseUpTime = Date.now();
+}
 
 
 // 最近游玩记录
@@ -398,7 +420,7 @@ async function handleRemoveSavePath(index: number) {
   >
     <n-drawer-content :native-scrollbar="false" @contextmenu.prevent>
       <template #header>
-        <div class="detail-header">
+        <div class="detail-header" @mousedown="handleHeaderDrag">
           <span>{{ game.name }}</span>
         </div>
       </template>
@@ -623,7 +645,7 @@ async function handleRemoveSavePath(index: number) {
         </div>
         <div class="info-row clickable" v-if="game.exe_path" @click="handleOpenExeFolder">
           <span class="info-label">可执行文件</span>
-          <span class="info-value path">{{ game.exe_path }}</span>
+          <span class="info-value path selectable">{{ game.exe_path }}</span>
           <n-tooltip trigger="hover">
             <template #trigger>
               <n-icon :component="CreateOutline" size="14" class="edit-icon" @click.stop="handleChangeExePath" />
@@ -634,6 +656,28 @@ async function handleRemoveSavePath(index: number) {
         <div class="info-row" v-if="game.exe_version">
           <span class="info-label">游戏版本</span>
           <span class="info-value">{{ game.exe_version }}</span>
+        </div>
+        <!-- 启动参数：本地游戏**常驻**显示（空值也显示，否则用户找不到这个入口），
+             右侧铅笔图标可编辑。平台游戏不显示——参数由客户端自己掌管 -->
+        <div class="info-row" v-if="(game.platform ?? 'local') === 'local'">
+          <span class="info-label">启动参数</span>
+          <span
+            class="info-value path selectable"
+            :class="{ 'value-empty': !game.launch_args }"
+          >
+            {{ game.launch_args || "未设置" }}
+          </span>
+          <n-tooltip trigger="hover">
+            <template #trigger>
+              <n-icon
+                :component="CreateOutline"
+                size="14"
+                class="edit-icon"
+                @click.stop="showLaunchArgsModal = true"
+              />
+            </template>
+            设置启动参数
+          </n-tooltip>
         </div>
       </div>
 
@@ -656,7 +700,7 @@ async function handleRemoveSavePath(index: number) {
           </n-button>
         </div>
         <div v-if="screenshotInfo" class="screenshot-item" @click="handleOpenScreenshots">
-          <span class="save-path-text" :title="screenshotInfo.path">{{ screenshotInfo.path }}</span>
+          <span class="save-path-text selectable" :title="screenshotInfo.path">{{ screenshotInfo.path }}</span>
           <span v-if="screenshotInfo.count > 0" class="screenshot-count">
             {{ screenshotInfo.count }} 张
           </span>
@@ -690,7 +734,7 @@ async function handleRemoveSavePath(index: number) {
             class="save-path-item clickable"
             @click="handleOpenSavePath(path)"
           >
-            <span class="save-path-text" :title="path">{{ path }}</span>
+            <span class="save-path-text selectable" :title="path">{{ path }}</span>
             <n-icon
               :component="CreateOutline"
               size="14"
@@ -729,6 +773,14 @@ async function handleRemoveSavePath(index: number) {
     @close="showEditInfoModal = false"
     @saved="showEditInfoModal = false"
   />
+
+  <!-- 启动参数弹窗（详情面板入口，与卡片右键菜单共用同一组件） -->
+  <LaunchArgsModal
+    :show="showLaunchArgsModal"
+    :game="game"
+    @close="showLaunchArgsModal = false"
+    @saved="showLaunchArgsModal = false"
+  />
 </template>
 
 <style scoped>
@@ -736,6 +788,9 @@ async function handleRemoveSavePath(index: number) {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* 这块可拖动窗口（见 handleHeaderDrag）：遮罩盖住了主标题栏，这里是详情态唯一的抓手 */
+  cursor: default;
+  user-select: none;
 }
 
 .cover-section {
@@ -836,6 +891,11 @@ async function handleRemoveSavePath(index: number) {
 .info-value.path {
   font-size: 11px;
   word-break: break-all;
+}
+
+/* 未设置参数时的占位文字：压暗一档，与真实值区分 */
+.info-value.value-empty {
+  color: rgba(255, 255, 255, 0.3);
 }
 
 .info-row.clickable {
