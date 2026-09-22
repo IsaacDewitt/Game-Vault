@@ -594,11 +594,12 @@ pub fn run() {
 
             // 注册全局截图热键（默认 F12，与 Steam 一致；仅从本库启动的游戏运行时生效）
             {
-                let hotkey = {
+                let (hotkey, gamepad_hotkey) = {
                     let db_guard = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    models::settings::Settings::load_from_db(&db_guard)
-                        .map(|s| s.screenshot_hotkey)
-                        .unwrap_or_else(|_| "F12".to_string())
+                    match models::settings::Settings::load_from_db(&db_guard) {
+                        Ok(s) => (s.screenshot_hotkey, s.screenshot_gamepad_hotkey),
+                        Err(_) => ("F12".to_string(), String::new()),
+                    }
                 };
 
                 // 记录当前热键（供设置修改时重新注册）
@@ -672,6 +673,66 @@ pub fn run() {
                                  避免替别的程序响应按键；请在设置里换一个快捷键"
                             );
                         }
+                    }
+                }
+
+                // ---- 手柄截图键通道（XInput 轮询，2026-09-22）----
+                // 上面两条键盘通道的前提都是"手在键盘上"；用手柄玩时够不到键盘，故再挂一条。
+                // 命中后调用的是**同一个截图入口**，所以前台匹配、Steam 静默退让、快门音、
+                // 落盘目录全部与键盘通道一致；差异与边界详见 core/gamepad.rs 的文件头。
+                {
+                    let gp_app = app.handle().clone();
+                    let gp_db = db.clone();
+                    let gp_tracker = tracker.clone();
+                    // 省电口径（老爷 2026-09-22 定）：只在"本库有游戏会话在跑"时才读手柄。
+                    // 用 has_pending_work 而不是只看活跃会话——平台游戏刚发起启动时只有待命会话。
+                    let gate_tracker = tracker.clone();
+                    let notice_app = app.handle().clone();
+
+                    if let Err(e) = core::gamepad::install(
+                        move || {
+                            // 【约束】轮询线程上执行，只投递（该线程以 125Hz 节奏跑，不能在这里做重活）
+                            commands::screenshots::dispatch_screenshot_async(
+                                gp_app.clone(),
+                                gp_db.clone(),
+                                gp_tracker.clone(),
+                                "手柄",
+                            );
+                        },
+                        move || {
+                            gate_tracker
+                                .lock()
+                                .map(|t| t.has_pending_work())
+                                .unwrap_or(false)
+                        },
+                        move |notice| {
+                            // 录制结果回给设置页：成功带着组合键、失败带着原因
+                            let (event, payload) = match notice {
+                                core::gamepad::Notice::Recorded(spec) => {
+                                    ("gamepad-hotkey-recorded", spec)
+                                }
+                                core::gamepad::Notice::Failed(reason) => {
+                                    ("gamepad-hotkey-record-failed", reason)
+                                }
+                            };
+                            let _ = notice_app.emit(event, payload);
+                        },
+                    ) {
+                        tracing::error!("启动手柄截图通道失败: {e}（键盘截图不受影响）");
+                    }
+
+                    core::gamepad::set_spec(core::gamepad::parse_hotkey(&gamepad_hotkey));
+                    match core::gamepad::current_spec() {
+                        Some(mask) => tracing::info!(
+                            "手柄截图键已就绪: {}（掩码 0x{mask:04X}）",
+                            core::gamepad::format_hotkey(mask)
+                        ),
+                        None if gamepad_hotkey.trim().is_empty() => {
+                            tracing::info!("手柄截图键未设置，手柄通道待命（无游戏时不读手柄）")
+                        }
+                        None => tracing::warn!(
+                            "手柄截图键 {gamepad_hotkey} 无法解析为键位，手柄通道停用"
+                        ),
                     }
                 }
             }
@@ -791,6 +852,8 @@ pub fn run() {
             commands::screenshots::get_screenshot_dir,
             commands::screenshots::list_screenshot_dirs,
             commands::screenshots::get_screenshot_hotkey_status,
+            commands::screenshots::start_gamepad_hotkey_recording,
+            commands::screenshots::cancel_gamepad_hotkey_recording,
             // 应用
             quit_app,
             frontend_ready,

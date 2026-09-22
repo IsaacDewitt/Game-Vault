@@ -77,6 +77,29 @@ fn reapply_screenshot_hotkey(
     *state = new_hotkey.to_string();
 }
 
+/// 手柄截图键变更后立即生效（save_settings / save_settings_partial 共用）。
+///
+/// 与键盘热键不同，手柄侧**没有"注册"这一步**：XInput 只能轮询，因此不存在
+/// "被别的程序占用"这类失败，也不需要与内存中的旧注册值比对。这里只做两件事：
+/// 把组合解析成掩码交给轮询线程；解析不出来就停用通道（并在日志里说明原因，
+/// 否则用户看到的是"设了却没反应"）。
+fn reapply_gamepad_hotkey(new_hotkey: &str) {
+    match crate::core::gamepad::parse_hotkey(new_hotkey) {
+        Some(mask) => {
+            crate::core::gamepad::set_spec(Some(mask));
+            tracing::info!("手柄截图键已生效: {new_hotkey}（掩码 0x{mask:04X}）");
+        }
+        None => {
+            crate::core::gamepad::set_spec(None);
+            if new_hotkey.trim().is_empty() {
+                tracing::info!("手柄截图键为空，手柄截图通道停用");
+            } else {
+                tracing::warn!("手柄截图键 {new_hotkey} 无法解析为键位，手柄通道停用");
+            }
+        }
+    }
+}
+
 /// 保存设置（整对象全量写库）——设置页「保存设置」按钮路径，覆盖全部字段
 #[tauri::command]
 pub fn save_settings(
@@ -99,6 +122,8 @@ pub fn save_settings(
         &hotkey_error,
         &settings.screenshot_hotkey,
     );
+    // 手柄键无注册概念，直接换键位
+    reapply_gamepad_hotkey(&settings.screenshot_gamepad_hotkey);
 
     Ok(())
 }
@@ -123,10 +148,12 @@ pub fn save_settings_partial(
         "accent_color",
         "screenshot_dir",
         "screenshot_hotkey",
+        "screenshot_gamepad_hotkey",
         "language",
     ];
 
     let mut new_hotkey: Option<String> = None;
+    let mut new_gamepad_hotkey: Option<String> = None;
     {
         let db = lock_or_recover(&db);
         let mut merged = Settings::load_from_db(&db).map_err(|e| e.to_string())?;
@@ -142,6 +169,10 @@ pub fn save_settings_partial(
                     merged.screenshot_hotkey = v.to_string();
                     new_hotkey = Some(v.to_string());
                 }
+                "screenshot_gamepad_hotkey" => {
+                    merged.screenshot_gamepad_hotkey = v.to_string();
+                    new_gamepad_hotkey = Some(v.to_string());
+                }
                 "language" => merged.language = v.to_string(),
                 _ => unreachable!("AUTO_KEYS 与 match 分支应一一对应"),
             }
@@ -152,6 +183,9 @@ pub fn save_settings_partial(
     // patch 里带了快捷键才做热键重注册（其余字段变化无需动热键）
     if let Some(hk) = new_hotkey {
         reapply_screenshot_hotkey(&app, &db, &hotkey_state, &hotkey_error, &hk);
+    }
+    if let Some(gp) = new_gamepad_hotkey {
+        reapply_gamepad_hotkey(&gp);
     }
     Ok(())
 }

@@ -1,6 +1,6 @@
 [package]
 name = "game-vault"
-version = "0.8.4"
+version = "0.8.5"
 description = "Game Vault - 轻量级游戏管理器"
 authors = ["Isaac"]
 edition = "2021"
@@ -78,5 +78,8 @@ windows = { version = "0.62", features = [
     # 截图兜底通道：WH_KEYBOARD_LL 钩子需要 GetAsyncKeyState（查修饰键态）与 VK_* 常量
     # —— 全屏游戏在前台时注册热键收不到 WM_HOTKEY，只能靠键盘钩子（见 core/hotkey_hook.rs）
     "Win32_UI_Input_KeyboardAndMouse",
+    # 手柄截图键（XInput 轮询通道，见 core/gamepad.rs）：XInputGetState 走 xinput1_4.dll，
+    # windows crate 用 link!("xinput1_4.dll" "system") 直连系统 DLL，无需导入库
+    "Win32_UI_Input_XboxController",
 ] }
 

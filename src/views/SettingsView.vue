@@ -15,6 +15,8 @@ import {
 } from "naive-ui";
 import { DownloadOutline, CloudUploadOutline, FolderOpenOutline, SaveOutline } from "@vicons/ionicons5";
 import { save, open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import * as api from "../lib/tauri";
 import type { Settings } from "../lib/tauri";
 import { DEFAULT_ACCENT_COLOR, DEBOUNCE_MS } from "../lib/constants";
@@ -37,6 +39,7 @@ const settings = ref<Settings>({
   window_height: 900,
   screenshot_dir: "",
   screenshot_hotkey: "F12",
+  screenshot_gamepad_hotkey: "",
 });
 
 // 窗口大小预设选项
@@ -412,7 +415,16 @@ function normalizeHotkeyKey(key: string): string | null {
 }
 
 function onGlobalHotkeyKeydown(e: KeyboardEvent) {
-  if (!recordingHotkey.value) return;
+  // 手柄键录制与键盘热键录制共用这个监听：键盘没在录时，也要让 Esc 能取消手柄录制
+  //（0.8.5 审查 O2 修复——此前手柄录制只能等 10 秒超时或点「清空」）
+  if (!recordingHotkey.value) {
+    if (recordingGamepad.value && e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      void cancelRecordingGamepadHotkey();
+    }
+    return;
+  }
   e.preventDefault();
   e.stopPropagation();
 
@@ -473,15 +485,89 @@ async function applyHotkeyChange() {
   }
 }
 
-onMounted(() => {
+// ==================== 手柄截图键录制 ====================
+// 录制走**后端**（XInput 轮询）而不是前端的 Gamepad API：保证"录得到的"与"跑得着的"
+// 同源 —— 前端 Chromium 与 XInput 对手柄的可见性口径并不一致，混用会出现
+// "录上了但运行时没反应"这种没法查的问题。
+const recordingGamepad = ref(false);
+let unlistenGamepadRecorded: UnlistenFn | null = null;
+let unlistenGamepadFailed: UnlistenFn | null = null;
+
+async function startRecordingGamepadHotkey() {
+  if (recordingGamepad.value) return;
+  try {
+    await api.startGamepadHotkeyRecording();
+    recordingGamepad.value = true;
+  } catch (e) {
+    console.error("启动手柄键录制失败:", e);
+    message.error("启动手柄键录制失败：" + (e as Error).toString());
+  }
+}
+
+async function cancelRecordingGamepadHotkey() {
+  if (!recordingGamepad.value) return;
+  recordingGamepad.value = false;
+  try {
+    await api.cancelGamepadHotkeyRecording();
+  } catch (e) {
+    console.error("取消手柄键录制失败:", e);
+  }
+}
+
+async function clearGamepadHotkey() {
+  await cancelRecordingGamepadHotkey();
+  settings.value.screenshot_gamepad_hotkey = "";
+  await applyGamepadHotkeyChange();
+}
+
+// 手柄键变更后立即生效（与键盘快捷键同样走 partial：只存这一个字段，不带走手动字段）
+async function applyGamepadHotkeyChange() {
+  try {
+    await api.saveSettingsPartial({
+      screenshot_gamepad_hotkey: settings.value.screenshot_gamepad_hotkey,
+    });
+    message.success(
+      settings.value.screenshot_gamepad_hotkey
+        ? `手柄截图键已设为 ${settings.value.screenshot_gamepad_hotkey}`
+        : "已清空手柄截图键"
+    );
+  } catch (e) {
+    console.error("保存手柄截图键失败:", e);
+    message.error("保存手柄截图键失败");
+  }
+}
+
+onMounted(async () => {
   window.addEventListener("keydown", onGlobalHotkeyKeydown);
   loadSettings();
   loadAutostartState();
+
+  // 手柄键录制结果由后端轮询线程回报（成功带组合键，失败带原因）
+  try {
+    unlistenGamepadRecorded = await listen<string>("gamepad-hotkey-recorded", (event) => {
+      recordingGamepad.value = false;
+      settings.value.screenshot_gamepad_hotkey = event.payload;
+      void applyGamepadHotkeyChange();
+    });
+    unlistenGamepadFailed = await listen<string>("gamepad-hotkey-record-failed", (event) => {
+      recordingGamepad.value = false;
+      message.error(event.payload, { duration: 8000 });
+    });
+  } catch (e) {
+    console.error("监听手柄键录制事件失败:", e);
+  }
 });
 
 // 组件卸载时清理定时器与按键监听
 onUnmounted(() => {
   window.removeEventListener("keydown", onGlobalHotkeyKeydown);
+  unlistenGamepadRecorded?.();
+  unlistenGamepadFailed?.();
+  // 离开设置页时若仍在录制，必须撤掉后端的录制态，否则它会占着轮询线程直到超时
+  if (recordingGamepad.value) {
+    recordingGamepad.value = false;
+    void api.cancelGamepadHotkeyRecording().catch((e) => console.error("取消手柄键录制失败:", e));
+  }
   if (autoSaveTimer) {
     clearTimeout(autoSaveTimer);
     autoSaveTimer = null;
@@ -730,10 +816,50 @@ async function handleImportSaves() {
             </span>
           </n-space>
         </n-form-item>
+        <n-form-item label="手柄截图键">
+          <n-space align="center">
+            <n-input
+              :value="settings.screenshot_gamepad_hotkey"
+              readonly
+              :placeholder="recordingGamepad ? '请按手柄按键…' : '未设置'"
+              :status="recordingGamepad ? 'warning' : undefined"
+              style="width: 220px"
+              @click="startRecordingGamepadHotkey"
+            />
+            <n-button
+              size="small"
+              :disabled="!settings.screenshot_gamepad_hotkey && !recordingGamepad"
+              @click="clearGamepadHotkey"
+            >
+              清空
+            </n-button>
+            <span
+              :style="{
+                fontSize: '12px',
+                color: recordingGamepad ? '#f0a020' : '#888',
+                lineHeight: '1.6',
+              }"
+            >
+              {{
+                recordingGamepad
+                  ? '请按住要用的键再全部松开（十秒内完成）'
+                  : '点击输入框后按手柄按键即可录制，支持组合键（如 LB+A）'
+              }}
+            </span>
+          </n-space>
+        </n-form-item>
         <n-form-item label=" ">
           <span style="font-size: 12px; color: #888; line-height: 1.6">
             保存目录与快捷键修改后立即生效。截图仅对「从本库启动且正在前台运行」的游戏生效；
             文件按「进程名\进程名_日期_时间.png」归档到保存目录下对应游戏文件夹
+          </span>
+        </n-form-item>
+        <n-form-item label=" ">
+          <span style="font-size: 12px; color: #888; line-height: 1.6">
+            手柄键走手柄自身的读取通道（XInput），因此：手柄需是 Xbox 类设备（PS 手柄经
+            Steam 或 DS4Windows 转成 Xbox 手柄后同样可用）；组合键会照常传给游戏，建议挑游戏里用不到的
+            组合；中间那个 Xbox 键系统不给读，选不了；Steam 游戏有自己的截图，本应用不抢。
+            手柄键只在本库的游戏运行期间生效，不玩游戏时完全不读手柄
           </span>
         </n-form-item>
       </n-form>

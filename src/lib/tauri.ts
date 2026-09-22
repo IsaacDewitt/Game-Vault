@@ -111,6 +111,8 @@ export interface Settings {
   screenshot_dir: string;
   /** 截图快捷键（默认 F12，与 Steam 一致） */
   screenshot_hotkey: string;
+  /** 手柄截图键（组合键，形如 `LB+A`；空串 = 未设置） */
+  screenshot_gamepad_hotkey: string;
 }
 
 // ==================== 成就系统 ====================
@@ -349,11 +351,16 @@ export async function saveSettings(settings: Settings): Promise<void> {
   return invoke("save_settings", { settings });
 }
 
-/** 自动保存白名单字段：改动即生效项（主题/主题色/截图目录/快捷键/语言） */
+/** 自动保存白名单字段：改动即生效项（主题/主题色/截图目录/快捷键/手柄截图键/语言） */
 export type AutoSavePatch = Partial<
   Pick<
     Settings,
-    "theme" | "accent_color" | "screenshot_dir" | "screenshot_hotkey" | "language"
+    | "theme"
+    | "accent_color"
+    | "screenshot_dir"
+    | "screenshot_hotkey"
+    | "screenshot_gamepad_hotkey"
+    | "language"
   >
 >;
 
@@ -408,19 +415,29 @@ export async function checkSavePaths(): Promise<Record<string, boolean>> {
  * 0.8.3 修复前这里用的 snake_case，导致 releaseDate / HLTB / savePaths 一直写不进去：
  * 界面提示"已保存"、命令返回成功，值却一个没变。
  * （单词字段如 description / genres 两种写法形态相同，故一直正常。）
+ *
+ * ⚠️【null 同样是坑（0.8.5 修复）】清空字段**不能传 null**：Tauri 参数层会把 JSON null
+ * 一律折叠成最外层 None（= "没提交"，serde_json 对 Value::Null 走 visit_none），
+ * 后端收不到任何清空信号。清空一律用哨兵值：文本 = 空串、数组 = 空数组、
+ * HLTB = 0、launchArgs = 空串。详见各字段注释。
  */
 export interface GameMetaInput {
-  description?: string | null;
-  developer?: string | null;
-  publisher?: string | null;
-  releaseDate?: string | null;
-  genres?: string[] | null;
-  hltbMainStory?: number | null;
-  hltbMainExtra?: number | null;
-  hltbCompletionist?: number | null;
-  savePaths?: string[] | null;
-  /** 空串 = 清空启动参数（后端按 trim 后为空处理） */
-  launchArgs?: string | null;
+  /** 空串 = 清空。⚠️ 不能传 null：Tauri 会把 JSON null 折叠成"没提交"，清空静默失效（0.8.5 修复） */
+  description?: string;
+  developer?: string;
+  publisher?: string;
+  /** 空串 = 清空发售日期（清空的日期选择器要转成 ""，不能传 null） */
+  releaseDate?: string;
+  /** 空数组 = 清空游戏类型（不能传 null） */
+  genres?: string[];
+  /** 0 = 清空（0 分钟时长本身即无效值；清空的数字框要转成 0，不能传 null） */
+  hltbMainStory?: number;
+  hltbMainExtra?: number;
+  hltbCompletionist?: number;
+  /** 空数组 = 清空存档路径 */
+  savePaths?: string[];
+  /** 空串/纯空白 = 清空启动参数（后端按 trim 后为空处理） */
+  launchArgs?: string;
 }
 
 export async function updateGameMeta(gameId: string, meta: GameMetaInput): Promise<Game> {
@@ -540,6 +557,19 @@ export async function listScreenshotDirs(): Promise<ScreenshotDirOption[]> {
 /** 查询截图热键注册状态：null=注册成功，字符串=注册失败原因 */
 export async function getScreenshotHotkeyStatus(): Promise<string | null> {
   return invoke("get_screenshot_hotkey_status");
+}
+
+/**
+ * 开始录制手柄截图键：在 `gamepad-hotkey-recorded`（成功，payload 为组合键字符串）
+ * 或 `gamepad-hotkey-record-failed`（失败原因）事件里拿结果。
+ */
+export async function startGamepadHotkeyRecording(): Promise<void> {
+  return invoke("start_gamepad_hotkey_recording");
+}
+
+/** 取消手柄截图键录制（中途放弃 / 离开设置页） */
+export async function cancelGamepadHotkeyRecording(): Promise<void> {
+  return invoke("cancel_gamepad_hotkey_recording");
 }
 
 // ==================== 游戏手账 ====================

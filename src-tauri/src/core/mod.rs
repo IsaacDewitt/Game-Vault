@@ -13,6 +13,7 @@ pub mod screenshot;
 pub mod boot_guard;
 pub mod platform;
 pub mod hotkey_hook;
+pub mod gamepad;
 
 pub use database::Database;
 pub use tracker::PlayTimeTracker;

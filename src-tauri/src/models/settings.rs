@@ -41,6 +41,12 @@ pub struct Settings {
     /// 截图快捷键（默认 "F12"，与 Steam 一致）
     #[serde(default = "default_screenshot_hotkey")]
     pub screenshot_hotkey: String,
+    /// 手柄截图键（组合键，形如 `LB+A`；空串 = 未设置）
+    ///
+    /// 与键盘热键的区别：手柄没有"全局热键"这种系统机制，只能靠 XInput 轮询
+    /// （见 `core/gamepad.rs`）。故它既不需要注册、也不可能与别的程序冲突。
+    #[serde(default)]
+    pub screenshot_gamepad_hotkey: String,
 }
 
 fn default_accent_color() -> String {
@@ -87,6 +93,7 @@ impl Default for Settings {
             window_height: default_window_height(),
             screenshot_dir: default_screenshot_dir(),
             screenshot_hotkey: default_screenshot_hotkey(),
+            screenshot_gamepad_hotkey: String::new(),
         }
     }
 }
@@ -116,6 +123,7 @@ impl Settings {
                 .unwrap_or(default_window_height()),
             screenshot_dir: get("screenshot_dir", &default_screenshot_dir())?,
             screenshot_hotkey: get("screenshot_hotkey", &default_screenshot_hotkey())?,
+            screenshot_gamepad_hotkey: get("screenshot_gamepad_hotkey", "")?,
         })
     }
 
@@ -134,6 +142,7 @@ impl Settings {
         db.set_setting("window_height", &self.window_height.to_string())?;
         db.set_setting("screenshot_dir", &self.screenshot_dir)?;
         db.set_setting("screenshot_hotkey", &self.screenshot_hotkey)?;
+        db.set_setting("screenshot_gamepad_hotkey", &self.screenshot_gamepad_hotkey)?;
         Ok(())
     }
 }

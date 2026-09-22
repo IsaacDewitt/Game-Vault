@@ -105,15 +105,19 @@ async function handleSave() {
   try {
     // 键名必须 camelCase：Tauri 按 camelCase 查键，snake_case 会被静默当成"没提交"
     // （见 lib/tauri.ts 里 GameMetaInput 的说明——0.8.3 之前这里一直是写不进去的）
+    //
+    // 清空一律用哨兵值、绝不传 null：Tauri 会把 JSON null 折叠成"没提交"，
+    // 清空会静默失效（0.8.5 修复——此前的 `|| null` 写法把后端的空串清空分支全堵死了）。
+    // 哨兵口径：文本 = 空串 / genres = 空数组 / HLTB = 0（数字框清空是 null，转 0）。
     await store.updateGameMeta(props.game.id, {
-      description: description.value || null,
-      developer: developer.value || null,
-      publisher: publisher.value || null,
-      releaseDate: formatTimestamp(releaseDate.value),
-      genres: genres.value.length > 0 ? genres.value : null,
-      hltbMainStory: hltbMainStory.value,
-      hltbMainExtra: hltbMainExtra.value,
-      hltbCompletionist: hltbCompletionist.value,
+      description: description.value,
+      developer: developer.value,
+      publisher: publisher.value,
+      releaseDate: formatTimestamp(releaseDate.value) ?? "",
+      genres: genres.value,
+      hltbMainStory: hltbMainStory.value ?? 0,
+      hltbMainExtra: hltbMainExtra.value ?? 0,
+      hltbCompletionist: hltbCompletionist.value ?? 0,
       savePaths: savePaths.value.filter((p) => p.trim() !== ""),
       // 空串即清空（后端按 trim 后为空处理）
       launchArgs: launchArgs.value.trim(),
@@ -203,9 +207,10 @@ async function handleSave() {
       <div class="form-row form-row-3">
         <div class="form-field">
           <label>主线</label>
+          <!-- min=1：0 被后端用作"清空"哨兵（清空的数字框传 0），不允许手输 0 -->
           <n-input-number
             v-model:value="hltbMainStory"
-            :min="0"
+            :min="1"
             placeholder="分钟"
             clearable
           />
@@ -214,7 +219,7 @@ async function handleSave() {
           <label>主线+支线</label>
           <n-input-number
             v-model:value="hltbMainExtra"
-            :min="0"
+            :min="1"
             placeholder="分钟"
             clearable
           />
@@ -223,7 +228,7 @@ async function handleSave() {
           <label>完美通关</label>
           <n-input-number
             v-model:value="hltbCompletionist"
-            :min="0"
+            :min="1"
             placeholder="分钟"
             clearable
           />

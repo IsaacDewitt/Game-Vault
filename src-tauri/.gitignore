@@ -8,3 +8,6 @@
 
 # 隔离测试目录（CARGO_TARGET_DIR=target-tests，避免覆盖交付产物）
 /target-tests/
+
+# 隔离编译检查目录（CARGO_TARGET_DIR=target-check，避免覆盖交付产物）
+/target-check/

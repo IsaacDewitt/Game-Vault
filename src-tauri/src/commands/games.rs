@@ -781,9 +781,18 @@ pub async fn fetch_game_info_llm(
 }
 
 /// 手动更新游戏元数据（与 LLM 获取的字段一致）
-/// hltb 参数用 Option<Option<u32>>：外层 Some 表示字段被提交，内层 Some(v) 设置值、None 表示清空
-// 参数对应前端 Tauri 命令调用契约（含 hltb 的 Option<Option<u32>> 清空语义），
-// 抽结构体重构会改变序列化签名、破坏前端调用，故此处放行。
+///
+/// 【清空语义（2026-09-22 修复，0.8.3 只修了设值这半边）】Tauri 命令参数层会把
+/// JSON `null` 折叠成最外层 `None`（tauri-2.11.2 `src/ipc/command.rs` 的
+/// `deserialize_option`：键存在时交给 serde_json，而 `Value::Null` 一律 `visit_none`），
+/// 因此**清空不能用 null 表达**——前端传 `hltbMainStory: null` 得到的是"没提交"而非
+/// "清空"。各字段的清空哨兵（必须是有效 JSON 值，且能穿过 serde）：
+/// - 文本字段（description / developer / publisher / release_date）：**空串**；
+/// - genres / save_paths：**空数组**；
+/// - hltb 三项：**`0`**（0 分钟时长本身即无效值；输入框 `min=1`，0 只能由清空产生）；
+/// - launch_args：空串（trim 后为空）。
+/// 未提交的字段（`None`，键缺失或值为 null 都会归到这）保持现值不变。
+// 参数对应前端 Tauri 命令调用契约，抽结构体重构会改变序列化签名、破坏前端调用，故此处放行。
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn update_game_meta(
@@ -794,17 +803,52 @@ pub fn update_game_meta(
     publisher: Option<String>,
     release_date: Option<String>,
     genres: Option<Vec<String>>,
-    hltb_main_story: Option<Option<u32>>,
-    hltb_main_extra: Option<Option<u32>>,
-    hltb_completionist: Option<Option<u32>>,
+    hltb_main_story: Option<u32>,
+    hltb_main_extra: Option<u32>,
+    hltb_completionist: Option<u32>,
     save_paths: Option<Vec<String>>,
     launch_args: Option<String>,
 ) -> Result<Game, String> {
-    let db_guard = lock_or_recover(&db);
-    let mut game = db_guard.get_game_by_id(&game_id)
+    apply_game_meta_update(
+        db.inner(),
+        &game_id,
+        description,
+        developer,
+        publisher,
+        release_date,
+        genres,
+        hltb_main_story,
+        hltb_main_extra,
+        hltb_completionist,
+        save_paths,
+        launch_args,
+    )
+}
+
+/// `update_game_meta` 的函数体（命令层只负责剥 State 壳）。
+/// 单独抽出是为了能直接用 `Arc<Mutex<Database>>` 做单元测试——清空语义
+/// （见命令层注释）有 `game_meta_clear_and_sentinel_semantics` 测试守着。
+#[allow(clippy::too_many_arguments)]
+fn apply_game_meta_update(
+    db: &Arc<Mutex<Database>>,
+    game_id: &str,
+    description: Option<String>,
+    developer: Option<String>,
+    publisher: Option<String>,
+    release_date: Option<String>,
+    genres: Option<Vec<String>>,
+    hltb_main_story: Option<u32>,
+    hltb_main_extra: Option<u32>,
+    hltb_completionist: Option<u32>,
+    save_paths: Option<Vec<String>>,
+    launch_args: Option<String>,
+) -> Result<Game, String> {
+    let db_guard = lock_or_recover(db);
+    let mut game = db_guard.get_game_by_id(game_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "游戏不存在".to_string())?;
 
+    // 文本字段：空串 = 清空（Some(空串) 是有效 JSON，能穿过 Tauri 参数层）
     if let Some(v) = description {
         game.description = if v.is_empty() { None } else { Some(v) };
     }
@@ -819,18 +863,22 @@ pub fn update_game_meta(
     }
     if let Some(v) = genres {
         // 手动填写也走归一化（与 apply_llm_meta / apply_meta_to_review 口径一致），
-        // 否则 NSelect 自由输入仍能造出「Action」这类非规范类型
+        // 否则 NSelect 自由输入仍能造出「Action」这类非规范类型；
+        // 空数组归一化后仍为空数组 → 等价清空（Game.genres 是 Vec，非 Option）
         game.genres = crate::core::genres::normalize_genres(&v);
     }
-    // Some(Some(v)) 设置值，Some(None) 清空（用户清空输入框），None 不处理
+    // hltb 三项：0 = 清空（0 分钟时长本身即无效值；输入框 min=1，0 只能由
+    // 前端把"清空的数字框"（null）转成 0 得到）。
+    // 【不能改回 Option<Option<u32>>】Tauri 会把 JSON null 折叠成外层 None，
+    // "内层 None 清空"在参数层根本不可达（0.8.3 的教训，详见命令层注释）。
     if let Some(v) = hltb_main_story {
-        game.hltb_main_story = v;
+        game.hltb_main_story = if v == 0 { None } else { Some(v) };
     }
     if let Some(v) = hltb_main_extra {
-        game.hltb_main_extra = v;
+        game.hltb_main_extra = if v == 0 { None } else { Some(v) };
     }
     if let Some(v) = hltb_completionist {
-        game.hltb_completionist = v;
+        game.hltb_completionist = if v == 0 { None } else { Some(v) };
     }
     if let Some(v) = save_paths {
         game.save_paths = v;
@@ -1712,4 +1760,112 @@ pub async fn fetch_missing_game_info(
         "total": total,
         "errors": errors,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Arc<Mutex<Database>> {
+        Arc::new(Mutex::new(
+            Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败"),
+        ))
+    }
+
+    fn seeded_game() -> crate::models::Game {
+        let mut g = crate::models::Game::new("Test Game".to_string());
+        g.description = Some("一段描述".to_string());
+        g.developer = Some("DevCo".to_string());
+        g.publisher = Some("PubCo".to_string());
+        g.release_date = Some("2020-01-01".to_string());
+        g.genres = vec!["动作".to_string()];
+        g.hltb_main_story = Some(120);
+        g.hltb_main_extra = Some(60);
+        g.hltb_completionist = Some(300);
+        g.save_paths = vec!["C:/Saves/TestGame".to_string()];
+        g.launch_args = Some("-windowed".to_string());
+        g
+    }
+
+    /// 清空哨兵必须真正落成 None/空——这是 0.8.3「设值修了、清空仍静默失效」
+    /// 那个 bug（R1，见 2026-09-22 审查报告）的回归防线。
+    /// 哨兵语义：文本=空串 / genres=空数组 / hltb=0 / save_paths=空数组 / launch_args=空白。
+    #[test]
+    fn game_meta_clear_and_sentinel_semantics() {
+        let db = test_db();
+        let game = seeded_game();
+        let id = game.id.clone();
+        db.lock().unwrap().upsert_game(&game).unwrap();
+
+        let updated = apply_game_meta_update(
+            &db, &id,
+            Some(String::new()),          // description 清空
+            Some("  ".to_string()),        // developer 纯空白（文本字段不 trim，等价清空？——注意：文本哨兵是"空串"，这里故意传两个空格验证与 launch_args 的差异口径）
+            Some(String::new()),          // publisher 清空
+            Some(String::new()),          // release_date 清空
+            Some(vec![]),                 // genres 清空
+            Some(0),                       // hltb_main_story 清空
+            Some(0),                       // hltb_main_extra 清空
+            Some(0),                       // hltb_completionist 清空
+            Some(vec![]),                 // save_paths 清空
+            Some("   ".to_string()),       // launch_args 纯空白 → 清空
+        )
+        .expect("更新不应失败");
+
+        assert_eq!(updated.description, None, "空串必须清空 description");
+        // developer 的哨兵是严格空串（与后端既有 is_empty 判断一致）；纯空白不会被当清空——
+        // 这个口径与 launch_args（trim 后判空）不同，属既有行为，测试里锁死以免无意漂移。
+        assert_eq!(updated.developer, Some("  ".to_string()), "文本字段不清 trim（哨兵是空串，非空白）");
+        assert_eq!(updated.publisher, None, "空串必须清空 publisher");
+        assert_eq!(updated.release_date, None, "空串必须清空 release_date");
+        assert!(updated.genres.is_empty(), "空数组必须清空 genres");
+        assert_eq!(updated.hltb_main_story, None, "0 必须清空 hltb_main_story");
+        assert_eq!(updated.hltb_main_extra, None, "0 必须清空 hltb_main_extra");
+        assert_eq!(updated.hltb_completionist, None, "0 必须清空 hltb_completionist");
+        assert!(updated.save_paths.is_empty(), "空数组必须清空 save_paths");
+        assert_eq!(updated.launch_args, None, "纯空白必须清空 launch_args（trim 口径）");
+    }
+
+    /// 设值与"未提交"（None = 字段缺失或 JSON null）保持现值
+    #[test]
+    fn game_meta_set_and_untouched_semantics() {
+        let db = test_db();
+        let game = seeded_game();
+        let id = game.id.clone();
+        db.lock().unwrap().upsert_game(&game).unwrap();
+
+        let updated = apply_game_meta_update(
+            &db, &id,
+            Some("新描述".to_string()),   // 设值
+            None,                          // 未提交 → 保持
+            None,                          // 未提交（等价 JSON null 被框架折叠后的形态）
+            Some("2024-06-01".to_string()),
+            Some(vec![
+                "Adventure".to_string(), // 英文别名 → 中文规范名
+                "Action".to_string(),    // 同上
+                "动作".to_string(),       // 与上一项归一化后重复 → 应被去掉
+            ]),
+            Some(90),
+            None,
+            Some(400),
+            Some(vec!["D:/New/Path".to_string()]),
+            Some("-fullscreen".to_string()),
+        )
+        .expect("更新不应失败");
+
+        assert_eq!(updated.description, Some("新描述".to_string()));
+        assert_eq!(updated.developer, Some("DevCo".to_string()), "None 必须保持现值");
+        assert_eq!(updated.publisher, Some("PubCo".to_string()), "None 必须保持现值");
+        assert_eq!(updated.release_date, Some("2024-06-01".to_string()));
+        assert_eq!(
+            updated.genres,
+            vec!["冒险".to_string(), "动作".to_string()],
+            "英文别名应归一化为中文规范名，重复项应被去掉"
+        );
+        assert_eq!(updated.hltb_main_story, Some(90));
+        assert_eq!(updated.hltb_main_extra, Some(60), "None 必须保持现值");
+        assert_eq!(updated.hltb_completionist, Some(400));
+        assert_eq!(updated.save_paths, vec!["D:/New/Path".to_string()]);
+        assert_eq!(updated.launch_args, Some("-fullscreen".to_string()));
+    }
 }

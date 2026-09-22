@@ -125,49 +125,86 @@ fn is_generic_dir_name(name: &str) -> bool {
     GENERIC.contains(&name.trim().to_ascii_lowercase().as_str())
 }
 
-/// 前台窗口若是本库正在追踪的游戏窗口，返回其 hwnd（供温会话预建使用）。
+/// 前台窗口是不是本库正在追踪的游戏窗口（供温会话预建使用）。
 ///
 /// 【与 `trigger_screenshot` 的关系】判定口径一致（进程名精确 → 进程路径落在安装目录下，
 /// 活跃会话优先、待命会话兜底），但刻意保持一份独立的轻量实现：预建跑在后台线程、
 /// 失败要静默返回，不该复用截图路径里"失败要播提示音 / 每个分支都要写日志"的那套重逻辑。
-fn resolve_foreground_game_hwnd(tracker: &Arc<Mutex<PlayTimeTracker>>) -> Option<isize> {
-    let foreground = Window::foreground().ok()?;
-    let pid = foreground.process_id().ok()?;
-    let hwnd = foreground.as_raw_hwnd() as isize;
+/// 代价是**两处逻辑必须同步改**，日后调整会话匹配口径时两处都要过一遍。
+///
+/// 【入参为什么传前台窗口】调用方（`maybe_prime_warm_session`）已经拿到过前台窗口，
+/// 传进来省一次查询，也避免两次取前台之间窗口恰好切换。
+fn foreground_is_tracked_game(
+    tracker: &Arc<Mutex<PlayTimeTracker>>,
+    foreground: &Window,
+) -> bool {
+    let Ok(pid) = foreground.process_id() else {
+        return false;
+    };
 
     let mut guard = lock_or_recover(tracker);
     let (n_active, n_pending) = guard.session_counts();
     if n_active == 0 && n_pending == 0 {
-        return None;
+        return false;
     }
 
     let full_path = guard.process_path(pid);
     let process_name = match foreground.process_name() {
         Ok(n) => n,
-        Err(_) => full_path
-            .as_deref()
-            .and_then(|p| p.rsplit(['\\', '/']).next())
-            .filter(|s| !s.is_empty())?
-            .to_string(),
+        Err(_) => {
+            match full_path
+                .as_deref()
+                .and_then(|p| p.rsplit(['\\', '/']).next())
+                .filter(|s| !s.is_empty())
+            {
+                Some(name) => name.to_string(),
+                None => return false,
+            }
+        }
     };
 
     guard
         .find_active_game_by_process(&process_name, full_path.as_deref())
         .or_else(|| guard.find_pending_game_by_process(&process_name, full_path.as_deref()))
-        .map(|_| hwnd)
+        .is_some()
 }
 
 /// 若前台是被追踪的游戏，就在后台预建截图温会话（见 `capture::prime_warm_session`）。
 ///
-/// 只在"没有温会话 / 温会话挂的不是这个窗口"时才投递，实际建会话与等首帧都在后台线程做，
-/// 绝不阻塞追踪循环。预建失败是常态允许情况（游戏还在启动、窗口最小化），静默即可。
+/// 本函数被追踪循环**每拍调用**（见 `lib.rs` 阶段 3），因此刻意做成三级漏斗，越往后越贵：
+/// 1. 取前台 hwnd —— 纯 Win32 查询，**不碰任何锁**；
+/// 2. 查温会话挂在哪个窗口 —— `try_lock`，同样**不碰 tracker 锁**；
+///    命中"已经挂在这个窗口上"就直接收工（绝大多数拍都停在这一步）；
+/// 3. 到此才判定"前台是不是被追踪的游戏"——这一步要持 **tracker 锁**并做一次进程路径查询，
+///    而 tracker 锁正是截图关键路径第 2 步也要拿的锁。能用前两步挡掉就别抢它，
+///    免得给"按键 → 画面到手"那条十几毫秒的链路掺入抖动。
+///
+/// 实际建会话与等首帧都在后台线程做，绝不阻塞追踪循环。预建失败是常态允许情况
+/// （游戏还在启动、窗口最小化），静默即可。
 pub fn maybe_prime_warm_session(tracker: &Arc<Mutex<PlayTimeTracker>>) {
-    let Some(hwnd) = resolve_foreground_game_hwnd(tracker) else {
+    use crate::core::capture::WarmTarget;
+
+    // ① 前台 hwnd：纯 Win32 查询，不持锁
+    let Ok(foreground) = Window::foreground() else {
         return;
     };
-    if crate::core::capture::warm_session_hwnd() == Some(hwnd) {
+    let hwnd = foreground.as_raw_hwnd() as isize;
+
+    // ② 温会话状态：try_lock，不持 tracker 锁
+    match crate::core::capture::warm_session_target() {
+        // 会话已经挂在这个窗口上 → 无事可做
+        WarmTarget::Window(h) if h == hwnd => return,
+        // 槽位正忙（别的线程正在建/销毁会话）→ 已经有人在干活，本拍不必插手
+        WarmTarget::Busy => return,
+        // 没有会话 / 挂在别的窗口上 → 才需要往下判定
+        _ => {}
+    }
+
+    // ③ 昂贵判定：前台是不是被追踪的游戏（持 tracker 锁）
+    if !foreground_is_tracked_game(tracker, &foreground) {
         return;
     }
+
     if let Err(e) = std::thread::Builder::new()
         .name("gv-wgc-prime".to_string())
         .spawn(move || crate::core::capture::prime_warm_session(hwnd))
@@ -765,6 +802,24 @@ pub fn get_screenshot_hotkey_status(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+/// 开始录制手柄截图键：等待用户完成一次「按下 → 全部松开」的按压序列，
+/// 期间同时按下的键即构成组合，结果经 `gamepad-hotkey-recorded` 事件回报；
+/// 10 秒内没读到按键、或用户中途取消则回报 `gamepad-hotkey-record-failed`。
+///
+/// 【为什么录制不受"游戏运行中才轮询"的限制】那条口径是给**截图触发**定的省电规则
+/// （不玩游戏不该耗电读手柄）；而录键是用户在设置页发起的显式操作，此时必须能读手柄，
+/// 否则"设置手柄截图键"这件事在没开游戏时根本做不成。
+#[tauri::command]
+pub fn start_gamepad_hotkey_recording() -> Result<(), String> {
+    crate::core::gamepad::start_recording()
+}
+
+/// 取消手柄截图键录制（用户中途放弃、或离开设置页）
+#[tauri::command]
+pub fn cancel_gamepad_hotkey_recording() {
+    crate::core::gamepad::cancel_recording();
 }
 
 #[cfg(test)]
