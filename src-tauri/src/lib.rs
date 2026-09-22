@@ -284,6 +284,9 @@ fn graceful_exit(app: &tauri::AppHandle) {
             };
             let finished = tracker_guard.force_finish_all();
             drop(tracker_guard);
+            // 退出前释放截图温会话（常驻 WGC 会话持有捕获线程与 D3D 资源，
+            // 不显式停掉会让进程退出时留下悬空线程）
+            core::capture::release_warm_session();
             if !finished.is_empty() {
                 core::PlayTimeTracker::persist_finished_sessions(&db, &finished);
                 // 结算最后一批会话对应的成就（静默，退出时不弹通知）
@@ -518,6 +521,10 @@ pub fn run() {
 
                     // 阶段 2：持久化已结束的会话到数据库（独立获取 DB 锁）
                     if !tick.finished.is_empty() {
+                        // 游戏已退出 → 释放截图温会话。常驻 WGC 会话的意义是"游戏会话期一直挂着"，
+                        // 游戏没了就没必要留着，否则捕获线程与句柄会一直挂到下一次截图才发现失效。
+                        core::capture::release_warm_session();
+
                         core::PlayTimeTracker::persist_finished_sessions(&db_arc, &tick.finished);
 
                         // 会话结束后检测成就（时长/次数类成就），新解锁通过事件通知前端
@@ -545,6 +552,10 @@ pub fn run() {
                     for session in &tick.finished {
                         let _ = app_handle.emit("game-stopped", &session.game_id);
                     }
+
+                    // 阶段 3：前台是被追踪的游戏时，后台预建截图温会话。
+                    // 有了它，连"会话里的第一张截图"也是温的（~11ms），不必先付一次建会话的 ~170ms。
+                    commands::screenshots::maybe_prime_warm_session(&tracker_arc);
                 }
             });
 

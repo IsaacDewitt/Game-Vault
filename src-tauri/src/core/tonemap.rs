@@ -24,6 +24,8 @@
 //! 注入方案用的 PQ 解码 / R10G10B10A2 解码 / 线性帧入口同样存于 injection 分支
 //! （且其 PQ 值域与白电平语义不一致，恢复前需先修正），master 不保留。
 
+use std::sync::OnceLock;
+
 use half::f16;
 
 /// 肩部最大下压深度：最强高光被压到 1-0.35=0.65 线性亮度（sRGB 约 211/255）。
@@ -75,6 +77,92 @@ fn linear_to_srgb(c: f32) -> f32 {
     } else {
         1.055 * c.powf(1.0 / 2.4) - 0.055
     }
+}
+
+// ==================== sRGB 编码查找表（2026-09-22：替掉逐像素 powf） ====================
+//
+// 【为什么】线性→sRGB 编码里的 `powf(1/2.4)` 是整条截图链路最贵的单项：2560×1440 一帧要走
+// 1106 万次 powf，实测单线程 101.3 ms。而这一步是**纯函数**（linear 闭区间 [0,1] → u8），
+// 完全可以查表。用 65536 项的表把 [0,1] 量化到 16 位，量化步长 1/131070 远细于 8bit 输出的
+// 1/255，实测结果与逐像素 powf 只在极少数取值上差 1 个 LSB（见下方一致性测试）。
+//
+// 选 65536 而不是更小 + 插值：实测 4096 项 + 线性插值反而更慢（47.9 ms，插值本身要算），
+// 65536 直接查表只要 26.4 ms；而 64 KiB 的表能常驻 L2，代价可忽略。
+
+/// linear → sRGB 8bit 的编码表（惰性构建一次）
+static SRGB_LUT: OnceLock<Box<[u8; 65536]>> = OnceLock::new();
+
+fn srgb_lut() -> &'static [u8; 65536] {
+    SRGB_LUT.get_or_init(|| {
+        let mut table = Box::new([0u8; 65536]);
+        for (i, slot) in table.iter_mut().enumerate() {
+            // 与逐像素实现同一条公式，保证"表里每个点 = 该点的精确值"
+            let s = linear_to_srgb(i as f32 / 65535.0);
+            *slot = (s * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        table
+    })
+}
+
+/// sRGB 编码（LUT 版）：把线性值量化到 16 位后查表。
+///
+/// 量化用 `round` 而不是截断：截断会让表内每个采样点的误差单向偏移，四舍五入则正负抵消。
+/// 越界值与 NaN 的处理与旧实现完全一致（`as usize` 是饱和转换：负数与 NaN 都落到 0）。
+#[inline]
+fn encode_srgb(c: f32) -> u8 {
+    let q = (c.clamp(0.0, 1.0) * 65535.0).round();
+    srgb_lut()[(q as usize).min(65535)]
+}
+
+/// alpha 编码：线性直通，无 gamma（与旧实现同式）
+#[inline]
+fn encode_alpha(a: f32) -> u8 {
+    (a.clamp(0.0, 1.0) * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// 单像素核心：路径分派 → 越界色收敛 → sRGB 编码。返回该像素的 RGBA8 四字节。
+#[inline]
+fn tonemap_pixel(px: &[f32], path: ToneMapPath, ws: f32, shoulder_w: f32) -> [u8; 4] {
+    let (mut r, mut g, mut b) = (px[0], px[1], px[2]);
+
+    match path {
+        ToneMapPath::DirectSrgb => {
+            // 零变换：值域未越界且白电平标准，直接编码
+        }
+        ToneMapPath::DivideWhiteLevel => {
+            // 系统把 SDR 内容按 nits/80 线性缩放，除回即无损还原
+            r /= ws;
+            g /= ws;
+            b /= ws;
+        }
+        ToneMapPath::Reinhard => {
+            // 归一化到 SDR 白 = 1.0
+            r /= ws;
+            g /= ws;
+            b /= ws;
+            // 恒等段 + 肩部：亮度 ≤ 1（SDR 内容）完全不动；
+            // (1, W] 的 HDR 高光经 smoothstep 肩部平滑压入 (1-d, 1]。
+            let n = luminance(r, g, b);
+            if n > 1.0 {
+                let t = ((n - 1.0) / (shoulder_w - 1.0)).clamp(0.0, 1.0);
+                let h = 3.0 * t * t - 2.0 * t * t * t;
+                let scale = (1.0 - SHOULDER_DEPTH * h) / n;
+                r *= scale;
+                g *= scale;
+                b *= scale;
+            }
+        }
+    }
+
+    // 公共出口：宽色域负分量 / 超界分量的保亮度收敛
+    // （DirectSrgb/DivideWhiteLevel 路径的正常像素此处为 no-op）
+    let (dr, dg, db) = desaturate(r, g, b);
+    [
+        encode_srgb(dr),
+        encode_srgb(dg),
+        encode_srgb(db),
+        encode_alpha(px[3]),
+    ]
 }
 
 /// 越界色收敛：保亮度把色域外颜色（任一通道 <0 的宽色域负分量，或 >1 的
@@ -167,56 +255,14 @@ pub fn tonemap_rgba16f_to_srgb(
     // 取 max 则肩部覆盖全部高光范围，个别超界坏点由 clamp 兜底。
     let shoulder_w = (stats.max / ws).max(1.0 + 1e-6);
 
-    let mut out: Vec<u8> = Vec::with_capacity(parsed_pixels * 4);
-
-    for px in linear.chunks_exact(4) {
-        let (mut r, mut g, mut b, a) = (px[0], px[1], px[2], px[3]);
-
-        match path {
-            ToneMapPath::DirectSrgb => {
-                // 零变换：值域未越界且白电平标准，直接编码
-            }
-            ToneMapPath::DivideWhiteLevel => {
-                // 系统把 SDR 内容按 nits/80 线性缩放，除回即无损还原
-                r /= ws;
-                g /= ws;
-                b /= ws;
-            }
-            ToneMapPath::Reinhard => {
-                // 归一化到 SDR 白 = 1.0
-                r /= ws;
-                g /= ws;
-                b /= ws;
-                // 恒等段 + 肩部：亮度 ≤ 1（SDR 内容）完全不动；
-                // (1, W] 的 HDR 高光经 smoothstep 肩部平滑压入 (1-d, 1]。
-                let n = luminance(r, g, b);
-                if n > 1.0 {
-                    let t = ((n - 1.0) / (shoulder_w - 1.0)).clamp(0.0, 1.0);
-                    let h = 3.0 * t * t - 2.0 * t * t * t;
-                    let scale = (1.0 - SHOULDER_DEPTH * h) / n;
-                    r *= scale;
-                    g *= scale;
-                    b *= scale;
-                }
-            }
-        }
-
-        // 公共出口：宽色域负分量 / 超界分量的保亮度收敛
-        // （DirectSrgb/DivideWhiteLevel 路径的正常像素此处为 no-op）
-        let (dr, dg, db) = desaturate(r, g, b);
-        r = dr;
-        g = dg;
-        b = db;
-
-        // sRGB 编码 + 8bit 量化
-        let enc = |c: f32| -> u8 {
-            let s = linear_to_srgb(c.clamp(0.0, 1.0));
-            (s * 255.0).round().clamp(0.0, 255.0) as u8
-        };
-        out.push(enc(r));
-        out.push(enc(g));
-        out.push(enc(b));
-        out.push((a.clamp(0.0, 1.0) * 255.0).round().clamp(0.0, 255.0) as u8);
+    // 第二遍：逐像素映射 + 编码（见 `tonemap_pixel`：数学与重构前逐字一致，
+    // 唯一变化是 sRGB 编码改走 65536 项查找表，替掉每像素 3 次 powf）。
+    //
+    // 【等价性前提】必须**先**完成整帧亮度统计、**再**逐像素处理 —— 路径判定依赖全帧最大亮度，
+    // 任何"一边处理一边定路径"的融合优化都会改变输出，不可做。
+    let mut out: Vec<u8> = vec![0u8; parsed_pixels * 4];
+    for (dst, px) in out.chunks_exact_mut(4).zip(linear.chunks_exact(4)) {
+        dst.copy_from_slice(&tonemap_pixel(px, path, ws, shoulder_w));
     }
 
     (out, path)
@@ -388,6 +434,56 @@ mod tests {
         assert!((r - 1.0).abs() < 1e-6 && (g - 1.0).abs() < 1e-6 && (b - 1.0).abs() < 1e-6);
         // NaN 通道：比较全为 false → 视为域内原样通过，enc 的 clamp 兜底，不 panic
         let _ = desaturate(f32::NAN, 0.5, 0.5);
+    }
+
+    /// LUT 编码 vs 逐像素 powf 精确实现的一致性 —— C 方案（2026-09-22）的回归防线。
+    ///
+    /// 用伪随机通道值模拟真实帧（不是表的采样点本身），断言：
+    /// 最大差异 ≤1 个 8bit 台阶，且出现差异的通道比例 ≤1%。
+    #[test]
+    fn lut_encoding_matches_exact_powf_within_one_lsb() {
+        let mut state: u64 = 0x2545F4914F6CDD1D;
+        let mut worst = 0i32;
+        let mut differing = 0usize;
+        const N: usize = 1_000_000;
+        for _ in 0..N {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let c = ((state >> 40) as u32) as f32 / (1u32 << 24) as f32; // [0,1)
+            let exact = {
+                let s = linear_to_srgb(c);
+                (s * 255.0).round().clamp(0.0, 255.0) as u8
+            };
+            let d = (exact as i32 - encode_srgb(c) as i32).abs();
+            if d > 0 {
+                differing += 1;
+            }
+            worst = worst.max(d);
+        }
+        // 打印实测分布（cargo test 时加 --nocapture 可见）：给"画质有没有变"留一份证据
+        println!(
+            "[tonemap LUT] 取样 {N} 个通道：最大差异 {worst} 个色阶；有差异的通道 {differing} 个（{:.3}%）",
+            differing as f64 / N as f64 * 100.0
+        );
+        assert!(
+            worst <= 1,
+            "LUT 与精确实现的最大差异不得超过 1 LSB，实际 {worst}"
+        );
+        assert!(
+            differing * 1000 / N <= 10,
+            "差异通道比例应 ≤1%，实际 {differing}/{N}"
+        );
+    }
+
+    /// 越界值与 NaN 的编码行为与旧实现一致：旧实现靠 `as u8` 饱和转换，负数与 NaN 都落到 0
+    #[test]
+    fn lut_encoding_clamps_and_handles_nan() {
+        assert_eq!(encode_srgb(-1.0), 0);
+        assert_eq!(encode_srgb(0.0), 0);
+        assert_eq!(encode_srgb(1.0), 255);
+        assert_eq!(encode_srgb(5.0), 255);
+        assert_eq!(encode_srgb(f32::NAN), 0, "NaN 必须落 0 且不得 panic");
     }
 
     /// 域内像素必须是严格 no-op（DirectSrgb 路径的逐像素开销仅一次比较）

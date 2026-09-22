@@ -389,14 +389,25 @@ pub fn save_srgb_png(
     })
 }
 
-/// 方案 A：从指定 HWND 抓取一帧并保存到指定目录（WGC 路径）。
-pub fn capture_and_save(
+/// 【关键路径】从指定 HWND 抓一帧 HDR 原始数据（按键 → 画面到手）。
+///
+/// 只做抓帧，不做任何后处理：调用方拿到这一帧就应立刻让出关键路径（响快门、开新线程落盘），
+/// 之后的 tonemap / PNG / 写盘都不该再影响"按了键多久才有反应"的体感。
+pub fn capture_frame(hwnd: isize) -> anyhow::Result<crate::core::capture::CapturedFrame> {
+    crate::core::capture::capture_window_fp16(hwnd)
+}
+
+/// 【后处理】色调映射 + PNG 编码 + 落盘（与抓帧解耦）。
+///
+/// 2026-09-22 从 `capture_and_save` 拆出：抓帧一完成，画面就已经被冻结，此后
+/// tonemap（1440p 实测 101ms → 换 LUT 后约 26ms）、PNG 编码、写盘都落在关键路径之外。
+/// 落盘目录的解析（含截图根目录扫描）也由调用方安排在这一步之前，不进关键路径。
+pub fn save_frame(
+    frame: &crate::core::capture::CapturedFrame,
     hwnd: isize,
     dir: &std::path::Path,
     stem: &str,
 ) -> anyhow::Result<ScreenshotResult> {
-    let frame = crate::core::capture::capture_window_fp16(hwnd)?;
-
     // 查询窗口所在显示器的真实 SDR 白电平（HDR 滑块 80~480nits，默认 80）。
     // 硬编码 1.0 会在滑块偏离默认时截图偏暗（<80nits）或误判为 HDR 压灰（>80nits）。
     let white_level_scale = crate::core::sdr_white::sdr_white_scale_for_window(hwnd);

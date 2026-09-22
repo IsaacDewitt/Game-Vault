@@ -125,6 +125,57 @@ fn is_generic_dir_name(name: &str) -> bool {
     GENERIC.contains(&name.trim().to_ascii_lowercase().as_str())
 }
 
+/// 前台窗口若是本库正在追踪的游戏窗口，返回其 hwnd（供温会话预建使用）。
+///
+/// 【与 `trigger_screenshot` 的关系】判定口径一致（进程名精确 → 进程路径落在安装目录下，
+/// 活跃会话优先、待命会话兜底），但刻意保持一份独立的轻量实现：预建跑在后台线程、
+/// 失败要静默返回，不该复用截图路径里"失败要播提示音 / 每个分支都要写日志"的那套重逻辑。
+fn resolve_foreground_game_hwnd(tracker: &Arc<Mutex<PlayTimeTracker>>) -> Option<isize> {
+    let foreground = Window::foreground().ok()?;
+    let pid = foreground.process_id().ok()?;
+    let hwnd = foreground.as_raw_hwnd() as isize;
+
+    let mut guard = lock_or_recover(tracker);
+    let (n_active, n_pending) = guard.session_counts();
+    if n_active == 0 && n_pending == 0 {
+        return None;
+    }
+
+    let full_path = guard.process_path(pid);
+    let process_name = match foreground.process_name() {
+        Ok(n) => n,
+        Err(_) => full_path
+            .as_deref()
+            .and_then(|p| p.rsplit(['\\', '/']).next())
+            .filter(|s| !s.is_empty())?
+            .to_string(),
+    };
+
+    guard
+        .find_active_game_by_process(&process_name, full_path.as_deref())
+        .or_else(|| guard.find_pending_game_by_process(&process_name, full_path.as_deref()))
+        .map(|_| hwnd)
+}
+
+/// 若前台是被追踪的游戏，就在后台预建截图温会话（见 `capture::prime_warm_session`）。
+///
+/// 只在"没有温会话 / 温会话挂的不是这个窗口"时才投递，实际建会话与等首帧都在后台线程做，
+/// 绝不阻塞追踪循环。预建失败是常态允许情况（游戏还在启动、窗口最小化），静默即可。
+pub fn maybe_prime_warm_session(tracker: &Arc<Mutex<PlayTimeTracker>>) {
+    let Some(hwnd) = resolve_foreground_game_hwnd(tracker) else {
+        return;
+    };
+    if crate::core::capture::warm_session_hwnd() == Some(hwnd) {
+        return;
+    }
+    if let Err(e) = std::thread::Builder::new()
+        .name("gv-wgc-prime".to_string())
+        .spawn(move || crate::core::capture::prime_warm_session(hwnd))
+    {
+        tracing::warn!("[截图] 无法创建温会话预建线程: {e}");
+    }
+}
+
 /// 截图执行体（由 `dispatch_screenshot_async` 在独立线程里调用）。
 ///
 /// 逻辑（与 Steam 对齐，仅限从本库启动的游戏）：
@@ -140,6 +191,9 @@ pub fn trigger_screenshot(
     db: &Arc<Mutex<Database>>,
     tracker: &Arc<Mutex<PlayTimeTracker>>,
 ) -> Option<ScreenshotOutcome> {
+    // 全程计时起点：用来量"按键 → 画面到手"这一关键路径（日志里给老爷看实测值）。
+    let t_start = std::time::Instant::now();
+
     // 1. 取前台窗口 + PID + 进程名
     //
     // 【可观测性铁律】本函数每条失败分支都必须留下日志。此前 4 条分支只播个提示音就返回，
@@ -259,24 +313,23 @@ pub fn trigger_screenshot(
         (id, archive_name)
     };
 
-    // 3. 平台分流 + 解析落盘目标（一次 DB 锁完成）
+    // 3. 关键路径上只留一次主键查询：判定 Steam 静默退让
     //
-    // Steam 自带截图，且其默认截图键同为 F12：本应用必须**静默退让**——
-    // 不截图、也**不发提示音**，否则每次 Steam 截图都会被我们"跟一声"。
-    // 判定必须显式按 platform 来，不能指望"Steam 条目没有 exe 名所以匹配不上"这种巧合——
-    // 一旦将来 exe_name 被填上，就会误触发。
+    // 【为什么只剩这一件事（2026-09-22 链路重排）】旧实现在抓帧**之前**就把
+    // 「查游戏 + 读设置 + 查手账 + 解析落盘目录」全做完了，其中解析落盘目录要对截图根目录
+    // 做 read_dir + 逐目录计数 —— 实测机械盘冷缓存下 `H:\GameCapture`（190 个子目录）要 **411ms**，
+    // 这段时间全压在"按键 → 画面到手"的关键路径上。现在这里只留一次主键查询（微秒级），
+    // 读设置 / 查手账 / 解析目录 / tonemap / PNG / 写盘全部后移到抓帧之后。
+    //
+    // Steam 自带截图，且其默认截图键同为 F12：本应用必须**静默退让**——不截图、也不发提示音。
+    // 因此这个判定必须发生在"响快门、抓帧"之前。判定显式按 platform 来，不能指望
+    // "Steam 条目没有 exe 名所以匹配不上"这种巧合——一旦将来 exe_name 被填上就会误触发。
     // （Epic 无此冲突：其覆盖层热键是 Shift+F2，故 Epic 游戏照常支持截图。）
-    let target = {
+    let matched_game = {
         let db_guard = lock_or_recover(db);
-
         // 【不可用 .ok().flatten() 吞掉错误】那会把「查不到」与「查失败」归并成同一个 None，
-        // 后果有两条且都与设计意图相悖：
-        //   ① platform 退化为空串 → 与 PLATFORM_STEAM 比较必然不成立 → **Steam 静默退让失效**，
-        //      本应用会跟 Steam 抢拍一张（正下方 277-283 行的设计意图落空）；
-        //   ② candidates 变空 → 截图落到「前台进程名」目录而非游戏目录。
-        // 二者都是低概率但症状诡异（日志一片正常）。故显式区分：DB 出错即报错返回，
-        // 与紧随其后 15 行的 Settings::load_from_db 失败处理保持同一口径。
-        let game = match db_guard.get_game_by_id(&matched_game_id) {
+        // 导致 platform 退化为空串 → Steam 静默退让失效 → 跟 Steam 抢拍一张（症状诡异、日志正常）。
+        match db_guard.get_game_by_id(&matched_game_id) {
             Ok(g) => g,
             Err(e) => {
                 tracing::error!("[截图] 查询游戏条目失败: {e}");
@@ -285,18 +338,47 @@ pub fn trigger_screenshot(
                     message: format!("查询游戏失败: {e}"),
                 });
             }
-        };
-        let platform = game
-            .as_ref()
-            .map(|g| g.platform.clone())
-            .unwrap_or_default();
-        if platform == crate::core::platform::PLATFORM_STEAM {
-            tracing::info!(
-                "前台游戏 {} 属 Steam（自带截图，默认键同为 F12），本应用静默退让",
-                matched_game_id
-            );
-            return Some(ScreenshotOutcome::PlatformExcluded);
         }
+    };
+    let platform = matched_game
+        .as_ref()
+        .map(|g| g.platform.clone())
+        .unwrap_or_default();
+    if platform == crate::core::platform::PLATFORM_STEAM {
+        tracing::info!(
+            "前台游戏 {} 属 Steam（自带截图，默认键同为 F12），本应用静默退让",
+            matched_game_id
+        );
+        return Some(ScreenshotOutcome::PlatformExcluded);
+    }
+
+    // 4. 【关键路径终点】响快门 + 抓帧
+    //
+    // 快门音前置（2026-09-22 老爷拍板，与 Steam 行为一致）：受理成立即响，不再等到 PNG 落盘
+    // ——旧实现把提示音排在最后，用户听到的那一声就等于整条链路的总时长。
+    // 若后续抓帧/落盘失败，错误音会打断它（PlaySound 的异步语义）：最坏情况是"先一声成功、
+    // 再一声失败"，这是为响应速度刻意接受的取舍。
+    screenshot::play_feedback(screenshot::FeedbackTone::Success);
+
+    let frame = match screenshot::capture_frame(hwnd) {
+        Ok(f) => f,
+        Err(e) => {
+            // 【关键】必须记日志。之前 WGC 失败只发前端 toast，而截图时焦点
+            // 在游戏上根本看不到，日志里也一片空白 —— 排查时线索彻底断掉。
+            tracing::error!("[截图] WGC 抓屏失败 (pid {pid}, 归档名 {archive_name}): {e}");
+            screenshot::play_feedback(screenshot::FeedbackTone::Error);
+            return Some(ScreenshotOutcome::Failed { message: e.to_string() });
+        }
+    };
+    tracing::info!(
+        "[截图] 按键 → 画面到手 {:.1} ms（归档名 {archive_name}）",
+        t_start.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // 5. 落盘目标解析 + 色调映射 + 写盘：全部在抓帧之后（画面已经冻结，这里慢不影响体感）
+    let t_save = std::time::Instant::now();
+    let target = {
+        let db_guard = lock_or_recover(db);
 
         let settings = match Settings::load_from_db(&db_guard) {
             Ok(s) => s,
@@ -309,7 +391,7 @@ pub fn trigger_screenshot(
 
         // 手账条目（含其指定的截图目录与英文题名）与候选名统一由 capture_target_inputs 组装，
         // 与「详情页显示 / 打开截图文件夹」走同一套口径。
-        let (candidates, journal_dir) = match game.as_ref() {
+        let (candidates, journal_dir) = match matched_game.as_ref() {
             Some(g) => capture_target_inputs(&db_guard, g),
             None => (Vec::new(), None),
         };
@@ -333,10 +415,13 @@ pub fn trigger_screenshot(
         target
     };
 
-    // 4. WGC 抓屏
-    match screenshot::capture_and_save(hwnd, &target.dir, &target.stem) {
+    match screenshot::save_frame(&frame, hwnd, &target.dir, &target.stem) {
         Ok(r) => {
-            screenshot::play_feedback(screenshot::FeedbackTone::Success);
+            tracing::info!(
+                "[截图] 后处理 + 落盘 {:.1} ms（按键至今合计 {:.1} ms）",
+                t_save.elapsed().as_secs_f64() * 1000.0,
+                t_start.elapsed().as_secs_f64() * 1000.0
+            );
             Some(ScreenshotOutcome::Captured {
                 path: r.path,
                 process_name: r.process_name,
@@ -346,9 +431,7 @@ pub fn trigger_screenshot(
             })
         }
         Err(e) => {
-            // 【关键】必须记日志。之前 WGC 失败只发前端 toast，而截图时焦点
-            // 在游戏上根本看不到，日志里也一片空白 —— 排查时线索彻底断掉。
-            tracing::error!("[截图] WGC 抓屏失败 (pid {pid}, 归档名 {archive_name}): {e}");
+            tracing::error!("[截图] 后处理/落盘失败 (pid {pid}, 归档名 {archive_name}): {e}");
             screenshot::play_feedback(screenshot::FeedbackTone::Error);
             Some(ScreenshotOutcome::Failed { message: e.to_string() })
         }
