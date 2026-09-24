@@ -5,7 +5,7 @@ use crate::core::{Database, PlayTimeTracker, GameLauncher};
 use crate::core::launcher::LaunchOutcome;
 use crate::core::cover_fetcher::CoverFetcher;
 use crate::core::cover_store;
-use crate::models::cover::OWNER_GAME;
+use crate::models::cover::{OWNER_GAME, OWNER_REVIEW};
 use crate::core::llm_fetcher::{LlmFetcher, LlmConfig, LlmProtocol, LlmGameMeta};
 use crate::models::*;
 use crate::models::settings::Settings;
@@ -389,6 +389,17 @@ pub fn set_game_cover(
         return Err("选择的图片文件不存在".to_string());
     }
 
+    // 先校验主体存在（2026-09-23 加）：否则会给一个已经删掉的 game_id 写进封面索引与
+    // 文件，而那条"孤儿"索引没有任何界面能读到、也没有任何清理逻辑会碰它 ——
+    // 它自己就是那条引用，引用计数永远 ≥1，对应的文件永远删不掉。
+    {
+        let db_guard = lock_or_recover(&db);
+        db_guard
+            .get_game_by_id(&game_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "游戏不存在".to_string())?;
+    }
+
     // 入库统一走 cover_store：解码 → 必要时转码 → 生成缩略图 → 写索引 → 清理旧文件。
     // delete_src = false：用户手选的文件不动它，只把内容收进封面库。
     //
@@ -413,33 +424,53 @@ pub fn remove_game_cover(
     Ok(())
 }
 
-/// 获取所有游戏的有效封面路径（供前端通过 asset 协议加载）
+/// 获取所有主体（游戏 + 手账）的有效封面路径（供前端通过 asset 协议加载）
 ///
-/// 返回 `{ game_id: { main, thumb } }`：
+/// 返回 `{ "<owner_kind>:<owner_id>": { main, thumb, updated_at } }`：
 /// - **含已移除游戏的留档封面**（state=archived）——时长排行里已删条目照样显示图片；
-/// - `thumb` 供卡片网格/排行等小尺寸场景使用，避免整张原图参与解码。
+/// - `thumb` 供卡片网格/排行等小尺寸场景使用，避免整张原图参与解码；
+/// - `updated_at` 是主图**最后一次被替换**的时刻，前端拼进 asset URL 当破缓存参数
+///   （换封面原地覆盖同名文件，URL 不变会被 WebView 图片缓存吃掉）。
 /// - 索引缺失但 `cover_local` 指向的文件确实存在时兜底返回（迁移未跑完/外部放入）。
+///
+/// **为什么带上手账**（2026-09-24）：原先只返回 game，手账侧取图靠 `review.cover_local`
+/// + `review.updated_at` 拼参数，而 `updated_at` 是**条目**改动时刻（改评分/改名都会动），
+/// 会让 URL 无谓抖动。统一从这里取「封面行」的时间戳，两侧语义才一致。
 #[tauri::command]
 pub fn get_all_covers(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<std::collections::HashMap<String, crate::models::CoverSet>, String> {
     let db_guard = lock_or_recover(&db);
 
+    /// 拼键：与前端 `coverKey()` 必须一致
+    fn key(owner_kind: &str, owner_id: &str) -> String {
+        format!("{}:{}", owner_kind, owner_id)
+    }
+
     let mut covers: std::collections::HashMap<String, crate::models::CoverSet> =
         std::collections::HashMap::new();
 
+    // 游戏走旧口径的裸 id 键（前端已有大量 `coverPaths[gameId]` 消费点，不动它）；
+    // 手账走 `review:<id>` 命名键，避免与游戏 id 撞键（两者都是 uuid，撞的概率极低
+    // 但语义上本就该分开）。
     for row in db_guard.all_cover_rows().map_err(|e| e.to_string())? {
-        if row.owner_kind != OWNER_GAME {
-            continue;
-        }
         let abs = cover_store::abs_path(&row.rel_path);
         if !abs.exists() {
             continue;
         }
         let path = abs.to_string_lossy().to_string();
-        let entry = covers.entry(row.owner_id).or_default();
+        let map_key = match row.owner_kind.as_str() {
+            OWNER_GAME => row.owner_id.clone(),
+            OWNER_REVIEW => key(OWNER_REVIEW, &row.owner_id),
+            _ => continue,
+        };
+        let entry = covers.entry(map_key).or_default();
         match row.kind.as_str() {
-            crate::models::KIND_MAIN => entry.main = Some(path),
+            crate::models::KIND_MAIN => {
+                entry.main = Some(path);
+                // 时间戳跟随主图行
+                entry.updated_at = Some(row.updated_at.clone());
+            }
             crate::models::KIND_THUMB => entry.thumb = Some(path),
             _ => {}
         }
@@ -465,6 +496,8 @@ pub fn get_all_covers(
                 let entry = crate::models::CoverSet {
                     main: Some(path_str),
                     thumb: None,
+                    // 无索引行可取时间戳 —— 交给前端回退到条目自身的 updated_at
+                    updated_at: None,
                 };
                 covers.insert(game.id.clone(), entry);
             }
@@ -982,6 +1015,85 @@ pub fn set_game_status(
 }
 
 /// 从主备份文件路径推导独立密钥文件路径（xxx.json -> xxx.keys.json）
+/// 导出存档备份的总字节上限（防御性闸门）。
+///
+/// 正常存档目录不可能接近这个量级；一旦触到，基本意味着 `save_paths` 被误填成了
+/// 整个磁盘或用户目录。没有这道闸门时，一次手滑就能对着几 TB 的数据打 ZIP。
+const SAVE_BACKUP_MAX_TOTAL_BYTES: u64 = 200 * 1024 * 1024 * 1024; // 200 GB
+
+/// 导出存档备份的条目数上限
+const SAVE_BACKUP_MAX_ENTRIES: u64 = 2_000_000;
+
+/// 导出过程中的累计状态（跨递归层级共享）
+struct ZipExportState {
+    total_bytes: u64,
+    entries: u64,
+}
+
+/// 判断路径本身是否 reparse point（junction / 符号链接 / 挂载点）。
+///
+/// 必须用 `symlink_metadata`：`metadata` 会**跟随**链接，永远看不到链接本体。
+/// 导出时拒不跟随是必须的 —— 存档目录里一个指向别处的 junction，会把那整块盘卷进备份。
+fn is_reparse_point(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        std::fs::symlink_metadata(path)
+            .map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    }
+}
+
+/// 原子写文件：先写**同目录**的唯一临时文件，落盘后再 rename 覆盖目标。
+///
+/// 直接 `std::fs::write(目标)` 在中途失败（磁盘满、U 盘拔出、进程被杀）时，会留下
+/// **半成品覆盖掉原本完好的旧备份** —— 而导出恰恰是"给自己留后路"的操作，后路本身
+/// 不该这么脆。改成先写临时文件后，失败只影响临时文件，原文件原封不动。
+///
+/// 临时文件必须与目标同目录：rename 跨卷会失败。
+fn write_file_atomically(target: &str, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let target_path = std::path::Path::new(target);
+    let file_name = target_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| format!("无效的导出路径: {}", target))?;
+    let temp_path = target_path.with_file_name(format!(
+        ".{}.{}.tmp",
+        file_name,
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp_path)?;
+        file.write_all(contents)?;
+        file.flush()?;
+        // sync_all 让内容真正落盘后再替换：否则断电时可能出现"rename 已生效、
+        // 内容还在页缓存"的半空文件。
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("写入临时文件失败: {}", e));
+    }
+
+    // std::fs::rename 在 Windows 上是替换语义（MoveFileEx + MOVEFILE_REPLACE_EXISTING）
+    if let Err(e) = std::fs::rename(&temp_path, target_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("替换目标文件失败: {}", e));
+    }
+    Ok(())
+}
+
 /// 后缀剥离大小写不敏感（.json / .Json / .JSON 都命中），否则用户手输混合大小写
 /// 文件名会得到 backup.Json.keys.json 这类怪名。
 fn derive_keys_path(file_path: &str) -> String {
@@ -1039,10 +1151,10 @@ pub fn export_game_data(
         "settings": sanitized_settings,
     });
 
-    // 序列化并写入主备份
+    // 序列化并**原子**写入主备份（先写同目录临时文件再替换，中途失败不破坏已有备份）
     let json = serde_json::to_string_pretty(&export_data)
         .map_err(|e| format!("序列化失败: {}", e))?;
-    std::fs::write(&file_path, json)
+    write_file_atomically(&file_path, json.as_bytes())
         .map_err(|e| format!("写入主备份失败: {}", e))?;
 
     // 独立密钥文件（敏感信息，单独存放、单独标注）
@@ -1054,7 +1166,7 @@ pub fn export_game_data(
     }))
     .map_err(|e| format!("序列化密钥失败: {}", e))?;
     let keys_path = derive_keys_path(&file_path);
-    std::fs::write(&keys_path, keys_json)
+    write_file_atomically(&keys_path, keys_json.as_bytes())
         .map_err(|e| format!("写入密钥文件失败: {}", e))?;
 
     Ok(serde_json::json!({
@@ -1063,7 +1175,15 @@ pub fn export_game_data(
     }))
 }
 
-/// 导入游戏库数据（从 JSON 备份文件恢复，自动识别同目录的密钥文件）
+/// 导入游戏库数据（从 JSON 备份文件恢复，自动识别同目录的密钥文件）。
+///
+/// 落库走**单个事务**（2026-09-23 起）。此前是逐条 upsert、再写设置、再写密钥，
+/// 每步各自提交：中途失败会留下"只导进去一半"的库，而失败只写进日志，
+/// 前端只看到计数偏少，用户无从察觉。
+///
+/// 现在分两阶段：
+///   阶段 1 解析与校验（不碰数据库）—— 格式坏的条目在这里出局，不会污染库；
+///   阶段 2 单事务落库 —— 要么全部生效，要么整体回滚，库保持原样。
 #[tauri::command]
 pub fn import_game_data(
     db: State<'_, Arc<Mutex<Database>>>,
@@ -1075,10 +1195,8 @@ pub fn import_game_data(
     let import_data: serde_json::Value = serde_json::from_str(&json_data)
         .map_err(|e| format!("JSON 解析失败: {}", e))?;
 
-    let db_guard = lock_or_recover(&db);
-
-    // 导入游戏
-    let mut imported_games = 0u32;
+    // ===== 阶段 1：解析与校验（不碰数据库） =====
+    let mut games_to_import: Vec<Game> = Vec::new();
     if let Some(games_array) = import_data["games"].as_array() {
         for game_json in games_array {
             match serde_json::from_value::<Game>(game_json.clone()) {
@@ -1088,14 +1206,7 @@ pub fn import_game_data(
                         tracing::warn!("跳过无效 game_id 的游戏: {}", game.id);
                         continue;
                     }
-                    // 封面策略：upsert_game 的 ON CONFLICT 对 cover 字段使用
-                    // COALESCE(excluded, games) —— 导入时若本地已有该游戏，保留现有封面；
-                    // 其他机器导出的封面路径不会生效（文件不存在时前端自动显示占位并可由"刷新封面"重新获取）
-                    if let Err(e) = db_guard.upsert_game(&game) {
-                        tracing::warn!("导入游戏失败 {}: {}", game.name, e);
-                    } else {
-                        imported_games += 1;
-                    }
+                    games_to_import.push(game);
                 }
                 Err(e) => {
                     tracing::warn!("解析游戏数据失败: {}", e);
@@ -1104,46 +1215,61 @@ pub fn import_game_data(
         }
     }
 
-    // 导入设置
-    let mut settings_restored = false;
-    if let Some(settings_json) = import_data.get("settings") {
-        match serde_json::from_value::<Settings>(settings_json.clone()) {
-            Ok(settings) => {
-                if let Err(e) = settings.save_to_db(&db_guard) {
-                    tracing::warn!("导入设置失败: {}", e);
-                } else {
-                    settings_restored = true;
-                }
-            }
+    let settings_to_import: Option<Settings> = match import_data.get("settings") {
+        Some(settings_json) => match serde_json::from_value::<Settings>(settings_json.clone()) {
+            Ok(settings) => Some(settings),
             Err(e) => {
                 tracing::warn!("解析设置数据失败: {}", e);
+                None
             }
-        }
-    }
+        },
+        None => None,
+    };
 
-    // 自动恢复密钥文件（若存在）。只恢复非空值，避免空值覆盖现有密钥
-    let mut keys_restored = 0u32;
+    // 密钥文件（敏感信息单独存放，若存在则一并恢复）：先读好，稍后连主数据入同一事务
     let keys_path = derive_keys_path(&file_path);
-    if let Ok(keys_data) = std::fs::read_to_string(&keys_path) {
-        if let Ok(keys_json) = serde_json::from_str::<serde_json::Value>(&keys_data) {
-            if let Some(key) = keys_json["steamgriddb_api_key"].as_str() {
-                if !key.is_empty() {
-                    match db_guard.set_setting("steamgriddb_api_key", key) {
-                        Ok(_) => keys_restored += 1,
-                        Err(e) => tracing::warn!("恢复 SteamGridDB 密钥失败: {}", e),
+    let keys_json: Option<serde_json::Value> = std::fs::read_to_string(&keys_path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok());
+
+    // ===== 阶段 2：单个事务落库（全成功才生效） =====
+    //
+    // 锁说明：本命令与改动前一样**全程持有 DB 锁**。单事务把 N 次独立提交压成一次，
+    // 持锁时间反而更短 —— 不会给截图关键路径里那次"主键查询(Steam 退让)"添堵。
+    // 请勿改成"分批提交 + 中间放锁"，那才会引入新的卡顿面。
+    let db_guard = lock_or_recover(&db);
+    let (imported_games, settings_restored, keys_restored) = db_guard
+        .with_transaction(|| {
+            let mut imported = 0u32;
+            for game in &games_to_import {
+                // 封面策略：upsert_game 的 ON CONFLICT 对 cover 字段使用
+                // COALESCE(excluded, games) —— 导入时若本地已有该游戏，保留现有封面；
+                // 其他机器导出的封面路径不会生效（文件不存在时前端自动显示占位，
+                // 可由"刷新封面"重新获取）。
+                db_guard.upsert_game(game)?;
+                imported += 1;
+            }
+
+            let mut settings_ok = false;
+            if let Some(settings) = &settings_to_import {
+                settings.save_to_db(&db_guard)?;
+                settings_ok = true;
+            }
+
+            // 只恢复非空值，避免空值覆盖现有密钥
+            let mut keys_ok = 0u32;
+            for field in ["steamgriddb_api_key", "llm_api_key"] {
+                if let Some(key) = keys_json.as_ref().and_then(|k| k[field].as_str()) {
+                    if !key.is_empty() {
+                        db_guard.set_setting(field, key)?;
+                        keys_ok += 1;
                     }
                 }
             }
-            if let Some(key) = keys_json["llm_api_key"].as_str() {
-                if !key.is_empty() {
-                    match db_guard.set_setting("llm_api_key", key) {
-                        Ok(_) => keys_restored += 1,
-                        Err(e) => tracing::warn!("恢复 LLM 密钥失败: {}", e),
-                    }
-                }
-            }
-        }
-    }
+
+            Ok((imported, settings_ok, keys_ok))
+        })
+        .map_err(|e| format!("导入失败，已整体回滚（数据库保持原样）：{}", e))?;
 
     Ok(serde_json::json!({
         "imported_games": imported_games,
@@ -1316,16 +1442,47 @@ pub fn check_save_paths_for_game(
     Ok(exists)
 }
 
-/// 将目录或文件添加到 ZIP 归档中
+/// 将目录或文件添加到 ZIP 归档中。
+///
+/// 两道防护（2026-09-23 加）：
+/// - **不跟随 reparse point**（junction / 符号链接）。`Path::is_dir()` 会跟随链接，
+///   存档目录里一个指向别的盘的 junction 会把那块盘整个卷进备份；链接成环时递归还会
+///   一直走下去。这里改成"跳过并回报一条错误"，不整体失败。
+/// - **累计体积与条目数上限**：见 `SAVE_BACKUP_MAX_TOTAL_BYTES`。
 fn add_path_to_zip(
     zip: &mut zip::ZipWriter<std::io::BufWriter<std::fs::File>>,
     base_path: &std::path::Path,
     current_path: &std::path::Path,
     zip_prefix: &str,
+    state: &mut ZipExportState,
 ) -> Result<(), String> {
     use zip::write::FileOptions;
 
+    // 入口先拦：无论它链接到目录还是文件，一律不跟随
+    if is_reparse_point(current_path) {
+        return Err(format!(
+            "已跳过链接（junction/symlink），避免把链接目标整块卷入备份: {}",
+            current_path.display()
+        ));
+    }
+
     if current_path.is_file() {
+        let size = std::fs::metadata(current_path).map(|m| m.len()).unwrap_or(0);
+        if state.total_bytes.saturating_add(size) > SAVE_BACKUP_MAX_TOTAL_BYTES {
+            return Err(format!(
+                "备份总大小将超过上限 {} GB，已中止该路径（请检查存档路径是否误填成了整个磁盘）",
+                SAVE_BACKUP_MAX_TOTAL_BYTES / 1024 / 1024 / 1024
+            ));
+        }
+        state.entries += 1;
+        if state.entries > SAVE_BACKUP_MAX_ENTRIES {
+            return Err(format!(
+                "备份条目数将超过上限 {}，已中止该路径",
+                SAVE_BACKUP_MAX_ENTRIES
+            ));
+        }
+        state.total_bytes += size;
+
         let relative = current_path.strip_prefix(base_path)
             .unwrap_or(current_path);
         let zip_path = if zip_prefix.is_empty() {
@@ -1348,7 +1505,7 @@ fn add_path_to_zip(
             .map_err(|e| format!("读取目录失败 {}: {}", current_path.display(), e))?
         {
             let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
-            add_path_to_zip(zip, base_path, &entry.path(), zip_prefix)?;
+            add_path_to_zip(zip, base_path, &entry.path(), zip_prefix, state)?;
         }
     }
 
@@ -1373,12 +1530,52 @@ pub async fn export_saves_backup(
         .map_err(|e| format!("导出任务执行失败: {}", e))?
 }
 
-/// 导出存档备份的同步实现（在阻塞线程池中运行）
+/// 导出存档备份的同步实现（在阻塞线程池中运行）。
+///
+/// 先写**同目录临时文件**，全部成功后再原子替换目标 —— 中途失败只影响临时文件，
+/// 已有的旧备份原封不动。旧实现直接 `File::create(目标)`，失败会把旧备份覆盖成半成品。
 fn export_saves_backup_sync(
     games: &[Game],
     export_path: &str,
 ) -> Result<serde_json::Value, String> {
-    let file = std::fs::File::create(export_path)
+    let target = std::path::Path::new(export_path);
+    let target_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| format!("无效的导出路径: {}", export_path))?;
+    let temp_path = target.with_file_name(format!(
+        ".{}.{}.tmp",
+        target_name,
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    let built = build_save_zip(games, &temp_path);
+    let (exported_count, errors) = match built {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+    };
+
+    // std::fs::rename 在 Windows 上是替换语义
+    if let Err(e) = std::fs::rename(&temp_path, target) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("替换备份文件失败: {}", e));
+    }
+
+    Ok(serde_json::json!({
+        "exported": exported_count,
+        "errors": errors,
+    }))
+}
+
+/// 把各游戏的存档目录打进 `temp_path` 指向的 ZIP，返回 (成功条数, 错误列表)。
+fn build_save_zip(
+    games: &[Game],
+    temp_path: &std::path::Path,
+) -> Result<(u32, Vec<String>), String> {
+    let file = std::fs::File::create(temp_path)
         .map_err(|e| format!("创建 ZIP 文件失败: {}", e))?;
     let buf_writer = std::io::BufWriter::new(file);
     let mut zip = zip::ZipWriter::new(buf_writer);
@@ -1386,6 +1583,11 @@ fn export_saves_backup_sync(
     let mut manifest: Vec<serde_json::Value> = Vec::new();
     let mut exported_count = 0u32;
     let mut errors: Vec<String> = Vec::new();
+    // 体积/条目闸门跨所有游戏累计，避免"逐个都不超、加起来爆掉"
+    let mut state = ZipExportState {
+        total_bytes: 0,
+        entries: 0,
+    };
 
     for game in games {
         if game.save_paths.is_empty() {
@@ -1413,7 +1615,7 @@ fn export_saves_backup_sync(
                 format!("{}_{}", safe_name, id_hint)
             };
 
-            match add_path_to_zip(&mut zip, &path, &path, &zip_prefix) {
+            match add_path_to_zip(&mut zip, &path, &path, &zip_prefix, &mut state) {
                 Ok(_) => {
                     manifest.push(serde_json::json!({
                         "game_id": game.id,
@@ -1443,10 +1645,237 @@ fn export_saves_backup_sync(
 
     zip.finish().map_err(|e| format!("完成 ZIP 文件失败: {}", e))?;
 
-    Ok(serde_json::json!({
-        "exported": exported_count,
-        "errors": errors,
-    }))
+    Ok((exported_count, errors))
+}
+
+/// 一条落盘计划：ZIP 内条目名 → 最终目标路径。
+struct ExtractEntry {
+    zip_name: String,
+    dest: std::path::PathBuf,
+    zip_prefix: String,
+    is_dir: bool,
+}
+
+/// 完整的恢复落盘计划（预览与实际导入共用）。
+struct ExtractPlan {
+    entries: Vec<ExtractEntry>,
+    /// 去重后的目标根目录（绝对路径）
+    target_dirs: Vec<String>,
+    errors: Vec<String>,
+}
+
+/// 纯逻辑路径规范化：消解 `.` 与 `..`，**不访问文件系统**。
+///
+/// 用来取代原先的 `canonicalize` 方案做 containment 判定。后者有两个毛病：
+/// ① 要求路径真实存在，逼得调用方在"预览"阶段就得把目录建出来（有副作用）；
+/// ② 对不存在的嵌套路径只能退化成"检查父目录"，逻辑分叉、难维护。
+fn normalize_logically(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// 解析 ZIP 备份的 manifest，产出完整落盘计划。
+///
+/// **纯解析：不建目录、不写文件**，因此可安全用于"恢复前预览"。
+///
+/// 铁律：预览与导入必须共用这一份解析。一旦分裂成两份，"预览说要写 A、实际写进 B"
+/// 这类错位几乎必然冒出来，且极难排查。
+fn build_extract_plan(
+    archive: &mut zip::ZipArchive<std::io::BufReader<std::fs::File>>,
+) -> Result<ExtractPlan, String> {
+    // 读取 manifest.json
+    let manifest: Vec<serde_json::Value> = {
+        let mut manifest_file = archive
+            .by_name("manifest.json")
+            .map_err(|_| "ZIP 文件中缺少 manifest.json".to_string())?;
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut manifest_file, &mut content)
+            .map_err(|e| format!("读取 manifest.json 失败: {}", e))?;
+        serde_json::from_str(&content).map_err(|e| format!("解析 manifest.json 失败: {}", e))?
+    };
+
+    // 预处理：一次性收集所有 ZIP 文件名，避免对每个 manifest 条目重复遍历 ZIP 目录
+    let all_zip_names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut entries: Vec<ExtractEntry> = Vec::new();
+    let mut target_dirs: Vec<String> = Vec::new();
+
+    for entry in &manifest {
+        let original_path = entry["original_path"].as_str().unwrap_or("");
+        let zip_prefix = entry["zip_prefix"].as_str().unwrap_or("");
+
+        if original_path.is_empty() || zip_prefix.is_empty() {
+            continue;
+        }
+
+        let expanded = utils::path::expand_env_vars(original_path);
+        let target_path = std::path::PathBuf::from(&expanded);
+
+        // 目标根必须是绝对路径：相对路径会随进程工作目录漂移，containment 判定就没有意义了
+        if !target_path.is_absolute() {
+            errors.push(format!("跳过非绝对路径的存档目标: {}", expanded));
+            continue;
+        }
+        let normalized_target = normalize_logically(&target_path);
+        let target_display = target_path.display().to_string();
+        if !target_dirs.contains(&target_display) {
+            target_dirs.push(target_display);
+        }
+
+        let prefix_with_slash = format!("{}/", zip_prefix);
+        let file_names: Vec<&str> = all_zip_names
+            .iter()
+            .filter(|name| name.as_str() == zip_prefix || name.starts_with(&prefix_with_slash))
+            .map(|s| s.as_str())
+            .collect();
+
+        for file_name in file_names {
+            let relative = file_name.strip_prefix(&prefix_with_slash).unwrap_or(file_name);
+            let relative_path = std::path::Path::new(relative);
+
+            // 安全检查：ZIP 条目名不得含 `..`
+            if relative_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                tracing::warn!("跳过包含路径遍历的 ZIP 条目: {}", file_name);
+                continue;
+            }
+            // 安全检查：ZIP 条目名不得是绝对路径
+            if relative_path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::Prefix(_)
+                )
+            }) {
+                tracing::warn!("跳过包含绝对路径的 ZIP 条目: {}", file_name);
+                continue;
+            }
+
+            let dest = if relative.is_empty() {
+                target_path.clone()
+            } else {
+                target_path.join(relative)
+            };
+
+            // 最终 containment：落点规范化后必须仍在目标根之内（纯逻辑，无副作用）
+            if !normalize_logically(&dest).starts_with(&normalized_target) {
+                tracing::warn!("跳过目标路径超出预期目录的 ZIP 条目: {}", file_name);
+                continue;
+            }
+
+            entries.push(ExtractEntry {
+                // ZIP 惯例：目录条目的名字以 '/' 结尾
+                is_dir: file_name.ends_with('/'),
+                zip_name: file_name.to_string(),
+                dest,
+                zip_prefix: zip_prefix.to_string(),
+            });
+        }
+    }
+
+    Ok(ExtractPlan {
+        entries,
+        target_dirs,
+        errors,
+    })
+}
+
+/// 覆盖前把已存在的目标文件挪成 `.bak` 留档，返回留下的备份路径（原本不存在则为 None）。
+///
+/// 用 rename 而非 copy：同目录移动是瞬时的、不额外占空间，也不会在大存档上卡住。
+/// 目的只有一个 —— 恢复错了备份时，原来那份还躺在旁边。
+fn backup_existing_file(dest: &std::path::Path) -> Result<Option<std::path::PathBuf>, String> {
+    if !dest.is_file() {
+        return Ok(None);
+    }
+    let Some(file_name) = dest.file_name() else {
+        return Ok(None);
+    };
+    let backup = dest.with_file_name(format!("{}.bak", file_name.to_string_lossy()));
+    // Windows 上 rename 是替换语义：重复恢复时旧 .bak 会被新版覆盖
+    std::fs::rename(dest, &backup)
+        .map_err(|e| format!("备份原文件失败 {}: {}", dest.display(), e))?;
+    Ok(Some(backup))
+}
+
+/// 存档恢复预览：把"即将写入哪里、会新建哪些目录、会覆盖哪些文件"先摊给用户看。
+#[derive(serde::Serialize)]
+pub struct SavesRestorePreview {
+    /// 去重后的目标根目录（最终落点）
+    pub target_dirs: Vec<String>,
+    /// 还不存在、恢复时会被新建的目标根目录
+    pub dirs_to_create: Vec<String>,
+    /// ZIP 内将被写出的文件总数（不含目录条目）
+    pub total_files: u64,
+    /// 会被覆盖的文件总数
+    pub overwrite_count: u64,
+    /// 将被覆盖的文件清单（最多列前 50 条，避免返回体过大）
+    pub overwrite_files: Vec<String>,
+    /// 解析过程中的问题（非致命）
+    pub warnings: Vec<String>,
+}
+
+/// 预览存档备份的恢复落点（**不写入任何东西**）。
+///
+/// 前端在真正执行恢复前先调它；若 `overwrite_count > 0` 就弹确认框，
+/// 让用户先看清"这次恢复会覆盖掉哪些现有存档"。
+#[tauri::command]
+pub async fn preview_saves_backup(zip_path: String) -> Result<SavesRestorePreview, String> {
+    tauri::async_runtime::spawn_blocking(move || preview_saves_backup_sync(&zip_path))
+        .await
+        .map_err(|e| format!("预览任务执行失败: {}", e))?
+}
+
+fn preview_saves_backup_sync(zip_path: &str) -> Result<SavesRestorePreview, String> {
+    /// 清单最多列这么多条，避免超大备份把返回体撑爆
+    const MAX_LISTED: usize = 50;
+
+    let file = std::fs::File::open(zip_path).map_err(|e| format!("打开 ZIP 文件失败: {}", e))?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|e| format!("读取 ZIP 文件失败: {}", e))?;
+
+    let plan = build_extract_plan(&mut archive)?;
+
+    let dirs_to_create: Vec<String> = plan
+        .target_dirs
+        .iter()
+        .filter(|d| !std::path::Path::new(d).is_dir())
+        .cloned()
+        .collect();
+
+    let total_files = plan.entries.iter().filter(|e| !e.is_dir).count() as u64;
+
+    let mut overwrite_files: Vec<String> = Vec::new();
+    let mut overwrite_count = 0u64;
+    for entry in plan.entries.iter().filter(|e| !e.is_dir) {
+        if entry.dest.is_file() {
+            overwrite_count += 1;
+            if overwrite_files.len() < MAX_LISTED {
+                overwrite_files.push(entry.dest.display().to_string());
+            }
+        }
+    }
+
+    Ok(SavesRestorePreview {
+        target_dirs: plan.target_dirs,
+        dirs_to_create,
+        total_files,
+        overwrite_count,
+        overwrite_files,
+        warnings: plan.errors,
+    })
 }
 
 /// 从 ZIP 备份文件导入存档（不需要数据库锁，仅做文件 I/O）
@@ -1460,7 +1889,14 @@ pub async fn import_saves_backup(
         .map_err(|e| format!("导入任务执行失败: {}", e))?
 }
 
-/// 导入存档备份的同步实现（在阻塞线程池中运行）
+/// 导入存档备份的同步实现（在阻塞线程池中运行）。
+///
+/// 与预览共用 `build_extract_plan`（**同一份路径解析**），所以"预览看到的落点"
+/// 与"实际写入的位置"必然一致。
+///
+/// 覆盖行为（2026-09-23 改）：目标文件已存在时，先把原文件改成 `.bak` 留档再写新的；
+/// 新文件写入失败则把 `.bak` 挪回原位。旧实现是 `File::create` 直接截断覆盖 ——
+/// 选错备份就是当场丢掉当前存档，一点退路都没有。
 fn import_saves_backup_sync(zip_path: &str) -> Result<serde_json::Value, String> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| format!("打开 ZIP 文件失败: {}", e))?;
@@ -1468,167 +1904,99 @@ fn import_saves_backup_sync(zip_path: &str) -> Result<serde_json::Value, String>
     let mut archive = zip::ZipArchive::new(buf_reader)
         .map_err(|e| format!("读取 ZIP 文件失败: {}", e))?;
 
-    // 读取 manifest.json
-    let manifest: Vec<serde_json::Value> = {
-        let mut manifest_file = archive.by_name("manifest.json")
-            .map_err(|_| "ZIP 文件中缺少 manifest.json".to_string())?;
-        let mut content = String::new();
-        std::io::Read::read_to_string(&mut manifest_file, &mut content)
-            .map_err(|e| format!("读取 manifest.json 失败: {}", e))?;
-        serde_json::from_str(&content)
-            .map_err(|e| format!("解析 manifest.json 失败: {}", e))?
-    };
+    let plan = build_extract_plan(&mut archive)?;
+    let mut errors = plan.errors;
 
-    // 预处理：一次性收集所有 ZIP 文件名，避免对每个 manifest 条目重复遍历 ZIP 目录
-    let all_zip_names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
-
-    // 构建每个 manifest 条目对应的目标路径映射
-    // errors 提前声明：manifest 解析阶段的建目录失败也要对前端可见，不能静默跳过
-    let mut errors: Vec<String> = Vec::new();
-    let mut extract_plan: Vec<(String, std::path::PathBuf, String)> = Vec::new();
-    for entry in &manifest {
-        let original_path = entry["original_path"].as_str().unwrap_or("");
-        let zip_prefix = entry["zip_prefix"].as_str().unwrap_or("");
-
-        if original_path.is_empty() || zip_prefix.is_empty() {
+    // 建出目标根目录（换机 / 存档丢失场景下这些目录本来并不存在）。
+    // 注意 save_path 也可能指向**单个文件**：那种情况 create_dir_all 必然失败，跳过即可
+    // （文件级写入会各自兜住父目录）。
+    for dir in &plan.target_dirs {
+        let path = std::path::Path::new(dir);
+        if path.is_file() {
             continue;
         }
-
-        let expanded = utils::path::expand_env_vars(original_path);
-        let target_path = std::path::PathBuf::from(&expanded);
-
-        // 创建目标目录本身（原存档目录不存在时也要能恢复——换机/存档丢失场景）。
-        // 必须建出 target_path，否则下方 is_safe 的 canonicalize 校验会因目录不存在而误判"不安全"，
-        // 导致所有文件被跳过、restored 却虚报成功。
-        // 注意：save_path 可能指向单个文件（add_path_to_zip 支持 is_file），目标已存在且是文件时
-        // create_dir_all 必然失败——此时跳过建目录（下方 is_safe 走 dest.canonicalize() 直比分支）；
-        // 其余建目录失败记入 errors 后跳过，保持错误对前端可见。
-        if !target_path.is_file() {
-            if let Err(e) = std::fs::create_dir_all(&target_path) {
-                errors.push(format!("创建存档目标目录失败 {}: {}", target_path.display(), e));
-                continue;
-            }
-        }
-
-        // 从已缓存的 ZIP 文件名列表中筛选该前缀下的条目
-        let prefix_with_slash = format!("{}/", zip_prefix);
-        let file_names: Vec<&str> = all_zip_names.iter()
-            .filter(|name| name.as_str() == zip_prefix || name.starts_with(&prefix_with_slash))
-            .map(|s| s.as_str())
-            .collect();
-
-        for file_name in file_names {
-            let relative = file_name.strip_prefix(&prefix_with_slash)
-                .unwrap_or(file_name);
-
-            // 安全检查：防止 ZIP 路径穿越攻击（如 prefix/../../etc/important_file）
-            let relative_path = std::path::Path::new(relative);
-            let has_parent_traversal = relative_path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir));
-            if has_parent_traversal {
-                tracing::warn!("跳过包含路径遍历的 ZIP 条目: {}", file_name);
-                continue;
-            }
-            // 安全检查：拒绝绝对路径的 ZIP 条目
-            let has_absolute = relative_path
-                .components()
-                .any(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Prefix(_)));
-            if has_absolute {
-                tracing::warn!("跳过包含绝对路径的 ZIP 条目: {}", file_name);
-                continue;
-            }
-
-            let dest = if relative.is_empty() {
-                target_path.clone()
-            } else {
-                target_path.join(relative)
-            };
-            // 最终安全检查：确保解压目标在预期目录下
-            // canonicalize 要求路径存在，因此对不存在的路径使用父目录检查
-            let is_safe = if let Ok(canonical_dest) = dest.canonicalize() {
-                // 路径已存在，直接比较
-                target_path.canonicalize()
-                    .map(|ct| canonical_dest.starts_with(&ct))
-                    .unwrap_or(false)
-            } else {
-                // 路径不存在（新文件），先创建其父目录再做安全检查，
-                // 否则嵌套子目录尚未创建时 canonicalize 会失败，误判"不安全"而跳过文件
-                let parent = dest.parent().unwrap_or(&dest);
-                if std::fs::create_dir_all(parent).is_err() {
-                    false
-                } else if let Ok(canonical_parent) = parent.canonicalize() {
-                    if let Ok(canonical_target) = target_path.canonicalize() {
-                        // 父目录必须在目标目录下，且文件名不含路径分隔符
-                        canonical_parent.starts_with(&canonical_target)
-                            && dest.file_name().is_some()
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            };
-            if !is_safe {
-                tracing::warn!("跳过目标路径超出预期目录的 ZIP 条目: {}", file_name);
-                continue;
-            }
-            extract_plan.push((file_name.to_string(), dest, zip_prefix.to_string()));
+        if let Err(e) = std::fs::create_dir_all(path) {
+            errors.push(format!("创建存档目标目录失败 {}: {}", dir, e));
         }
     }
 
-    // 一次性遍历计划，逐个从 archive 中提取（archive 只打开一次）
     // 成功恢复的存档路径（zip_prefix）集合，用于精确计数而非按 manifest 条目数虚报
     let mut restored_prefixes: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for (file_name, dest, zip_prefix) in extract_plan {
-        let mut zip_file = match archive.by_name(&file_name) {
+    for entry in plan.entries {
+        let mut zip_file = match archive.by_name(&entry.zip_name) {
             Ok(f) => f,
             Err(e) => {
-                errors.push(format!("读取 ZIP 条目失败 {}: {}", file_name, e));
+                errors.push(format!("读取 ZIP 条目失败 {}: {}", entry.zip_name, e));
                 continue;
             }
         };
 
-        if zip_file.is_dir() {
-            if let Err(e) = std::fs::create_dir_all(&dest) {
+        if entry.is_dir {
+            if let Err(e) = std::fs::create_dir_all(&entry.dest) {
                 errors.push(format!("创建目录失败: {}", e));
             }
-        } else {
-            if let Some(parent) = dest.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    errors.push(format!("创建目录失败: {}", e));
-                    continue;
-                }
+            continue;
+        }
+
+        if let Some(parent) = entry.dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                errors.push(format!("创建目录失败: {}", e));
+                continue;
             }
-            let mut dest_file = match std::fs::File::create(&dest) {
+        }
+
+        // 覆盖前留档
+        let backup = match backup_existing_file(&entry.dest) {
+            Ok(b) => b,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+
+        let copy_result = {
+            let mut dest_file = match std::fs::File::create(&entry.dest) {
                 Ok(f) => f,
                 Err(e) => {
-                    errors.push(format!("创建文件失败 {}: {}", dest.display(), e));
+                    errors.push(format!("创建文件失败 {}: {}", entry.dest.display(), e));
+                    // 建不出来就把留档挪回去
+                    if let Some(b) = &backup {
+                        let _ = std::fs::rename(b, &entry.dest);
+                    }
                     continue;
                 }
             };
-            if let Err(e) = std::io::copy(&mut zip_file, &mut dest_file) {
-                errors.push(format!("写入文件失败 {}: {}", dest.display(), e));
-            } else {
-                restored_prefixes.insert(zip_prefix);
+            let copied = std::io::copy(&mut zip_file, &mut dest_file);
+            // 句柄必须先释放：Windows 上文件被打开时不允许 rename
+            drop(dest_file);
+            copied
+        };
+        drop(zip_file);
+
+        match copy_result {
+            Ok(_) => {
+                restored_prefixes.insert(entry.zip_prefix);
+            }
+            Err(e) => {
+                errors.push(format!("写入文件失败 {}: {}", entry.dest.display(), e));
+                // 写失败就把留档挪回原位，别让用户两头空
+                if let Some(b) = &backup {
+                    let _ = std::fs::remove_file(&entry.dest);
+                    if let Err(re) = std::fs::rename(b, &entry.dest) {
+                        errors.push(format!("回滚留档失败 {}: {}", b.display(), re));
+                    }
+                }
             }
         }
     }
 
-    // 恢复计数 = 实际成功写出文件的存档路径数
-    let restored_count = restored_prefixes.len() as u32;
-
-    for entry in &manifest {
-        let game_id = entry["game_id"].as_str().unwrap_or("");
-        let original_path = entry["original_path"].as_str().unwrap_or("");
-        if !original_path.is_empty() {
-            tracing::info!("已恢复存档: {} -> {}", game_id, utils::path::expand_env_vars(original_path));
-        }
+    for dir in &plan.target_dirs {
+        tracing::info!("已恢复存档到: {}", dir);
     }
 
     Ok(serde_json::json!({
-        "restored": restored_count,
+        "restored": restored_prefixes.len() as u32,
         "errors": errors,
     }))
 }
@@ -1867,5 +2235,112 @@ mod tests {
         assert_eq!(updated.hltb_completionist, Some(400));
         assert_eq!(updated.save_paths, vec!["D:/New/Path".to_string()]);
         assert_eq!(updated.launch_args, Some("-fullscreen".to_string()));
+    }
+
+    // ==================== 2026-09-23：存档备份加固的回归防线 ====================
+
+    /// 纯逻辑路径规范化：`.` 丢弃、`..` 消解，且不破坏盘符前缀。
+    ///
+    /// 这是恢复落点 containment 判定的基石 —— 它错了，`..` 就能把文件写出目标目录。
+    #[test]
+    fn normalize_logically_handles_dot_and_dotdot() {
+        use std::path::Path;
+        let cases = [
+            (r"C:\a\b", r"C:\a\b"),
+            (r"C:\a\.\b", r"C:\a\b"),
+            (r"C:\a\..\b", r"C:\b"),
+            (r"C:\a\b\..\..\c", r"C:\c"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                normalize_logically(Path::new(input)),
+                Path::new(expected),
+                "规范化 {input} 应得 {expected}"
+            );
+        }
+    }
+
+    /// 构造一个临时 ZIP（含 manifest.json + 若干条目），返回其路径。
+    fn write_test_zip(entries: &[&str], manifest: &serde_json::Value) -> std::path::PathBuf {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join(format!(
+            "gv-restore-test-{}.zip",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let file = std::fs::File::create(&path).expect("建临时 ZIP 失败");
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::FileOptions::default();
+        zip.start_file("manifest.json", opts).unwrap();
+        zip.write_all(manifest.to_string().as_bytes()).unwrap();
+        for name in entries {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(b"data").unwrap();
+        }
+        zip.finish().unwrap();
+        path
+    }
+
+    /// 恢复计划必须剔除 `..` 条目与非绝对路径的目标根，只放行落在目标目录内的条目。
+    ///
+    /// 预览与实际导入共用 `build_extract_plan`，所以这一条同时守住两侧 ——
+    /// 也是"预览说写 A、实际写进 B"这类错位的防线。
+    #[test]
+    fn extract_plan_filters_traversal_and_relative_targets() {
+        let target = std::env::temp_dir()
+            .join(format!("gv-target-{}", uuid::Uuid::new_v4().simple()));
+        let manifest = serde_json::json!([
+            { "game_id": "g1", "original_path": target.display().to_string(), "zip_prefix": "p" },
+            { "game_id": "g2", "original_path": "relative\\oops", "zip_prefix": "q" },
+        ]);
+        let zip_path = write_test_zip(
+            &["p/save.dat", "p/../../escape.dat", "q/whatever.dat"],
+            &manifest,
+        );
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).unwrap();
+        let plan = build_extract_plan(&mut archive).unwrap();
+
+        assert_eq!(plan.entries.len(), 1, "只该接受 p/save.dat");
+        assert_eq!(plan.entries[0].zip_name, "p/save.dat");
+        assert!(!plan.entries[0].is_dir, "文件条目的 is_dir 必须为 false");
+        assert!(
+            plan.entries[0].dest.starts_with(&target),
+            "落点必须落在目标根之下"
+        );
+        assert_eq!(plan.target_dirs.len(), 1, "相对路径的目标根不该进入计划");
+        assert!(
+            !plan.errors.is_empty(),
+            "被拒绝的目标根应留下可回报说明，不能静默丢弃"
+        );
+
+        let _ = std::fs::remove_file(&zip_path);
+    }
+
+    /// 原子写文件：目标已存在时必须**整体替换**（而非只覆盖前几字节），且不留临时文件。
+    #[test]
+    fn atomic_write_replaces_target_and_leaves_no_temp() {
+        let dir = std::env::temp_dir()
+            .join(format!("gv-atomic-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("backup.json");
+        std::fs::write(&target, b"OLD-AND-MUCH-LONGER-CONTENT").unwrap();
+
+        write_file_atomically(&target.display().to_string(), b"NEW").unwrap();
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"NEW",
+            "必须是整体替换，不能留下旧内容的尾巴"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应残留临时文件: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

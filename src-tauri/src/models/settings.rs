@@ -127,22 +127,51 @@ impl Settings {
         })
     }
 
-    /// 保存设置到数据库
+    /// 保存设置到数据库。
+    ///
+    /// 走**单个事务**批量写入（2026-09-23 起）：此前是 14 次独立的 `set_setting`，
+    /// 每条各自提交，中途失败（磁盘满、权限、进程被杀）会留下半套配置——
+    /// 典型症状是"API Key 明明填了却不生效"，因为同一批里的 Base URL 没写进去。
+    ///
+    /// 实现上把全部字段收进**一次** `set_settings_batch` 调用（数值型也先转成字符串），
+    /// 拆成两次调用就变成两个事务了，达不到原子性。
     pub fn save_to_db(&self, db: &crate::core::Database) -> anyhow::Result<()> {
-        db.set_setting("theme", &self.theme)?;
-        db.set_setting("language", &self.language)?;
-        db.set_setting("steamgriddb_api_key", &self.steamgriddb_api_key)?;
-        db.set_setting("llm_protocol", &self.llm_protocol)?;
-        db.set_setting("llm_api_key", &self.llm_api_key)?;
-        db.set_setting("llm_base_url", &self.llm_base_url)?;
-        db.set_setting("llm_model", &self.llm_model)?;
-        db.set_setting("llm_enabled", &self.llm_enabled.to_string())?;
-        db.set_setting("accent_color", &self.accent_color)?;
-        db.set_setting("window_width", &self.window_width.to_string())?;
-        db.set_setting("window_height", &self.window_height.to_string())?;
-        db.set_setting("screenshot_dir", &self.screenshot_dir)?;
-        db.set_setting("screenshot_hotkey", &self.screenshot_hotkey)?;
-        db.set_setting("screenshot_gamepad_hotkey", &self.screenshot_gamepad_hotkey)?;
+        let owned: Vec<(String, String)> = vec![
+            ("theme".to_string(), self.theme.clone()),
+            ("language".to_string(), self.language.clone()),
+            (
+                "steamgriddb_api_key".to_string(),
+                self.steamgriddb_api_key.clone(),
+            ),
+            ("llm_protocol".to_string(), self.llm_protocol.clone()),
+            ("llm_api_key".to_string(), self.llm_api_key.clone()),
+            ("llm_base_url".to_string(), self.llm_base_url.clone()),
+            ("llm_model".to_string(), self.llm_model.clone()),
+            (
+                "llm_enabled".to_string(),
+                if self.llm_enabled { "true" } else { "false" }.to_string(),
+            ),
+            ("accent_color".to_string(), self.accent_color.clone()),
+            ("window_width".to_string(), self.window_width.to_string()),
+            ("window_height".to_string(), self.window_height.to_string()),
+            (
+                "screenshot_dir".to_string(),
+                self.screenshot_dir.clone(),
+            ),
+            (
+                "screenshot_hotkey".to_string(),
+                self.screenshot_hotkey.clone(),
+            ),
+            (
+                "screenshot_gamepad_hotkey".to_string(),
+                self.screenshot_gamepad_hotkey.clone(),
+            ),
+        ];
+        let refs: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        db.set_settings_batch(&refs)?;
         Ok(())
     }
 }

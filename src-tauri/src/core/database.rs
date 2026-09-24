@@ -34,6 +34,11 @@ fn escape_like(input: &str) -> String {
     out
 }
 
+/// 已删除留档条目在成就统计里的伪状态（不是合法的 `games.status` 取值）。
+/// 用途只有两个：① 让依赖状态的成就（P-07「通关者」等）不再对它结算；
+/// ② 给前端一个可辨识的标记，成就页据此标注「已删除」。历史**已解锁**记录不受影响。
+pub const GAME_STATUS_REMOVED: &str = "removed";
+
 /// SQLite 数据库管理
 pub struct Database {
     conn: Connection,
@@ -1734,6 +1739,53 @@ impl Database {
         Ok(())
     }
 
+    /// 在单个事务中执行一组数据库写操作；**失败自动回滚**。
+    ///
+    /// - 闭包内请使用本 `Database` 的 `&self` 方法（`upsert_game` / `set_setting` /
+    ///   `set_settings_batch` 等）：SQLite 的事务是**连接级**的，它们内部的
+    ///   `self.conn.execute` 会自动纳入本事务；若换成别的连接则不在保护范围内。
+    /// - **可重入**：若连接已处于事务中（`is_autocommit() == false`），直接执行闭包
+    ///   而不新开事务 —— SQLite 不支持嵌套 `BEGIN`，不这样处理，批处理方法就无法被
+    ///   包进更大的事务里（会报 "cannot start a transaction within a transaction"）。
+    /// - 为什么需要它：此前多处批量写是"逐条 execute 各自提交"，中途失败会留下半套
+    ///   数据（导入生成半套库、设置存成半套配置）。RAII 事务保证要么全成、要么全回滚，
+    ///   且失败不会把连接留在"事务未提交"的脏状态。
+    pub fn with_transaction<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        if !self.conn.is_autocommit() {
+            return f();
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let out = f()?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// 在**单个事务**里批量写多条设置（全成功才生效）。
+    ///
+    /// 存在的理由：一整份设置是一个语义整体。逐条 `set_setting` 时每条各自提交，
+    /// 中途失败会留下"API Key 写进去了、Base URL 没写"这类**半套配置**——
+    /// 用户侧表现为"配置明明填了却不生效"，极难排查。
+    ///
+    /// 借 `with_transaction` 实现，因此**可被包在更大的事务里**
+    /// （导入备份时，游戏 + 设置 + 密钥就是同一个事务）。
+    pub fn set_settings_batch(&self, items: &[(&str, &str)]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.with_transaction(|| {
+            let mut stmt = self
+                .conn
+                .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)")?;
+            for (key, value) in items {
+                stmt.execute(params![key, value])?;
+            }
+            Ok(())
+        })
+    }
+
     /// 获取游戏总数
     pub fn get_game_count(&self) -> Result<u32> {
         let count: i64 = self.conn.query_row(
@@ -2244,8 +2296,45 @@ impl Database {
     }
 
     /// 聚合每个游戏的成就检测统计
+    ///
+    /// **在库条目 + 已删除留档条目**一并纳入（2026-09-24 修订）。此前只扫 `games` 表，
+    /// 于是被删除的游戏（其成就解锁记录与每日时长汇总都按设计留档）根本进不了返回集，
+    /// 成就页既看不到它们、整体「已解锁」计数也漏算——表现得就像「删游戏把成就删了」。
+    /// 与 `delete_game` / `insert_tombstone` / `reclaim_game_totals` 的「删除只移除库内条目、
+    /// 历史与成就留档」语义对齐，这里补上消费端。
+    ///
+    /// 已删条目的名称与 HLTB 从**手账条目**（同名或英文名相同）回填——手账是独立模块、
+    /// 不随游戏删除蒸发，故最可靠；手账也没有时退回墓碑里留档的原名。
+    /// 已删条目 `status` 一律置 `"removed"`：它已不在库中，P-07「通关者」等依赖状态的成就
+    /// 不应再对它结算，但它此前**已解锁**的记录照旧保留、照旧展示在成就页。
     pub fn get_per_game_achievement_stats(&self) -> Result<Vec<PerGameStats>> {
-        // 1. 游戏基本信息
+        // 0. 手账条目快照：给已删除游戏回填名称与 HLTB（按名字 / 英文名匹配，与
+        //    find_review_id_by_game_name 同口径）。手账为空时照样走下面的兜底。
+        let mut review_by_name: std::collections::HashMap<String, (String, Option<u64>, Option<u64>)> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT name, name_en, hltb_main_story, hltb_completionist FROM reviews",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?.map(|v| v.max(0) as u64),
+                    row.get::<_, Option<i64>>(3)?.map(|v| v.max(0) as u64),
+                ))
+            })?;
+            for row in rows {
+                let (name, name_en, hltb_main, hltb_comp) = row?;
+                let entry = (name.clone(), hltb_main, hltb_comp);
+                review_by_name.insert(crate::core::screenshot::match_key(&name), entry.clone());
+                if let Some(en) = name_en.filter(|e| !e.trim().is_empty()) {
+                    review_by_name.insert(crate::core::screenshot::match_key(&en), entry);
+                }
+            }
+        }
+
+        // 1. 游戏基本信息（在库）
         let mut stats_map: std::collections::HashMap<String, PerGameStats> = std::collections::HashMap::new();
         {
             let mut stmt = self.conn.prepare(
@@ -2281,6 +2370,66 @@ impl Database {
                     hltb_main_story: hltb_main,
                     hltb_completionist: hltb_comp,
                     replayed_after_abandon: replayed,
+                    ..Default::default()
+                });
+            }
+        }
+
+        // 1.5 已删除留档条目（墓碑）：补进统计集，让「删除不删成就」在界面上真正成立。
+        //     ① 名称/HLTB 优先取自手账（不随游戏删除消失），退回墓碑原名；
+        //     ② 累计时长/次数从 play_stats_daily 回填（games 行已不存在，取其当时累计值
+        //        之来源即每日汇总），避免 P-02..P-05/P-16 这类时长成就的进度凭空归零；
+        //     ③ 只补**确实留下痕迹**的条目：有时长汇总、或有成就解锁记录。
+        //        纯墓碑（装过又删、从未玩过）不必出现在成就页，否则成就页会被空壳塞满。
+        {
+            let mut with_traces: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for table in ["play_stats_daily", "achievement_unlocks"] {
+                // achievement_unlocks 的全局成就 game_id 为空串，天然被排除
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT DISTINCT game_id FROM {} WHERE game_id <> ''",
+                    table
+                ))?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    with_traces.insert(row?);
+                }
+            }
+
+            let mut stmt = self.conn.prepare(
+                "SELECT t.id, t.name,
+                        (SELECT COALESCE(SUM(total_seconds), 0) FROM play_stats_daily d WHERE d.game_id = t.id),
+                        (SELECT COALESCE(SUM(session_count), 0)  FROM play_stats_daily d WHERE d.game_id = t.id)
+                 FROM game_tombstones t",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                    row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
+                ))
+            })?;
+            for row in rows {
+                let (id, tomb_name, total_seconds, session_count) = row?;
+                if !with_traces.contains(&id) {
+                    continue; // 装过又删、从未玩过、也无成就——留档但不占成就页
+                }
+                let review = review_by_name.get(&crate::core::screenshot::match_key(&tomb_name));
+                let game_name = review
+                    .map(|(n, _, _)| n.clone())
+                    .unwrap_or_else(|| tomb_name.clone());
+                let (hltb_main, hltb_comp) = review
+                    .map(|(_, m, c)| (*m, *c))
+                    .unwrap_or((None, None));
+                stats_map.insert(id.clone(), PerGameStats {
+                    game_id: id,
+                    game_name,
+                    status: GAME_STATUS_REMOVED.to_string(),
+                    removed: true,
+                    play_time_seconds: total_seconds,
+                    play_count: session_count,
+                    hltb_main_story: hltb_main,
+                    hltb_completionist: hltb_comp,
                     ..Default::default()
                 });
             }
@@ -2527,26 +2676,37 @@ impl Database {
             return Ok(());
         }
 
-        // 注意：PRAGMA foreign_keys 在事务内是 no-op，必须在 BEGIN 之前切换
-        self.conn.execute_batch(
-            "PRAGMA foreign_keys = OFF;
-             BEGIN;
-             CREATE TABLE play_sessions_detached (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 game_id TEXT NOT NULL,
-                 start_time TEXT NOT NULL,
-                 end_time TEXT,
-                 duration_seconds INTEGER NOT NULL
-             );
-             INSERT INTO play_sessions_detached (id, game_id, start_time, end_time, duration_seconds)
-                 SELECT id, game_id, start_time, end_time, duration_seconds FROM play_sessions;
-             DROP TABLE play_sessions;
-             ALTER TABLE play_sessions_detached RENAME TO play_sessions;
-             CREATE INDEX IF NOT EXISTS idx_play_sessions_game_id ON play_sessions(game_id);
-             CREATE INDEX IF NOT EXISTS idx_play_sessions_start_time ON play_sessions(start_time);
-             COMMIT;
-             PRAGMA foreign_keys = ON;",
-        )?;
+        // 注意：PRAGMA foreign_keys 在事务内是 no-op，必须在 BEGIN 之前切换。
+        //
+        // 用 RAII 事务替代原先手写的 BEGIN/COMMIT（2026-09-23）：原写法把
+        // "关外键 → 建表 → 换名 → 提交 → 开外键"整段塞进一个 execute_batch，
+        // 中途失败时**既不回滚、也不恢复 PRAGMA**，连接会停在外键关闭 + 事务未提交的
+        // 脏状态 —— 此后所有写入都被卷进那个未决事务里，行为不可预期。
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+        let migrated = self.with_transaction(|| {
+            self.conn.execute_batch(
+                "CREATE TABLE play_sessions_detached (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     game_id TEXT NOT NULL,
+                     start_time TEXT NOT NULL,
+                     end_time TEXT,
+                     duration_seconds INTEGER NOT NULL
+                 );
+                 INSERT INTO play_sessions_detached (id, game_id, start_time, end_time, duration_seconds)
+                     SELECT id, game_id, start_time, end_time, duration_seconds FROM play_sessions;
+                 DROP TABLE play_sessions;
+                 ALTER TABLE play_sessions_detached RENAME TO play_sessions;
+                 CREATE INDEX IF NOT EXISTS idx_play_sessions_game_id ON play_sessions(game_id);
+                 CREATE INDEX IF NOT EXISTS idx_play_sessions_start_time ON play_sessions(start_time);",
+            )?;
+            Ok(())
+        });
+
+        // 无论成败都必须把外键开关恢复原状（PRAGMA 无法在事务内切换，故置于事务之外）
+        let restored = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        migrated?;
+        restored?;
 
         let kept: i64 = self.conn.query_row("SELECT COUNT(*) FROM play_sessions", [], |r| r.get(0))?;
         tracing::info!(
@@ -3103,6 +3263,98 @@ mod tests {
         assert!(again.is_none(), "认领成功后墓碑应被清除");
     }
 
+    /// 删除游戏不删成就（2026-09-24）：条目移除后，其历史解锁必须仍能从统计集里读到。
+    ///
+    /// 修复前 `get_per_game_achievement_stats` 只扫 `games` 表，被删游戏的 id 根本不在
+    /// 返回集里 → 成就页看不到它、整体「已解锁」计数也漏算，表现得就像「删游戏把成就删了」。
+    /// 本测试钉住三条：① 已删条目进得了统计集且带 removed 标记；
+    /// ② 名称/HLTB 从手账（含英文名）回填，手账缺失时退回墓碑原名；
+    /// ③ 从未玩过、也无解锁痕迹的纯墓碑不进统计集（否则成就页被空壳塞满）。
+    #[test]
+    fn deleted_game_achievements_stay_visible() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+
+        // ── 已删游戏 A：有成就 + 有时长，手账里有同名条目（HLTB 应回填）
+        let a_id = uuid::Uuid::new_v4().to_string();
+        let mut game_a = Game::new("Mafia: The Old Country".to_string());
+        game_a.id = a_id.clone();
+        db.upsert_game(&game_a).unwrap();
+        db.delete_game(&a_id).unwrap();
+        db.insert_tombstone(&a_id, &game_a.name, None, "2026-09-10T00:00:00Z")
+            .unwrap();
+        db.conn
+            .execute_batch(&format!(
+                "INSERT INTO play_stats_daily (day, game_id, total_seconds, session_count, max_duration)
+                     VALUES ('2026-09-01', '{0}', 7200, 3, 3600);
+                 INSERT INTO achievement_unlocks (achievement_id, game_id, unlocked_at)
+                     VALUES ('p01_1', '{0}', '2026-09-01T00:00:00Z');",
+                a_id
+            ))
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO reviews (id, name, name_en, hltb_main_story, hltb_completionist, added_at)
+                 VALUES ('rv-a', '四海兄弟：故乡', 'Mafia: The Old Country', 780, 1560, '2026-08-01')",
+                [],
+            )
+            .unwrap();
+
+        // ── 已删游戏 B：只有纯墓碑（从没玩过、无成就）→ 不应进统计集
+        let b_id = uuid::Uuid::new_v4().to_string();
+        let mut game_b = Game::new("Never Played Removed".to_string());
+        game_b.id = b_id.clone();
+        db.upsert_game(&game_b).unwrap();
+        db.delete_game(&b_id).unwrap();
+        db.insert_tombstone(&b_id, &game_b.name, None, "2026-09-10T00:00:00Z")
+            .unwrap();
+
+        // ── 在库游戏 C：回归保障，别把在库条目弄丢
+        let c_id = uuid::Uuid::new_v4().to_string();
+        let mut game_c = Game::new("Still In Library".to_string());
+        game_c.id = c_id.clone();
+        db.upsert_game(&game_c).unwrap();
+
+        let stats = db.get_per_game_achievement_stats().unwrap();
+        let find = |id: &str| stats.iter().find(|s| s.game_id == id);
+
+        // ① 已删 A 进得了统计集，且标记为 removed
+        let a = find(&a_id).expect("已删除游戏的成就统计必须仍在返回集里（删除不删成就）");
+        assert!(a.removed, "已删除条目应带 removed 标记");
+        assert_eq!(a.status, GAME_STATUS_REMOVED);
+        assert_eq!(a.play_time_seconds, 7200, "累计时长应从每日汇总回填");
+        assert_eq!(a.sessions_count, 3);
+        assert_eq!(a.max_session_duration, 3600);
+
+        // ② 名称走手账中文名，HLTB 从手账回填（成就页 P-08/P-09 的目标值才有意义）
+        assert_eq!(a.game_name, "四海兄弟：故乡", "名称应优先取手账条目");
+        assert_eq!(a.hltb_main_story, Some(780));
+        assert_eq!(a.hltb_completionist, Some(1560));
+
+        // ③ 纯墓碑不进统计集；在库条目照旧在
+        assert!(find(&b_id).is_none(), "从未玩过、无痕迹的纯墓碑不应占成就页");
+        assert!(find(&c_id).is_some(), "在库条目不得被误伤");
+
+        // 汇总层：已删条目的解锁照旧计入，成就页因此不再漏算
+        let summary = crate::core::AchievementEngine::get_summary(&db).unwrap();
+        let a_summary = summary
+            .per_game
+            .iter()
+            .find(|g| g.game_id == a_id)
+            .expect("已删除条目应出现在成就汇总里");
+        assert!(a_summary.removed, "汇总里的已删条目要带 removed 标记给前端");
+        assert!(
+            a_summary.achievements.iter().any(|x| x.unlocked),
+            "已删除条目此前解锁的成就必须仍显示为已解锁"
+        );
+
+        // ④ 已删条目不再参与结算：直接调 evaluate 不应补发新解锁
+        let before = db.get_achievement_unlocks().unwrap().len();
+        let events = crate::core::AchievementEngine::evaluate(&db).unwrap();
+        let new_for_a = events.iter().any(|e| e.game_id.as_deref() == Some(a_id.as_str()));
+        assert!(!new_for_a, "已删除条目不应被补发新成就（时长是从汇总回填的展示值）");
+        let _ = before;
+    }
+
     /// 删除游戏不删记录（2026-09-10）：条目移除后历史不得从统计里消失。
     /// ① 时长排行仍列出它（名字走墓碑还原，is_removed=true）；
     /// ② 总时长不随删除缩水，且不缺明细的库内条目也不会被少算（双账本取大）；
@@ -3613,5 +3865,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ==================== 2026-09-23：事务化改造的回归防线 ====================
+
+    /// 批量设置写入必须是**原子**的，且 `with_transaction` 必须**可重入**。
+    ///
+    /// 可重入这一点有实际后果：导入备份时是"游戏 + 设置 + 密钥"一个大事务，
+    /// 里面会再调 `set_settings_batch`；若它无条件开事务，就会撞上 SQLite 的
+    /// "cannot start a transaction within a transaction"。
+    #[test]
+    fn settings_batch_is_atomic_and_reentrant() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+        db.set_setting("probe", "initial").unwrap();
+
+        // 可重入：外层事务里再调批量方法，必须成功而不是报嵌套错误
+        let nested = db.with_transaction(|| {
+            db.set_settings_batch(&[("probe", "outer"), ("probe2", "added")])?;
+            Ok(())
+        });
+        assert!(nested.is_ok(), "嵌套调用必须成功: {:?}", nested.err());
+        assert_eq!(db.get_setting("probe").unwrap().as_deref(), Some("outer"));
+        assert_eq!(db.get_setting("probe2").unwrap().as_deref(), Some("added"));
+
+        // 回滚：闭包返回 Err 时，事务内已写入的内容必须整体不生效
+        let failed = db.with_transaction(|| -> anyhow::Result<()> {
+            db.set_setting("rollback_probe", "should-not-persist")?;
+            anyhow::bail!("模拟中途失败");
+        });
+        assert!(failed.is_err(), "闭包返回 Err 时 with_transaction 必须一并返回 Err");
+        assert_eq!(
+            db.get_setting("rollback_probe").unwrap(),
+            None,
+            "失败的事务必须整体回滚，不能留下半套配置"
+        );
+        // 回滚不应影响事务之前已提交的值
+        assert_eq!(db.get_setting("probe").unwrap().as_deref(), Some("outer"));
     }
 }

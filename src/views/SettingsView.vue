@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch, inject } from "vue";
+import { ref, computed, onMounted, onUnmounted, watch, inject, h } from "vue";
 import {
   NCard,
   NForm,
@@ -11,9 +11,17 @@ import {
   NSelect,
   NIcon,
   NInputNumber,
+  NPopover,
   useMessage,
+  useDialog,
 } from "naive-ui";
-import { DownloadOutline, CloudUploadOutline, FolderOpenOutline, SaveOutline } from "@vicons/ionicons5";
+import {
+  DownloadOutline,
+  CloudUploadOutline,
+  FolderOpenOutline,
+  SaveOutline,
+  InformationCircleOutline,
+} from "@vicons/ionicons5";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -23,6 +31,7 @@ import { DEFAULT_ACCENT_COLOR, DEBOUNCE_MS } from "../lib/constants";
 import { isValidHexColor } from "../lib/color";
 
 const message = useMessage();
+const dialog = useDialog();
 
 // 默认值仅用于表单初始显示，实际默认值从后端 API 获取
 const settings = ref<Settings>({
@@ -632,7 +641,56 @@ async function handleImportSaves() {
       return;
     }
 
-    const result = await api.importSavesBackup(selected as string);
+    const zipPath = selected as string;
+
+    // 恢复前先预览落点（2026-09-23 加）：把"会写到哪里、哪些目录会被新建、哪些文件
+    // 会被覆盖"摊开给用户看。**只在真会覆盖现有存档时才拦一下** —— 没有冲突就保持
+    // 原来"选完即恢复"的手感，不无谓增加点击。
+    const preview = await api.previewSavesBackup(zipPath);
+
+    if (preview.overwrite_count > 0) {
+      const confirmed = await new Promise<boolean>((resolve) => {
+        dialog.warning({
+          title: "恢复会覆盖现有存档",
+          content: () =>
+            h(
+              "div",
+              { style: "max-height: 320px; overflow: auto; font-size: 13px;" },
+              [
+                h("p", `目标目录：${preview.target_dirs.join("；") || "（无）"}`),
+                h(
+                  "p",
+                  `本次将写出 ${preview.total_files} 个文件，其中 ${preview.overwrite_count} 个会覆盖现有文件：`
+                ),
+                h(
+                  "pre",
+                  {
+                    style:
+                      "white-space: pre-wrap; word-break: break-all; margin: 6px 0;",
+                  },
+                  preview.overwrite_files.join("\n") +
+                    (preview.overwrite_count > preview.overwrite_files.length
+                      ? `\n…等共 ${preview.overwrite_count} 个`
+                      : "")
+                ),
+                h("p", "被覆盖的文件会先改名为 .bak 留档，恢复选错也还有得救。"),
+              ]
+            ),
+          positiveText: "确认恢复",
+          negativeText: "取消",
+          onPositiveClick: () => resolve(true),
+          onNegativeClick: () => resolve(false),
+          onClose: () => resolve(false),
+        });
+      });
+
+      if (!confirmed) {
+        importingSaves.value = false;
+        return;
+      }
+    }
+
+    const result = await api.importSavesBackup(zipPath);
 
     if (result.errors.length > 0) {
       message.warning(
@@ -769,8 +827,35 @@ async function handleImportSaves() {
       </n-form>
     </n-card>
 
-    <!-- 截图设置 -->
+    <!-- 截图设置：说明文字全部收进标题右侧的 ⓘ 气泡，不再以整段小字铺在表单里 -->
     <n-card title="截图设置" style="margin-bottom: 16px">
+      <template #header-extra>
+        <n-popover trigger="hover" placement="bottom-end" :style="{ maxWidth: '430px' }">
+          <template #trigger>
+            <n-icon
+              :component="InformationCircleOutline"
+              size="18"
+              class="hint-icon"
+            />
+          </template>
+          <div class="gv-hint-popover">
+            <div class="gv-hint-title">生效范围</div>
+            <div>· 保存目录与快捷键修改后立即生效</div>
+            <div>· 只对「从本库启动且正在前台运行」的游戏生效</div>
+            <div>
+              · 文件按「进程名\进程名_日期_时间.png」归档到保存目录下对应游戏的文件夹
+            </div>
+            <div class="gv-hint-title">手柄键（走手柄自身的读取通道 XInput）</div>
+            <div>
+              · 手柄需是 Xbox 类设备；PS 手柄经 Steam 或 DS4Windows 转成 Xbox 手柄后同样可用
+            </div>
+            <div>· 组合键会照常传给游戏，建议挑游戏里用不到的键</div>
+            <div>· 中间那个 Xbox 指南键系统不给读，选不了</div>
+            <div>· Steam 游戏有自己的截图，本应用不抢</div>
+            <div>· 只在本库的游戏运行期间生效，不玩游戏时完全不读手柄</div>
+          </div>
+        </n-popover>
+      </template>
       <n-form label-placement="left" label-width="140">
         <n-form-item label="保存目录">
           <n-space align="center" style="width: 100%">
@@ -843,24 +928,10 @@ async function handleImportSaves() {
               {{
                 recordingGamepad
                   ? '请按住要用的键再全部松开（十秒内完成）'
-                  : '点击输入框后按手柄按键即可录制，支持组合键（如 LB+A）'
+                  : '点击输入框后按手柄键即可录制'
               }}
             </span>
           </n-space>
-        </n-form-item>
-        <n-form-item label=" ">
-          <span style="font-size: 12px; color: #888; line-height: 1.6">
-            保存目录与快捷键修改后立即生效。截图仅对「从本库启动且正在前台运行」的游戏生效；
-            文件按「进程名\进程名_日期_时间.png」归档到保存目录下对应游戏文件夹
-          </span>
-        </n-form-item>
-        <n-form-item label=" ">
-          <span style="font-size: 12px; color: #888; line-height: 1.6">
-            手柄键走手柄自身的读取通道（XInput），因此：手柄需是 Xbox 类设备（PS 手柄经
-            Steam 或 DS4Windows 转成 Xbox 手柄后同样可用）；组合键会照常传给游戏，建议挑游戏里用不到的
-            组合；中间那个 Xbox 键系统不给读，选不了；Steam 游戏有自己的截图，本应用不抢。
-            手柄键只在本库的游戏运行期间生效，不玩游戏时完全不读手柄
-          </span>
         </n-form-item>
       </n-form>
     </n-card>
@@ -1036,5 +1107,39 @@ async function handleImportSaves() {
 .color-swatch.active {
   border-color: white;
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.3);
+}
+
+/* 说明气泡的触发图标：颜色跟随主题文本，弱化显示，悬停点亮 */
+.hint-icon {
+  color: inherit;
+  opacity: 0.45;
+  cursor: help;
+  vertical-align: middle;
+  transition: opacity 0.2s;
+}
+
+.hint-icon:hover {
+  opacity: 1;
+}
+</style>
+
+<!-- 气泡内容由 naive-ui 传送到 body，scoped 选择器够不着，故用 gv- 前缀全局定义 -->
+<style>
+.gv-hint-popover {
+  max-width: 430px;
+  font-size: 12px;
+  line-height: 1.8;
+  /* 颜色继承主题文本色，不写死，深浅主题都能读 */
+  color: inherit;
+}
+
+.gv-hint-popover .gv-hint-title {
+  margin-top: 8px;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.gv-hint-popover .gv-hint-title:first-child {
+  margin-top: 0;
 }
 </style>

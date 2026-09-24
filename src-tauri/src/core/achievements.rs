@@ -163,7 +163,14 @@ impl AchievementEngine {
     }
 
     /// 评估单游戏成就
+    ///
+    /// 已删除留档条目（`removed`）不参与结算：它已不入库，`play_time_seconds` 等是从
+    /// 每日汇总回填的展示值，不能反过来当作「时长达标」去补发新成就（否则重装认领时
+    /// 会凭空多出一批解锁）。它**已经解锁**的记录仍由 `get_summary` 照旧读出展示。
     fn eval_per_game(def: &AchievementDef, gs: &PerGameStats) -> (u64, bool) {
+        if gs.removed {
+            return (0, false);
+        }
         let (progress, satisfied) = match def.base_id.as_str() {
             "P-01" => (gs.sessions_count, gs.sessions_count >= 1),
             "P-02" | "P-03" | "P-04" | "P-05" | "P-16" => (gs.play_time_seconds, gs.play_time_seconds >= def.target),
@@ -301,6 +308,7 @@ impl AchievementEngine {
             per_game.push(GameAchievements {
                 game_id: gs.game_id.clone(),
                 game_name: gs.game_name.clone(),
+                removed: gs.removed,
                 achievements,
             });
         }

@@ -208,6 +208,14 @@ export const useGamesStore = defineStore("games", () => {
    * 将封面路径转为 asset URL（Tauri asset 协议直接加载，避免全量 base64 传输）。
    * preferThumb=true 时优先用缩略图（卡片网格/统计排行等小尺寸场景，避免整张原图参与解码）；
    * 缩略图缺失时自动回退原图。
+   *
+   * **必须拼破缓存参数**（2026-09-24 修）：封面文件名恒为 `<game_id>.<ext>`，换封面是
+   * 原地覆盖同名文件 → asset URL 逐字节不变 → WebView2 命中图片缓存继续显示旧图
+   * （老爷实测：点开卡片换封面，关闭后卡片纹丝不动）。
+   *
+   * 参数优先取**封面行**的 `updated_at`（只有封面真换了才变）；取不到时（旧数据/
+   * 索引兜底路径）回退条目自身的 `updated_at`——它偏"吵"（涨时长/改评分都会动，
+   * 会白烧一次解码），但至少保证换完封面能立刻看到新图。
    */
   function coverSrc(gameId: string, preferThumb = true): string | null {
     const entry = coverPaths.value[gameId];
@@ -215,7 +223,9 @@ export const useGamesStore = defineStore("games", () => {
     const p = (preferThumb ? entry.thumb : entry.main) || entry.main || entry.thumb;
     if (!p) return null;
     try {
-      return convertFileSrc(p);
+      const url = convertFileSrc(p);
+      const t = entry.updated_at || games.value.find((g) => g.id === gameId)?.updated_at || gameId;
+      return `${url}${url.includes("?") ? "&" : "?"}t=${encodeURIComponent(t)}`;
     } catch (e) {
       console.error("转换封面路径失败:", gameId, e);
       return null;

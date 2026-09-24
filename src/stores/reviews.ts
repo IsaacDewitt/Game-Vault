@@ -17,6 +17,8 @@ export const useReviewsStore = defineStore("reviews", () => {
   const selectedReview = ref<Review | null>(null);
   // 正在刷新信息的条目 id 集合
   const refreshingIds = ref<Set<string>>(new Set());
+  // 封面路径映射（键 `review:<id>`），含封面行的 updated_at 供破缓存用
+  const coverPaths = ref<Record<string, api.CoverSet>>({});
   // 筛选与排序状态
   const searchQuery = ref("");
   const statusFilter = ref("");
@@ -81,19 +83,34 @@ export const useReviewsStore = defineStore("reviews", () => {
     return result;
   });
 
-  /** 将封面本地路径转为 asset URL（带 updated_at 破折，防同路径覆盖后 WebView 命中缓存不刷新） */
+  /**
+   * 将封面本地路径转为 asset URL，并拼破缓存参数防 WebView 命中旧图。
+   *
+   * 参数优先取**封面行**的 `updated_at`（`getAllCovers` 带回，键 `review:<id>`）——
+   * 它只在封面真被替换时才变。取不到时回退 `review.updated_at`（旧行为）：
+   * 后者偏"吵"，改评分、改评价、改名都会刷新它，会让 URL 无谓抖动、白烧一次
+   * 图片解码（2026-09-24 收敛）。
+   */
   function coverSrc(review: Review): string | null {
     const p = review.cover_local || review.cover_url;
     if (!p) return null;
     try {
       const url = convertFileSrc(p);
-      // 更换封面时新图覆盖同名文件，asset URL 不变 → WebView 图片缓存会让界面显示旧图；
-      // updated_at 每次换封面都会被后端刷新，拼进 URL 即可强制重载
-      const t = review.updated_at ? encodeURIComponent(review.updated_at) : review.id;
-      return `${url}${url.includes("?") ? "&" : "?"}t=${t}`;
+      const entry = coverPaths.value[api.coverKey("review", review.id)];
+      const t = entry?.updated_at || review.updated_at || review.id;
+      return `${url}${url.includes("?") ? "&" : "?"}t=${encodeURIComponent(t)}`;
     } catch (e) {
       console.error("转换封面路径失败:", review.id, e);
       return null;
+    }
+  }
+
+  /** 拉取封面路径映射（含手账条目的封面行时间戳，供破缓存用） */
+  async function loadAllCovers() {
+    try {
+      coverPaths.value = await api.getAllCovers();
+    } catch (e) {
+      console.error("加载封面路径失败:", e);
     }
   }
 
@@ -110,6 +127,7 @@ export const useReviewsStore = defineStore("reviews", () => {
     error.value = null;
     try {
       reviews.value = await api.getReviews();
+      await loadAllCovers();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       error.value = `加载手账列表失败: ${msg}`;
@@ -146,6 +164,8 @@ export const useReviewsStore = defineStore("reviews", () => {
     try {
       const updated = await api.refreshReviewInfo(reviewId);
       updateReviewInStore(reviewId, updated);
+      // 该次刷新可能换了封面（时间戳变）→ 重拉映射，否则 URL 参数还停在旧的
+      await loadAllCovers();
       return updated;
     } finally {
       refreshingIds.value.delete(reviewId);
@@ -206,6 +226,8 @@ export const useReviewsStore = defineStore("reviews", () => {
     if (updated) {
       updateReviewInStore(reviewId, updated);
     }
+    // 封面行时间戳变了 → 必须重拉映射，否则 URL 参数还是旧的、WebView 仍显示旧图
+    await loadAllCovers();
   }
 
   function selectReview(review: Review) {
@@ -240,6 +262,8 @@ export const useReviewsStore = defineStore("reviews", () => {
     sortOrder,
     filteredReviews,
     coverSrc,
+    coverPaths,
+    loadAllCovers,
     loadReviews,
     addReview,
     importFromGame,

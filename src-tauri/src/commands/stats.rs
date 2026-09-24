@@ -4,6 +4,19 @@ use crate::core::Database;
 use crate::models::*;
 use super::lock_or_recover;
 
+/// 统计查询参数的业务上界（防御性钳位）。
+///
+/// 这些参数经 IPC 直达数据库层。前端只会传 30 / 365 / 50 这类小值，但命令层
+/// 不该假设调用方乖巧：`get_daily_stats` 会按 `days` 逐日补零，且开工就是
+/// `Vec::with_capacity(days as usize)`（见 `core/database.rs` 同名方法）——
+/// 传进一个 4e9 级的 days 会申请数百 GB 内存并直接 abort 进程。
+///
+/// **只封上界、不设下界**：加下界会改变 `days = 0` 时的既有语义（当前返回 1 条），
+/// 那属于功能变化，不在本次改动范围内。
+const STATS_MAX_DAYS: u32 = 3650; // 10 年，远超热力图默认 365 天的实际用量
+const STATS_MAX_LIMIT: u32 = 1000; // 远超排行榜 / 明细页的单页需求
+const STATS_MAX_OFFSET: u32 = 1_000_000;
+
 /// 获取游戏时长排行榜
 #[tauri::command]
 pub fn get_play_stats(
@@ -11,7 +24,7 @@ pub fn get_play_stats(
     limit: Option<u32>,
 ) -> Result<Vec<GamePlayStats>, String> {
     let db = lock_or_recover(&db);
-    let limit = limit.unwrap_or(20);
+    let limit = limit.unwrap_or(20).min(STATS_MAX_LIMIT);
     db.get_play_stats(limit).map_err(|e| e.to_string())
 }
 
@@ -22,7 +35,7 @@ pub fn get_daily_stats(
     days: Option<u32>,
 ) -> Result<Vec<DailyStats>, String> {
     let db = lock_or_recover(&db);
-    let days = days.unwrap_or(30);
+    let days = days.unwrap_or(30).min(STATS_MAX_DAYS);
     db.get_daily_stats(days).map_err(|e| e.to_string())
 }
 
@@ -67,7 +80,7 @@ pub fn get_heatmap_stats(
     days: Option<u32>,
 ) -> Result<Vec<HeatmapDay>, String> {
     let db = lock_or_recover(&db);
-    let days = days.unwrap_or(365);
+    let days = days.unwrap_or(365).min(STATS_MAX_DAYS);
     db.get_heatmap_stats(days).map_err(|e| e.to_string())
 }
 
@@ -98,7 +111,7 @@ pub fn get_play_sessions(
     offset: Option<u32>,
 ) -> Result<Vec<PlaySessionDetail>, String> {
     let db = lock_or_recover(&db);
-    let limit = limit.unwrap_or(50);
-    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(50).min(STATS_MAX_LIMIT);
+    let offset = offset.unwrap_or(0).min(STATS_MAX_OFFSET);
     db.get_play_sessions(game_id.as_deref(), limit, offset).map_err(|e| e.to_string())
 }

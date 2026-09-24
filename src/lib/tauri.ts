@@ -153,6 +153,8 @@ export interface GameAchievementStatus {
 export interface GameAchievements {
   game_id: string;
   game_name: string;
+  /** 该条目已从库中删除，仅成就解锁记录留档 */
+  removed: boolean;
   achievements: GameAchievementStatus[];
 }
 
@@ -270,10 +272,21 @@ export async function fetchMissingGameInfo(): Promise<CoverFetchResult> {
 /**
  * 封面路径集合：main 为原图（详情页用），thumb 为缩略图（卡片网格/排行用，可缺省）。
  * 含已移除游戏的留档封面（时长排行里的「已移除」条目照样有图）。
+ *
+ * `updated_at` 是**主图最后一次被替换**的时刻，专供拼 asset URL 的破缓存参数：
+ * 封面文件名恒为 `<owner_id>.<ext>`，换封面原地覆盖同名文件，URL 逐字节不变，
+ * WebView2 会直接命中图片缓存继续显示旧图。缺省时（旧数据/兜底路径）前端
+ * 回退到条目自身的 updated_at。
  */
 export interface CoverSet {
   main: string | null;
   thumb: string | null;
+  updated_at?: string | null;
+}
+
+/** 所有主体封面映射的键：游戏用裸 id，手账用 `review:<id>` */
+export function coverKey(ownerKind: "game" | "review", ownerId: string): string {
+  return ownerKind === "game" ? ownerId : `review:${ownerId}`;
 }
 
 export async function getAllCovers(): Promise<Record<string, CoverSet>> {
@@ -460,6 +473,20 @@ export interface SavesRestoreResult {
 
 export async function importSavesBackup(zipPath: string): Promise<SavesRestoreResult> {
   return invoke("import_saves_backup", { zipPath });
+}
+
+/** 存档恢复预览：即将写入的落点、会新建的目录、会被覆盖的文件 */
+export interface SavesRestorePreview {
+  target_dirs: string[];
+  dirs_to_create: string[];
+  total_files: number;
+  overwrite_count: number;
+  overwrite_files: string[];
+  warnings: string[];
+}
+
+export async function previewSavesBackup(zipPath: string): Promise<SavesRestorePreview> {
+  return invoke("preview_saves_backup", { zipPath });
 }
 
 export interface PlaySessionDetail {

@@ -5,7 +5,7 @@
 基于 **Tauri 2.0** + **Rust** + **Vue 3** 构建，本机运行，数据完全离线。
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.1-6366f1" alt="version">
+  <img src="https://img.shields.io/badge/version-0.8.5-6366f1" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2B-blue" alt="platform">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
 </p>

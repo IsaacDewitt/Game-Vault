@@ -61,6 +61,8 @@ pub struct GameAchievementStatus {
 pub struct GameAchievements {
     pub game_id: String,
     pub game_name: String,
+    /// 该条目已从库中删除、仅成就解锁记录留档（成就页据此标注「已删除」）
+    pub removed: bool,
     pub achievements: Vec<GameAchievementStatus>,
 }
 
@@ -143,6 +145,9 @@ pub struct PerGameStats {
     pub game_id: String,
     pub game_name: String,
     pub status: String,
+    /// 已删除留档条目标记：不在库中、仅供成就页展示既有解锁（见 database.rs 的
+    /// `get_per_game_achievement_stats`）。它不再参与成就结算，但历史解锁照旧可见。
+    pub removed: bool,
     pub play_time_seconds: u64,
     pub play_count: u64,
     pub sessions_count: u64,

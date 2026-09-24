@@ -53,30 +53,54 @@ impl PollWakeup {
 
 /// 双写日志：同时输出到 stderr（开发时终端可见）与日志文件（正式版可排查）
 struct MultiLogWriter {
-    file: Arc<std::sync::Mutex<std::fs::File>>,
+    /// 日志文件句柄。为 `None` 表示文件出口不可用（目录不可写 / 磁盘满 / 权限被拦），
+    /// 此时只写 stderr —— 见 `init_logging` 的降级说明。
+    file: Option<Arc<std::sync::Mutex<std::fs::File>>>,
 }
 
 impl std::io::Write for MultiLogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let _ = std::io::stderr().write(buf);
-        self.file.lock().unwrap_or_else(|e| e.into_inner()).write(buf)
+        match &self.file {
+            Some(file) => file.lock().unwrap_or_else(|e| e.into_inner()).write(buf),
+            // 没有文件出口时报"全部写入成功"，免得 tracing 反复报错刷屏
+            None => Ok(buf.len()),
+        }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         let _ = std::io::stderr().flush();
-        self.file.lock().unwrap_or_else(|e| e.into_inner()).flush()
+        if let Some(file) = &self.file {
+            file.lock().unwrap_or_else(|e| e.into_inner()).flush()?;
+        }
+        Ok(())
     }
 }
 
-/// 初始化日志输出到终端 + 日志文件
+/// 初始化日志输出到终端 + 日志文件。
+///
+/// **日志文件建不出来时不再 panic**（2026-09-23 改）：目录不可写、磁盘满、权限被拦，
+/// 都不该让应用起不来。旧实现的 `expect("无法创建日志文件")` 会让进程直接消失，而 release
+/// 版是 `windows_subsystem = "windows"`、没有控制台，用户只看到"双击没反应"。
+/// 现在降级为只写 stderr，应用照常启动。
 fn init_logging() {
     // 日志文件：%APPDATA%/GameVault/logs/gamevault.log
     let log_dir = utils::path::get_app_data_dir().join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
+
+    let log_path = log_dir.join("gamevault.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_dir.join("gamevault.log"))
-        .expect("无法创建日志文件");
+        .open(&log_path)
+        .ok();
+
+    if log_file.is_none() {
+        // 此处**不能用 tracing**（subscriber 尚未 install），只能直接写 stderr
+        eprintln!(
+            "[GameVault] 警告：无法创建日志文件 {}（目录不可写？），本次运行日志仅输出到 stderr",
+            log_path.display()
+        );
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -84,7 +108,7 @@ fn init_logging() {
                 .add_directive(tracing::Level::INFO.into()),
         )
         .with_writer(Mutex::new(MultiLogWriter {
-            file: Arc::new(Mutex::new(log_file)),
+            file: log_file.map(|f| Arc::new(Mutex::new(f))),
         }))
         .with_ansi(false)
         .init();
@@ -112,6 +136,40 @@ fn install_panic_hook() {
         tracing::error!("PANIC @ {} | {}", location, payload);
         default_hook(info);
     }));
+}
+
+/// 启动期致命错误：尽力留痕后交由调用方决定退出。
+///
+/// 为什么不能用 `expect`：release 版没有控制台，而启动期的致命错误（数据目录建不出来、
+/// 数据库打不开）恰恰发生在**日志系统可能尚未就绪**的时候 —— `expect` 的 panic 信息会
+/// 彻底沉没，用户只看到"双击没反应"。这里同时走三条路：日志、stderr、系统消息框。
+fn fatal_init_error(context: &str, detail: &str) {
+    let message = format!("{context}：{detail}");
+    tracing::error!("[启动失败] {message}");
+    eprintln!("[GameVault 启动失败] {message}");
+    show_error_message_box(&message);
+}
+
+/// 弹一个阻塞式系统错误框。
+///
+/// 启动早期还没有任何窗口，也谈不上前端 toast —— 只能直接走 Win32。这是"让用户至少
+/// 知道发生了什么"的最后一道防线。
+#[cfg(windows)]
+fn show_error_message_box(message: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let text = HSTRING::from(message);
+    let caption = HSTRING::from("Game Vault 启动失败");
+    // SAFETY: 两个 HSTRING 在本次调用期间一直存活；未指定 owner 窗口（此时尚无窗口）。
+    unsafe {
+        let _ = MessageBoxW(None, &text, &caption, MB_OK | MB_ICONERROR);
+    }
+}
+
+#[cfg(not(windows))]
+fn show_error_message_box(message: &str) {
+    eprintln!("[GameVault 启动失败] {message}");
 }
 
 /// 手动创建主窗口。
@@ -327,10 +385,14 @@ fn quit_app(app: tauri::AppHandle) {
 /// 初始化应用
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 初始化日志输出到终端 + 日志文件
-    init_logging();
-    // 让 panic（尤其 Tauri 内部 setup 失败）不再静默沉没
+    // panic hook **必须先于日志系统安装**（2026-09-23 调整顺序）。
+    // 理由：日志初始化本身要建目录、开文件，万一在那里发生意外 panic，而 hook 尚未就绪，
+    // release 版（无控制台）就会彻底静默 —— 正是我们要消除的那种"双击没反应"。
+    // 先装 hook，最差情况信息也能落到 stderr 与日志（tracing 在 subscriber 未 install
+    // 时是 no-op，不会因顺序而报错）。
     install_panic_hook();
+    // 初始化日志输出到终端 + 日志文件（失败时降级为只写 stderr，不再 panic）
+    init_logging();
 
     let context = tauri::generate_context!();
 
@@ -363,14 +425,30 @@ pub fn run() {
             core::boot_guard::prepare_launch(&app.config().identifier);
 
             // ---- 1. 数据库（同步必需：前端所有命令都依赖它，必须最先就绪）----
+            //
+            // 这两步失败即无法继续，但不该以 `expect` 静默带走进程（见 fatal_init_error 注释）：
+            // 记日志 + 弹系统消息框 + 把错误上抛给 Tauri run()，让用户至少知道发生了什么。
             let db_path = utils::path::get_database_path();
             let parent_dir = db_path.parent().ok_or_else(|| anyhow::anyhow!("无法获取数据库目录"))?;
-            utils::path::ensure_dir_exists(parent_dir)
-                .expect("无法创建数据目录");
+            if let Err(e) = utils::path::ensure_dir_exists(parent_dir) {
+                fatal_init_error(
+                    "无法创建数据目录",
+                    &format!("{}（{}）", parent_dir.display(), e),
+                );
+                return Err(format!("无法创建数据目录: {}", e).into());
+            }
 
             let t_db = std::time::Instant::now();
-            let db = core::Database::new(&db_path)
-                .expect("无法初始化数据库");
+            let db = match core::Database::new(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    fatal_init_error(
+                        "无法初始化数据库",
+                        &format!("{}（{}）", db_path.display(), e),
+                    );
+                    return Err(format!("无法初始化数据库: {}", e).into());
+                }
+            };
             tracing::info!("数据库初始化耗时 {} ms", t_db.elapsed().as_millis());
 
             let db = Arc::new(Mutex::new(db));
@@ -811,6 +889,7 @@ pub fn run() {
             commands::games::update_game_meta,
             commands::games::export_saves_backup,
             commands::games::import_saves_backup,
+            commands::games::preview_saves_backup,
             // 平台（Steam / Epic）扫描与导入
             commands::platform::scan_platform_games,
             commands::platform::import_platform_games,

@@ -246,7 +246,11 @@ pub fn resolve(db: &Database, owner_kind: &str, owner_id: &str) -> Result<CoverS
         }
         let s = abs.to_string_lossy().to_string();
         match row.kind.as_str() {
-            KIND_MAIN => set.main = Some(s),
+            KIND_MAIN => {
+                set.main = Some(s);
+                // 破缓存时间戳跟随**主图**：前端详情页/卡片用的都是它
+                set.updated_at = Some(row.updated_at.clone());
+            }
             KIND_THUMB => set.thumb = Some(s),
             _ => {}
         }
@@ -342,6 +346,8 @@ pub fn commit_prepared(
             .rows
             .get(1)
             .map(|r| abs_path(&r.rel_path).to_string_lossy().to_string()),
+        // 主图行的时间戳就是本次替换时刻（prepared.rows 里 main 恒为首行）
+        updated_at: prepared.rows.first().map(|r| r.updated_at.clone()),
     })
 }
 
@@ -809,6 +815,77 @@ mod tests {
         sync_owner_paths(&db, OWNER_GAME, &id).unwrap();
         let saved = db.get_game_by_id(&id).unwrap().unwrap();
         assert_eq!(saved.cover_local.as_deref(), Some(main.to_string_lossy().as_ref()));
+    }
+
+    /// 回归（2026-09-24）：`CoverSet.updated_at` 必须反映**封面文件最后一次被替换**的
+    /// 时刻，且换封面后必须变——前端拿它拼 asset URL 的破缓存参数，若它不变，
+    /// WebView2 会继续显示旧图（老爷实测的"卡片换封面不刷新"）。
+    ///
+    /// 同时守一个反向性质：**没换封面时它不该变**。否则前端 URL 无谓抖动、
+    /// 白烧一次图片解码。
+    #[test]
+    fn cover_set_timestamp_tracks_replacement_only() {
+        let db = db();
+        let id = uuid::Uuid::new_v4().to_string();
+
+        let first = ingest_bytes(&db, OWNER_GAME, &id, &opaque_png(600, 900)).unwrap();
+        let t1 = first.updated_at.clone().expect("入库后应带时间戳");
+        assert_eq!(
+            t1,
+            db.cover_rows(OWNER_GAME, &id).unwrap()
+                .iter()
+                .find(|r| r.kind == KIND_MAIN)
+                .unwrap()
+                .updated_at,
+            "时间戳必须与索引表主图行一致（前端靠它破缓存）"
+        );
+
+        // `resolve` 是另一条取图通道，必须给出同一个时间戳
+        let resolved = resolve(&db, OWNER_GAME, &id).unwrap();
+        assert_eq!(resolved.updated_at.as_deref(), Some(t1.as_str()));
+
+        // 不换封面：连跑几次 resolve / 读索引，时间戳必须岿然不动
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert_eq!(
+                resolve(&db, OWNER_GAME, &id).unwrap().updated_at.as_deref(),
+                Some(t1.as_str()),
+                "没换封面时时间戳不得变动（否则前端 URL 白抖）"
+            );
+        }
+
+        // 换封面（换一张不同内容的图）：时间戳必须变
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = ingest_bytes(&db, OWNER_GAME, &id, &opaque_png(700, 1000)).unwrap();
+        let t2 = second.updated_at.clone().expect("入库后应带时间戳");
+        assert_ne!(t1, t2, "换封面后时间戳必须变化，否则前端破缓存失效");
+
+        // 且新值同样与索引表一致（旧行已被 replace 掉）
+        assert_eq!(
+            t2,
+            db.cover_rows(OWNER_GAME, &id).unwrap()
+                .iter()
+                .find(|r| r.kind == KIND_MAIN)
+                .unwrap()
+                .updated_at
+        );
+    }
+
+    /// 回归（2026-09-24）：封面文件名恒为 `<owner_id>.<ext>`，换封面是**原地覆盖同名文件**
+    /// ——这正是不拼破缓存参数就会显示旧图的根因。本测试把这个前提钉住：**换了图，
+    /// 路径逐字节不变**。哪天真改成"按内容哈希命名"，此测试会失败，提醒重新审视
+    /// 前端那条破缓存逻辑是否还需要。
+    #[test]
+    fn cover_path_stays_identical_across_replacement() {
+        let db = db();
+        let id = uuid::Uuid::new_v4().to_string();
+
+        let first = ingest_bytes(&db, OWNER_GAME, &id, &opaque_png(600, 900)).unwrap();
+        let second = ingest_bytes(&db, OWNER_GAME, &id, &opaque_png(800, 1200)).unwrap();
+
+        assert_eq!(first.main, second.main, "换封面应在原地覆盖同名文件（路径不变）");
+        assert_ne!(first.updated_at, second.updated_at, "但时间戳必须变，供前端破缓存");
+        assert!(std::path::Path::new(second.main.as_ref().unwrap()).exists());
     }
 
     /// 编码策略：不透明 PNG 转 JPEG（省体积）；含透明 PNG 保留 PNG（保 alpha）

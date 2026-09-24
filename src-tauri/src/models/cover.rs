@@ -42,4 +42,14 @@ pub struct CoverIndexRow {
 pub struct CoverSet {
     pub main: Option<String>,
     pub thumb: Option<String>,
+    /// 主图**最后一次被替换**的时刻（RFC3339）。
+    ///
+    /// 专供前端拼 asset URL 的破缓存参数：封面文件名恒为 `<owner_id>.<ext>`，
+    /// 换封面是**原地覆盖同名文件**，URL 逐字节不变 → WebView2 会直接命中
+    /// 图片缓存、继续显示旧图（2026-09-24 老爷实测：卡片换封面后不刷新）。
+    ///
+    /// 之所以不复用 `games.updated_at` / `reviews.updated_at`：那是**条目**最后
+    /// 改动时刻，改评分、涨游玩时长都会刷新它，会让 URL 无谓抖动、白烧一次
+    /// 图片解码。这里要的是**这张图**最后变化的时刻，只有封面真的换了才变。
+    pub updated_at: Option<String>,
 }

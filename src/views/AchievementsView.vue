@@ -148,12 +148,40 @@ function groupProgress(group: AchievementGroup): { progress: number; target: num
   return { progress: lastUnlocked.progress, target: lastUnlocked.target };
 }
 
+// 当前选中的是否为「已删除留档」条目
+const selectedGameRemoved = computed(() =>
+  (summary.value?.per_game ?? []).some(
+    (g) => g.game_id === selectedGameId.value && g.removed
+  )
+);
+
 // 游戏选择器选项
-const gameOptions = computed(() =>
-  (summary.value?.per_game ?? []).map((g) => ({
-    label: g.game_name,
+//
+// 后端按 game_id（UUID）字典序返回，那是**无意义顺序**——42 款游戏的下拉里根本找不着人。
+// 这里重排成人看得懂的顺序（2026-09-24 修「已删除条目在下拉里找不到」）：
+//   ① 已获成就的排前面（最可能是想看的）；
+//   ② 再按已解锁数量多的靠前；
+//   ③ 同分按名字（用 localeCompare 让中文按拼音、英文按字母）；
+//   ④ **已删除留档条目沉到最底**并带「已删除」后缀——它们不在库中，不该混在在库游戏里，
+//      但要能在列表末尾找得到（成就记录按设计保留）。
+const gameOptions = computed(() => {
+  const list = [...(summary.value?.per_game ?? [])];
+  list.sort((a, b) => {
+    if (a.removed !== b.removed) return a.removed ? 1 : -1;
+    const ua = a.achievements.filter((x) => x.unlocked).length;
+    const ub = b.achievements.filter((x) => x.unlocked).length;
+    if (ua !== ub) return ub - ua;
+    return a.game_name.localeCompare(b.game_name, "zh-Hans-CN");
+  });
+  return list.map((g) => ({
+    label: g.removed ? `${g.game_name}（已删除）` : g.game_name,
     value: g.game_id,
-  }))
+  }));
+});
+
+// 已删除留档条目在选项里的子集（给「沉底找不到」补一条显式入口）
+const removedOptions = computed(() =>
+  gameOptions.value.filter((o) => o.label.endsWith("（已删除）"))
 );
 
 // 分类徽章颜色
@@ -275,13 +303,31 @@ function categoryColor(cat: string): string {
             <n-select
               v-model:value="selectedGameId"
               :options="gameOptions"
-              placeholder="选择一款游戏查看其成就"
-              style="width: 240px"
+              placeholder="选择一款游戏查看其成就（可输入搜索）"
+              style="width: 280px"
+              filterable
               clearable
             />
           </div>
 
+          <!-- 已删除留档条目提示：它们沉在列表末尾，不点出来用户根本不知道有这几个 -->
+          <div v-if="removedOptions.length" class="removed-hint">
+            已删除的游戏（{{ removedOptions.length }} 款）的成就记录仍保留，列在列表末尾：
+            <button
+              v-for="o in removedOptions"
+              :key="o.value"
+              class="removed-link"
+              @click="selectedGameId = o.value"
+            >
+              {{ o.label }}
+            </button>
+          </div>
+
           <template v-if="selectedGameId">
+            <!-- 已删除条目的说明：解锁记录按设计留档，但它已不在库中 -->
+            <div v-if="selectedGameRemoved" class="removed-note">
+              该游戏已从库中删除，此处展示的是其历史解锁记录——成就记录不随删除消失。
+            </div>
             <div v-if="gameGroups.length" class="achv-grid">
               <div
                 v-for="group in gameGroups"
@@ -496,6 +542,48 @@ function categoryColor(cat: string): string {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
   gap: 12px;
+}
+
+/* 已删除留档条目的说明条 */
+.removed-note {
+  margin-bottom: 14px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary, #9aa4b2);
+  background: var(--panel, #161b24);
+  border: 1px dashed var(--border, #262d3d);
+}
+
+/* 下拉前的已删除条目快捷入口（它们沉在列表末尾，这里给一条明路） */
+.removed-hint {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  color: var(--text-secondary, #9aa4b2);
+}
+
+.removed-link {
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  color: var(--text-secondary, #9aa4b2);
+  background: var(--panel, #161b24);
+  border: 1px dashed var(--border, #262d3d);
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.removed-link:hover {
+  color: var(--accent-color, #6366f1);
+  border-color: var(--accent-color, #6366f1);
 }
 
 .achv-card {

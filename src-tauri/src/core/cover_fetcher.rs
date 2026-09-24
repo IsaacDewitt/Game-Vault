@@ -30,6 +30,20 @@ fn is_trusted_cover_host(url: &reqwest::Url) -> bool {
         .unwrap_or(false)
 }
 
+/// 为目标文件生成一个**唯一命名**的同目录临时路径。
+///
+/// 放在同目录（而非系统临时目录）是必须的：随后的 `rename` 要落在同一卷上，
+/// 跨卷 rename 会直接失败。名字里带进程内唯一随机串，是为了让并发写同一目标的
+/// 两次下载各有各的落地文件，不会互相覆盖或误删。
+fn unique_temp_path(actual_path: &Path) -> PathBuf {
+    let stem = actual_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "cover".to_string());
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    actual_path.with_file_name(format!(".{stem}.{unique}.tmp"))
+}
+
 impl CoverFetcher {
     pub fn new(cache_dir: PathBuf, steamgriddb_api_key: String) -> Result<Self> {
         // 确保缓存目录存在
@@ -497,9 +511,14 @@ impl CoverFetcher {
             save_path.with_extension(ext)
         };
 
-        // 先写入临时文件，成功后再重命名，避免留下损坏的文件
-        let temp_path = actual_path.with_extension("tmp");
-        std::fs::write(&temp_path, &bytes)?;
+        // 先写入**唯一命名**的临时文件，成功后再替换正式文件，避免留下损坏的文件。
+        // 名字必须唯一：批量刷新封面与手动选封面可能并发落到同一目标，
+        // 旧实现的固定 ".tmp" 名会互相覆盖、甚至被对方的清理误删。
+        let temp_path = unique_temp_path(&actual_path);
+        if let Err(e) = std::fs::write(&temp_path, &bytes) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(anyhow::anyhow!("下载失败: 写入临时文件失败 ({})", e));
+        }
 
         // 验证临时文件大小
         let metadata = std::fs::metadata(&temp_path)?;
@@ -508,9 +527,18 @@ impl CoverFetcher {
             anyhow::bail!("下载失败: 写入后文件太小({} bytes)", metadata.len());
         }
 
-        // 重命名为正式文件（Windows 上 rename 不覆盖已有文件，先删除旧文件）
-        let _ = std::fs::remove_file(&actual_path);
-        std::fs::rename(&temp_path, &actual_path)?;
+        // 直接 rename 替换正式文件。
+        // `std::fs::rename` 在 Windows 走 MoveFileEx(MOVEFILE_REPLACE_EXISTING)，
+        // **本身就是替换语义**——原实现"先 remove_file 再 rename"不但多余，
+        // 还在"删成功、rename 失败"的窗口里让封面凭空消失。
+        if let Err(e) = std::fs::rename(&temp_path, &actual_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(anyhow::anyhow!(
+                "下载失败: 替换封面文件失败 {} ({})",
+                actual_path.display(),
+                e
+            ));
+        }
 
         Ok(actual_path)
     }
