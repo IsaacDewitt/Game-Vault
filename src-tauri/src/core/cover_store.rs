@@ -4,7 +4,7 @@
 //! ```text
 //! %APPDATA%/GameVault/covers/
 //!   <owner_id>.<ext>            主图（游戏/手账共用；ext 视源格式而定）
-//!   thumb/<owner_id>.<ext>      缩略图（长边 ≤256，卡片网格/统计排行使用）
+//!   thumb/<owner_id>.<ext>      缩略图（长边 ≤ `THUMB_MAX_EDGE`，卡片网格/统计排行使用）
 //!   archive/<owner_id>.<ext>    已移除条目的留档主图（删除不再删图）
 //!   archive/thumb/<owner_id>.<ext>
 //! ```
@@ -20,7 +20,20 @@
 //! `image` 0.25 的 WebP 编码器**只有无损模式**（VP8L），对照片类封面写出来往往
 //! 比原 JPEG 还大；有损 WebP 需引入 libwebp（C 依赖）。故：
 //! - 主图：源是**不透明 PNG** → 转 JPEG q92（省体积且无视觉损失）；其余原样保留（已压过）。
-//! - 缩略图：不透明 → JPEG q82；含真透明 → 无损 WebP（保留 alpha，256px 下体积可控）。
+//! - 缩略图：不透明 → JPEG q82；含真透明 → 无损 WebP（保留 alpha，512px 下体积可控）。
+//!
+//! ## 缩略图规格 = 渲染预算（改 `THUMB_MAX_EDGE` 前必读，2026-09-27）
+//! 缩略图**只服务卡片网格/最近条带/时长排行**这类小尺寸场景，而它的长边预算必须同时
+//! 盖住三件事，否则界面就是"糊"的：
+//! 1. **卡片宽度随窗口变**：`.game-grid` 用 `auto-fill + minmax(180px, 220px)`，
+//!    卡片宽 180~220 CSS px（高 = 宽×4/3，即 240~293 px）；
+//! 2. **系统缩放（DPI）**：125%/150%/200% 时同样的卡片要 1.25~2 倍的物理像素；
+//! 3. **源图长宽比**：缩略图按**长边**封顶，卡片却是固定 3:4 + `object-fit: cover`——
+//!    16:9 的源封顶后只有 512×288，短边若太小，卡片就得放大补足（旧 256 规格下横图
+//!    要放大 2.0 倍，肉眼就是"糊"）。抓来的封面恒为 2:3，本地手选的图长宽比任意，
+//!    所以"只有自己上传的封面才糊"。
+//! 结论：256 只够 100% 缩放下的小卡片；512 覆盖到 150% 缩放与任意长宽比。
+//! **改动此常量后必须让老缩略图重生**（见 [`upgrade_thumbs`]），否则老图不会自动刷新。
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -30,8 +43,8 @@ use crate::core::Database;
 use crate::models::cover::*;
 use crate::utils::path;
 
-/// 缩略图长边像素上限
-pub const THUMB_MAX_EDGE: u32 = 256;
+/// 缩略图长边像素上限（渲染预算，见模块头注释；改动后必须走 [`upgrade_thumbs`]）
+pub const THUMB_MAX_EDGE: u32 = 512;
 /// 不透明主图转 JPEG 的质量（仅 PNG→JPEG 时使用）
 const MAIN_JPEG_QUALITY: u8 = 92;
 /// 缩略图 JPEG 质量
@@ -126,6 +139,14 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
     }
 }
 
+/// 换扩展名（`thumb/x.jpg` → `thumb/x.webp`）：只动最后一段的扩展名，目录层级不动
+fn swap_ext(rel: &str, ext: &str) -> String {
+    match rel.rfind('.') {
+        Some(i) if !rel[i..].contains('/') => format!("{}.{}", &rel[..i], ext),
+        _ => format!("{}.{}", rel, ext),
+    }
+}
+
 /// 该文件是否还有别人（索引里任意行）在用
 fn file_still_referenced(db: &Database, sha256: &str) -> Result<bool> {
     if sha256.is_empty() {
@@ -201,7 +222,10 @@ fn encode_lossless_webp(img: &image::DynamicImage) -> Result<Vec<u8>> {
 ///
 /// 扩展名仍按**编码结果的容器魔数**判定（而非复述 has_real_alpha），与旧行为逐字节一致。
 fn build_thumb(img: &image::DynamicImage) -> Result<(Vec<u8>, u32, u32, &'static str)> {
-    let thumb = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
+    // 预算框长边**不超过源图长边**：小图（长边 < THUMB_MAX_EDGE）一律不放大 ——
+    // 放大只会白占体积，还让卡片拿到一张"糊得更均匀"的假高清。
+    let box_edge = THUMB_MAX_EDGE.min(img.width().max(img.height()));
+    let thumb = img.thumbnail(box_edge, box_edge);
     let (width, height) = (thumb.width(), thumb.height());
     let bytes = if has_real_alpha(&thumb) {
         encode_lossless_webp(&thumb)?
@@ -621,6 +645,125 @@ pub fn sync_owner_paths(db: &Database, owner_kind: &str, owner_id: &str) -> Resu
 
 // ==================== 存量迁移 ====================
 
+/// 缩略图规格标记：值就是当前规格（长边像素）。
+/// **刻意存值而不是存 "1"** —— 将来再把 `THUMB_MAX_EDGE` 调大时，标记自然不等于新规格，
+/// 升级会自己重跑，不需要记得去改这个键名或手工重置。
+const THUMB_SPEC_FLAG: &str = "covers_thumb_spec";
+
+/// 缩略图规格升级结果（供日志）
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct ThumbUpgradeReport {
+    pub rebuilt: u32,
+    pub skipped: u32,
+    pub failed: u32,
+}
+
+/// 把规格落后的缩略图按当前 `THUMB_MAX_EDGE` 重建（幂等，靠 `covers_thumb_spec` 记录已达标规格）。
+///
+/// **为什么必须有这一步**：缩略图是"渲染预算"的产物（见模块头注释），一旦把
+/// `THUMB_MAX_EDGE` 调大，**老缩略图不会自己重生** —— 界面看着跟没改一样，白改。
+/// 重建要点：
+/// - 源一律取**主图**：缩略图必须从原图重采样，从旧缩略图再缩是二次损失；
+/// - 按 `rel_path` **分组**：共享同一物理文件的多个主体一起改，引用计数不受影响；
+/// - **同步推进主图行的 `updated_at`**：前端 asset URL 的破缓存参数取自主图行时间戳，
+///   不推进的话 WebView2 照旧命中缓存里的小缩略图，用户会以为"改了没生效"。
+pub fn upgrade_thumbs(db: &Database) -> Result<ThumbUpgradeReport> {
+    let want = THUMB_MAX_EDGE.to_string();
+    if db.get_setting(THUMB_SPEC_FLAG)?.as_deref() == Some(want.as_str()) {
+        return Ok(ThumbUpgradeReport::default());
+    }
+    path::ensure_cover_dirs()?;
+
+    // rel_path → 指向该文件的所有 thumb 行（共享封面会出现多条）
+    let mut groups: std::collections::BTreeMap<String, Vec<CoverIndexRow>> = std::collections::BTreeMap::new();
+    for row in db.all_cover_rows()? {
+        if row.kind == KIND_THUMB {
+            groups.entry(row.rel_path.clone()).or_default().push(row);
+        }
+    }
+
+    let mut report = ThumbUpgradeReport::default();
+    for (rel_path, group) in groups {
+        // 只读文件头比尺寸，便宜；读不到（文件缺失/损坏）就跳过，交给 restore/migrate 那套逻辑
+        match image::image_dimensions(abs_path(&rel_path)) {
+            Ok((w, h)) if w.max(h) >= THUMB_MAX_EDGE => {
+                report.skipped += 1;
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("缩略图重建跳过（读不到尺寸）{}: {}", rel_path, e);
+                report.skipped += 1;
+                continue;
+            }
+        }
+
+        let first = &group[0];
+        let main_abs = db
+            .cover_rows(&first.owner_kind, &first.owner_id)?
+            .into_iter()
+            .find(|r| r.kind == KIND_MAIN)
+            .map(|r| abs_path(&r.rel_path))
+            .filter(|p| p.exists());
+        let Some(main_abs) = main_abs else {
+            tracing::warn!("缩略图重建跳过（主图缺失）: {}", rel_path);
+            report.skipped += 1;
+            continue;
+        };
+
+        let img = match image::open(&main_abs) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!("缩略图重建失败（主图解码）{}: {}", main_abs.display(), e);
+                report.failed += 1;
+                continue;
+            }
+        };
+        let (bytes, tw, th, thumb_ext) = match build_thumb(&img) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("缩略图重建失败（编码）{}: {}", rel_path, e);
+                report.failed += 1;
+                continue;
+            }
+        };
+
+        // 编码结果换了容器（jpg ↔ webp，源图透明性变过）时不原地覆盖：按新扩展名落盘，索引跟着改
+        let new_rel = swap_ext(&rel_path, thumb_ext);
+        if let Err(e) = write_atomic(&abs_path(&new_rel), &bytes) {
+            tracing::warn!("缩略图重建写盘失败 {}: {}", new_rel, e);
+            report.failed += 1;
+            continue;
+        }
+        let sha = sha256_hex(&bytes);
+        let now = now_rfc3339();
+        for row in &group {
+            if new_rel != rel_path {
+                db.set_cover_rel_path(&row.owner_kind, &row.owner_id, KIND_THUMB, &new_rel, &row.state)?;
+            }
+            db.update_cover_meta(
+                &row.owner_kind,
+                &row.owner_id,
+                KIND_THUMB,
+                &sha,
+                tw,
+                th,
+                bytes.len() as u64,
+                &now,
+            )?;
+            // 破缓存：前端 URL 的 t 取自主图行，主图行不动则界面还显示缓存里的小图
+            db.touch_cover_row(&row.owner_kind, &row.owner_id, KIND_MAIN, &now)?;
+        }
+        if new_rel != rel_path && db.cover_rel_refcount(&rel_path)? == 0 {
+            let _ = std::fs::remove_file(abs_path(&rel_path)); // 旧扩展名文件已无人引用
+        }
+        report.rebuilt += 1;
+    }
+
+    db.set_setting(THUMB_SPEC_FLAG, &want)?;
+    Ok(report)
+}
+
 const MIGRATION_FLAG: &str = "covers_index_v1_done";
 /// 强制重跑标记（置 1 → 下次启动重跑迁移）
 const MIGRATION_FLAG_AGAIN: &str = "covers_index_v1_rerun";
@@ -909,6 +1052,104 @@ mod tests {
         );
         // 透明图的缩略图走无损 WebP
         assert!(set.thumb.as_ref().unwrap().ends_with(".webp"));
+    }
+
+    /// 缩略图预算：源图长边小于规格时**不放大**（旧规格会一路放大到 256）
+    #[test]
+    fn thumb_is_not_upscaled_for_small_source() {
+        let db = db();
+        let id = uuid::Uuid::new_v4().to_string();
+        let set = ingest_bytes(&db, OWNER_GAME, &id, &opaque_png(300, 400)).unwrap();
+        let thumb = image::open(set.thumb.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            (thumb.width(), thumb.height()),
+            (300, 400),
+            "小图不得被放大成 {} 长边",
+            THUMB_MAX_EDGE
+        );
+    }
+
+    /// 换扩展名的路径拼接（升级时 jpg ↔ webp 互转要用）
+    #[test]
+    fn swap_ext_only_touches_last_segment() {
+        assert_eq!(swap_ext("thumb/x.jpg", "webp"), "thumb/x.webp");
+        assert_eq!(swap_ext("archive/thumb/x.jpg", "png"), "archive/thumb/x.png");
+        assert_eq!(swap_ext("x", "jpg"), "x.jpg");
+    }
+
+    /// 关键回归（2026-09-27）：`THUMB_MAX_EDGE` 调大后，**存量小缩略图必须被重建**，
+    /// 且要推进主图行时间戳 —— 否则前端 asset URL 不变，WebView2 继续显示缓存里的
+    /// 旧小图，用户看到的是"改了没生效"（卡片还是糊的）。
+    #[test]
+    fn thumb_spec_upgrade_rebuilds_small_thumbs_and_busts_cache() {
+        let db = db();
+        let id = uuid::Uuid::new_v4().to_string();
+        let set = ingest_bytes(&db, OWNER_GAME, &id, &opaque_png(1200, 1800)).unwrap();
+        let thumb_path = std::path::PathBuf::from(set.thumb.clone().unwrap());
+
+        // 造一张"旧规格"缩略图覆盖上去，并把索引同步成它的尺寸（模拟升级前的存量）
+        let old = image::open(&thumb_path).unwrap().thumbnail(256, 256);
+        let (ow, oh) = (old.width(), old.height());
+        let mut old_bytes = Vec::new();
+        old.write_to(&mut std::io::Cursor::new(&mut old_bytes), image::ImageFormat::Jpeg).unwrap();
+        std::fs::write(&thumb_path, &old_bytes).unwrap();
+        db.update_cover_meta(OWNER_GAME, &id, KIND_THUMB, &sha256_hex(&old_bytes), ow, oh, old_bytes.len() as u64, "2026-01-01T00:00:00Z").unwrap();
+
+        // 标记置为未达标 → 触发升级
+        db.set_setting(THUMB_SPEC_FLAG, "0").unwrap();
+        let main_t1 = db
+            .cover_rows(OWNER_GAME, &id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.kind == KIND_MAIN)
+            .unwrap()
+            .updated_at;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let report = upgrade_thumbs(&db).unwrap();
+        assert_eq!(report.rebuilt, 1, "存量小缩略图应被重建");
+        assert_eq!(report.failed, 0);
+
+        let now_img = image::open(&thumb_path).unwrap();
+        assert!(
+            now_img.width().max(now_img.height()) >= THUMB_MAX_EDGE,
+            "重建后长边应达到新规格，实际 {}x{}",
+            now_img.width(),
+            now_img.height()
+        );
+
+        let rows = db.cover_rows(OWNER_GAME, &id).unwrap();
+        let main_row = rows.iter().find(|r| r.kind == KIND_MAIN).unwrap();
+        let thumb_row = rows.iter().find(|r| r.kind == KIND_THUMB).unwrap();
+        assert_eq!(
+            (thumb_row.width, thumb_row.height),
+            (now_img.width(), now_img.height()),
+            "索引尺寸必须与落盘文件一致（否则前端拿着对不上的账）"
+        );
+        assert_ne!(
+            main_row.updated_at, main_t1,
+            "必须推进主图行时间戳，否则前端 URL 不变、WebView2 命中缓存显示旧小图"
+        );
+
+        // 幂等：标记已达标时短路返回（不重复扫描），且不再动时间戳
+        let want = THUMB_MAX_EDGE.to_string();
+        let again = upgrade_thumbs(&db).unwrap();
+        assert_eq!((again.rebuilt, again.skipped, again.failed), (0, 0, 0), "已达标应短路返回");
+        assert_eq!(
+            db.get_setting(THUMB_SPEC_FLAG).unwrap().as_deref(),
+            Some(want.as_str()),
+            "标记应记为当前规格（将来再调大时会自动重跑）"
+        );
+
+        // 再模拟一次"标记丢失"（手工清空 settings）：这次缩略图已达标，应**跳过**而非重建
+        db.set_setting(THUMB_SPEC_FLAG, "0").unwrap();
+        let rescan = upgrade_thumbs(&db).unwrap();
+        assert_eq!((rescan.rebuilt, rescan.skipped), (0, 1), "已达标缩略图应跳过重建");
+        assert_eq!(
+            db.cover_rows(OWNER_GAME, &id).unwrap().iter().find(|r| r.kind == KIND_MAIN).unwrap().updated_at,
+            main_row.updated_at,
+            "跳过时不得动时间戳（否则前端 URL 白抖、白烧解码）"
+        );
     }
 
     /// 归档保留、彻底删除才删文件

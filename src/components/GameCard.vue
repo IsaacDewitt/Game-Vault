@@ -214,6 +214,13 @@ function handleContextMenu(e: MouseEvent) {
   background: rgba(255, 255, 255, 0.05);
   transition: all 0.2s ease;
   position: relative;
+  /* 宽度上限（2026-09-27 加，纯兜底）：卡片宽 = 栅格列宽 = 可用宽/列数，
+     窗口拉得很窄时列数会掉到 2~3 列，单卡被撑到 260px+ —— 那会超出缩略图预算
+     （THUMB_MAX_EDGE = 512）而放大发虚。常规窗口下列宽 180~196px，这条**不生效**，
+     布局与原样逐像素一致。上限 220px 与后端缩略图预算配套。
+     注意：上限**不能**写在 HomeView 的 grid minmax() 里 —— max 值会参与 auto-fill
+     的列数计算，一改列数就掉档（6 列 → 5 列）。 */
+  max-width: 220px;
 }
 
 .game-card:hover {

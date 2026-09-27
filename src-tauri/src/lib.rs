@@ -507,6 +507,8 @@ pub fn run() {
             // 没图时按同名从手账回挂一张（"删游戏不删图"的历史欠账）。后台跑，不阻塞启动。
             {
                 let cover_db = db.clone();
+                // 重建完要通知前端重拉封面映射（见下），故一并带上 AppHandle
+                let cover_app = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(2500));
                     let db_guard = match cover_db.lock() {
@@ -520,6 +522,23 @@ pub fn run() {
                         ),
                         Ok(_) => tracing::debug!("封面索引迁移：无需处理"),
                         Err(e) => tracing::error!("封面索引迁移失败: {}", e),
+                    }
+                    // 缩略图规格升级（2026-09-27：长边 256 → 512，卡片糊的根因）：
+                    // 老缩略图不会自己重生，必须在迁移之后补一次重建，否则界面看着跟没改一样。
+                    match core::cover_store::upgrade_thumbs(&db_guard) {
+                        Ok(r) if r.rebuilt > 0 => {
+                            tracing::info!(
+                                "缩略图规格升级：重建 {}，跳过 {}，失败 {}（长边上限 {}）",
+                                r.rebuilt, r.skipped, r.failed, core::cover_store::THUMB_MAX_EDGE
+                            );
+                            // 重建会推进封面行时间戳（破缓存）。前端启动时拿到的映射还是旧的，
+                            // 不重拉的话首启看到的仍是缓存里的旧小图 —— "改了没生效"。
+                            drop(db_guard);
+                            let _ = cover_app.emit("covers-upgraded", r.rebuilt);
+                            return;
+                        }
+                        Ok(_) => tracing::debug!("缩略图规格升级：无需处理"),
+                        Err(e) => tracing::error!("缩略图规格升级失败: {}", e),
                     }
                 });
             }

@@ -31,6 +31,7 @@ export const useGamesStore = defineStore("games", () => {
   let unlistenGameStopped: (() => void) | null = null;
   let unlistenCoverProgress: (() => void) | null = null;
   let unlistenGameInfoProgress: (() => void) | null = null;
+  let unlistenCoversUpgraded: (() => void) | null = null;
 
   async function setupEventListeners() {
     if (unlistenGameStopped) return;
@@ -60,6 +61,13 @@ export const useGamesStore = defineStore("games", () => {
         gameInfoFetchProgress.value = event.payload;
       }
     );
+
+    // 后端缩略图规格升级（重建老缩略图）完成 → 封面行的破缓存时间戳已被推进，
+    // 前端手里的映射还是旧的（URL 不变 = 显示缓存里的旧图），必须重拉一次。
+    unlistenCoversUpgraded = await listen<number>("covers-upgraded", (event) => {
+      console.info(`[Cover] 缩略图规格升级完成，重建 ${event.payload} 张，刷新封面映射`);
+      loadAllCovers().catch(() => {});
+    });
   }
 
   // 清理事件监听器（应用退出时调用）
@@ -75,6 +83,10 @@ export const useGamesStore = defineStore("games", () => {
     if (unlistenGameInfoProgress) {
       unlistenGameInfoProgress();
       unlistenGameInfoProgress = null;
+    }
+    if (unlistenCoversUpgraded) {
+      unlistenCoversUpgraded();
+      unlistenCoversUpgraded = null;
     }
   }
 

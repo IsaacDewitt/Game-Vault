@@ -1100,6 +1100,54 @@ impl Database {
         Ok(n.max(0) as u32)
     }
 
+    /// 重写某条索引行的内容元数据（重建缩略图后同步 sha/尺寸/字节数/时间戳）。
+    /// 只动这一行，不碰同主体的其它行 —— 调用方负责把共享同一文件的各行一起更新。
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_cover_meta(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+        kind: &str,
+        sha256: &str,
+        width: u32,
+        height: u32,
+        bytes: u64,
+        updated_at: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE covers SET sha256 = ?1, width = ?2, height = ?3, bytes = ?4, updated_at = ?5
+             WHERE owner_kind = ?6 AND owner_id = ?7 AND kind = ?8",
+            params![
+                sha256,
+                width,
+                height,
+                bytes as i64,
+                updated_at,
+                owner_kind,
+                owner_id,
+                kind
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 只推进某行的 `updated_at`（**不改内容**）。
+    /// 场景：重建缩略图后，前端 asset URL 的破缓存参数取的是**主图行**时间戳，
+    /// 不推进它，WebView2 会继续命中缓存里的旧缩略图（"改了没生效"）。
+    pub fn touch_cover_row(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+        kind: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE covers SET updated_at = ?1 WHERE owner_kind = ?2 AND owner_id = ?3 AND kind = ?4",
+            params![updated_at, owner_kind, owner_id, kind],
+        )?;
+        Ok(())
+    }
+
     /// 同名字（含英文名）的手账条目 id —— 删除游戏后回挂封面用
     pub fn find_review_id_by_game_name(&self, name: &str) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(

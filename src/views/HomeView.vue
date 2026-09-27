@@ -1130,6 +1130,10 @@ function handleDeleteGame(gameId: string) {
 
 .game-grid {
   display: grid;
+  /* 列数算法**保持原样**（auto-fill 按 180+16 算列，1400 窗口下 6 列 × 185px）。
+     卡片宽度上限不在这里设：minmax 的 max 值会参与列数计算，一改列数就掉档
+     （6 列 → 5 列，卡片被撑大、观感全变）。上限放在 GameCard 的 max-width 上，
+     常规窗口下等于没生效，只在"窗口很窄、列数掉到 2~3 列被撑到 260px+"时兜底。 */
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 16px;
   padding-bottom: 24px;
