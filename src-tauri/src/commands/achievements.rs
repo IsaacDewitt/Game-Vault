@@ -15,7 +15,10 @@ pub fn get_achievements(
 
 /// 手动触发成就检测（前端在增删改等操作后调用）
 /// 返回本次新解锁的事件列表，由前端弹通知展示
-#[tauri::command]
+///
+/// **`(async)`（2026-10-03 修）**：本命令持 DB 锁评估全部成就（全局 + 每游戏），
+/// 留在主线程会阻塞整个 IPC 队列。
+#[tauri::command(async)]
 pub fn check_achievements(
     app: AppHandle,
     db: State<'_, Arc<Mutex<Database>>>,

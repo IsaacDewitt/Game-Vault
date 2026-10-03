@@ -195,8 +195,24 @@ async function doImport() {
     }
 
     emit("imported");
-    // 重新扫描以刷新「已在库」标记
-    await scan();
+
+    // 「已在库」标记改为本地就地更新（2026-10-03 修）
+    //
+    // 原先这里 `await scan()` 重扫整库，唯一的目的是刷新这个布尔标记，代价却是
+    // 重跑一次完整扫描（Steam 侧要 spawn reg 子进程 + 遍历 11 个库，实测固定 5.3 秒；
+    // 又因导入已触发整库重载，等于同一份活并发干两遍）。刚导入成功的条目安装路径
+    // 必然已在库中，直接就地置位即可 —— 零 I/O。
+    if (r.failed > 0) {
+      // 罕见路径：r.errors 只有文案（含游戏名）没有结构化条目标识，
+      // 从字符串反推失败名单不可靠，退回全量重扫以保证标记准确
+      await scan();
+    } else {
+      const importedIds = new Set(items.map((g) => g.platform_id));
+      games.value = games.value.map((g) =>
+        importedIds.has(g.platform_id) ? { ...g, already_added: true } : g
+      );
+      selectedIds.value = new Set();
+    }
   } catch (e) {
     message.error(`导入失败：${e instanceof Error ? e.message : String(e)}`);
   } finally {

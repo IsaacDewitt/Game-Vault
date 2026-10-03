@@ -49,7 +49,11 @@ fn normalize_install_path(p: &str) -> String {
 /// 返回候选列表并标记：
 /// - `already_added`：安装路径已在库中（前端应禁止重复勾选）
 /// - `same_name_in_library`：库中有同名条目但路径不同（仅提示，不阻止——可能是两份不同安装）
-#[tauri::command]
+///
+/// **`(async)` 不可省（2026-10-03 修）**：不加时该命令跑在 Tauri 主线程上，会阻塞
+/// 整个 IPC 队列与窗口消息泵——扫描期间的任何卡顿都表现为「界面转圈假死」
+/// （WebView2 渲染在独立进程，动画照转，所以看起来只是"慢"）。
+#[tauri::command(async)]
 pub fn scan_platform_games(
     db: State<'_, Arc<Mutex<Database>>>,
     platform_name: String,
@@ -91,7 +95,9 @@ pub fn scan_platform_games(
 ///
 /// 去重按安装路径归一化精确比对；同名不同路径**允许**导入（可能是两份不同安装）。
 /// 入库统一走 `insert_game_with_reclaim`，与手动添加共享墓碑认领语义。
-#[tauri::command]
+///
+/// **`(async)` 不可省**：本命令全程持 DB 锁并逐条写库，留在主线程会阻塞整个 IPC。
+#[tauri::command(async)]
 pub fn import_platform_games(
     db: State<'_, Arc<Mutex<Database>>>,
     items: Vec<PlatformGame>,

@@ -312,7 +312,7 @@ pub fn add_game_manual(
 /// 仅对有 exe_path 且版本号为空或 exe 文件已变更的游戏进行更新
 /// 使用文件元数据（修改时间 + 文件大小）进行缓存判断，避免每次都读取 exe 文件
 /// 两阶段设计：收集游戏列表后立即释放 DB 锁，文件 I/O 在无锁状态下进行，最后重取锁批量更新
-#[tauri::command]
+#[tauri::command(async)]
 pub fn refresh_exe_versions(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<u32, String> {
@@ -436,7 +436,7 @@ pub fn remove_game_cover(
 /// **为什么带上手账**（2026-09-24）：原先只返回 game，手账侧取图靠 `review.cover_local`
 /// + `review.updated_at` 拼参数，而 `updated_at` 是**条目**改动时刻（改评分/改名都会动），
 /// 会让 URL 无谓抖动。统一从这里取「封面行」的时间戳，两侧语义才一致。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_all_covers(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<std::collections::HashMap<String, crate::models::CoverSet>, String> {
@@ -1279,7 +1279,7 @@ pub fn import_game_data(
 }
 
 /// 获取所有游戏类型（去重列表）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_all_genres(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<Vec<String>, String> {
@@ -1391,28 +1391,41 @@ fn save_path_effectively_exists(path: &str) -> bool {
 
 /// 检查所有游戏的存档路径是否存在
 /// 返回 game_id -> bool 的映射，true 表示至少有一条存档路径（或其游戏级父文件夹）存在
-#[tauri::command]
+///
+/// **两段式 + `(async)`（2026-10-03 修）**：原实现全程持有 DB 互斥锁去做文件 I/O
+/// （每个游戏多条 `exists()`，`save_path_effectively_exists` 还会逐级向上探测）——
+/// 只要某条路径落在慢介质/离线位置，全应用所有命令都会被这把锁连带堵住。
+/// 现改为「锁内只取快照 → 锁外做 I/O」，并把命令移出主线程。
+#[tauri::command(async)]
 pub fn check_save_paths(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<std::collections::HashMap<String, bool>, String> {
     use crate::models::GameFilter;
     use crate::utils::path::expand_env_vars;
 
-    let db_guard = lock_or_recover(&db);
-    let games = db_guard.get_games(&GameFilter::default()).map_err(|e| e.to_string())?;
+    // 阶段 1：锁内只取 (id, save_paths) 快照，随即释放
+    let snapshot: Vec<(String, Vec<String>)> = {
+        let db_guard = lock_or_recover(&db);
+        db_guard
+            .get_games(&GameFilter::default())
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|g| (g.id, g.save_paths))
+            .collect()
+    };
 
+    // 阶段 2：无锁状态下做文件 I/O
     let mut result = std::collections::HashMap::new();
-
-    for game in games {
-        let exists = if game.save_paths.is_empty() {
+    for (id, save_paths) in snapshot {
+        let exists = if save_paths.is_empty() {
             false
         } else {
-            game.save_paths.iter().any(|p| {
+            save_paths.iter().any(|p| {
                 let expanded = expand_env_vars(p);
                 save_path_effectively_exists(&expanded)
             })
         };
-        result.insert(game.id, exists);
+        result.insert(id, exists);
     }
 
     Ok(result)

@@ -45,6 +45,12 @@ pub struct PlatformGame {
 pub const PLATFORM_STEAM: &str = "steam";
 pub const PLATFORM_EPIC: &str = "epic";
 
+/// `CreateProcess` 标志：不为新控制台程序分配控制台窗口。
+///
+/// GUI 子系统进程（本应用无控制台）spawn 控制台程序时，缺此标志会让系统新建一个
+/// 控制台，实测把 spawn 成本从 ~13 ms 抬到 ~280 ms，并伴随黑窗闪现。
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// 构造反向启动 URI（交由 Windows shell 转给对应客户端）
 ///
 /// - Steam：`steam://rungameid/{appid}`
@@ -192,9 +198,20 @@ fn parse_epic_item(path: &Path) -> Result<Option<PlatformGame>> {
 /// 刻意用 `reg query` 子进程而非 windows crate 直连注册表 API：本函数仅在用户
 /// 主动扫描时调用一次，几十毫秒成本无感，换来零 API 绑定风险（windows-rs 的
 /// 注册表签名琐碎且编译期难以验证，出错即整包编译失败）。
+///
+/// **必须带 `CREATE_NO_WINDOW`（2026-10-03 修）**：本应用是 GUI 子系统、无控制台，
+/// 不给标志时 Windows 会为 `reg.exe` 分配一个新控制台，实测 spawn 成本从 ~13 ms
+/// 涨到 ~280 ms，并会闪出一个黑窗。改用绝对路径同时免除 PATH/CWD 搜索。
 fn steam_root_from_registry() -> Option<PathBuf> {
-    let out = std::process::Command::new("reg")
+    use std::os::windows::process::CommandExt;
+
+    let reg = std::env::var("SystemRoot")
+        .map(|r| format!(r"{}\System32\reg.exe", r))
+        .unwrap_or_else(|_| r"C:\Windows\System32\reg.exe".to_string());
+
+    let out = std::process::Command::new(&reg)
         .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     if !out.status.success() {

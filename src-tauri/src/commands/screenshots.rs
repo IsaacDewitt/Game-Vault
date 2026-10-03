@@ -1,6 +1,6 @@
 //! 截图相关 Tauri 命令：热键触发的截图入口 + 打开截图文件夹。
 
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, Ordering}};
 use tauri::{Emitter, State};
 use windows_capture::window::Window;
 
@@ -127,6 +127,10 @@ fn is_generic_dir_name(name: &str) -> bool {
 
 /// 前台窗口是不是本库正在追踪的游戏窗口（供温会话预建使用）。
 ///
+/// 命中时返回其 `game_id`（未命中返回 `None`）。之所以要带出 game_id 而不只是 bool：
+/// 调用方需要据此查 `platform`，对 **Steam 游戏跳过 WGC 预建**（见 `maybe_prime_warm_session`
+/// 的"Steam 不建截图链路"说明），故这里必须把身份交出去。
+///
 /// 【与 `trigger_screenshot` 的关系】判定口径一致（进程名精确 → 进程路径落在安装目录下，
 /// 活跃会话优先、待命会话兜底），但刻意保持一份独立的轻量实现：预建跑在后台线程、
 /// 失败要静默返回，不该复用截图路径里"失败要播提示音 / 每个分支都要写日志"的那套重逻辑。
@@ -134,54 +138,96 @@ fn is_generic_dir_name(name: &str) -> bool {
 ///
 /// 【入参为什么传前台窗口】调用方（`maybe_prime_warm_session`）已经拿到过前台窗口，
 /// 传进来省一次查询，也避免两次取前台之间窗口恰好切换。
-fn foreground_is_tracked_game(
+fn foreground_tracked_game_id(
     tracker: &Arc<Mutex<PlayTimeTracker>>,
     foreground: &Window,
-) -> bool {
-    let Ok(pid) = foreground.process_id() else {
-        return false;
-    };
+) -> Option<String> {
+    let pid = foreground.process_id().ok()?;
 
     let mut guard = lock_or_recover(tracker);
     let (n_active, n_pending) = guard.session_counts();
     if n_active == 0 && n_pending == 0 {
-        return false;
+        return None;
     }
 
     let full_path = guard.process_path(pid);
     let process_name = match foreground.process_name() {
         Ok(n) => n,
-        Err(_) => {
-            match full_path
-                .as_deref()
-                .and_then(|p| p.rsplit(['\\', '/']).next())
-                .filter(|s| !s.is_empty())
-            {
-                Some(name) => name.to_string(),
-                None => return false,
-            }
-        }
+        Err(_) => full_path
+            .as_deref()
+            .and_then(|p| p.rsplit(['\\', '/']).next())
+            .filter(|s| !s.is_empty())?
+            .to_string(),
     };
 
     guard
         .find_active_game_by_process(&process_name, full_path.as_deref())
         .or_else(|| guard.find_pending_game_by_process(&process_name, full_path.as_deref()))
-        .is_some()
+}
+
+/// 本次运行内**已判定为"不建截图链路"的游戏**（当前只有 Steam）缓存。
+///
+/// 【为什么必须有】对 Steam 游戏，第 ② 步（会话已挂在当前窗口 → 短路）**永远不会命中**，
+/// 因为会话压根不会建。于是每一拍（1 秒）都会走到第 ③ 步持 tracker 锁查进程路径、
+/// 第 ④ 步再查一次 DB —— 而 Steam 游戏恰恰是主力库，这个空转开销会持续整个游戏会话。
+/// 缓存后：同一 game_id 只在**首次**判定时查一次 DB，之后直接短路。
+///
+/// 【为什么可以永久缓存】`platform` 是游戏的固有属性，运行期内不会变（改库不重载）。
+/// 代价是"运行中把某游戏平台从 steam 改成 epic"需重启应用才生效——这是可接受的取舍，
+/// 且该场景实际不会发生（平台由扫描导入时确定）。
+///
+/// 【为什么只缓存"命中"不缓存"未命中"】未命中（非 Steam 平台）的判定结果不该固化：
+/// 一是没必要（非 Steam 游戏会建会话，第 ② 步自然短路，不构成每拍开销）；
+/// 二是若将来平台可变，缓存未命中反而会让改动不生效。只缓存豁免名单，语义更清晰。
+static STEAM_EXEMPT: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+/// 该 game_id 是否已被判定为"Steam 豁免"（不建截图链路）
+fn is_steam_exempt(game_id: &str) -> bool {
+    STEAM_EXEMPT
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(game_id)
+}
+
+/// 把 game_id 记入"Steam 豁免"名单（幂等）
+fn mark_steam_exempt(game_id: &str) {
+    STEAM_EXEMPT
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(game_id.to_string());
 }
 
 /// 若前台是被追踪的游戏，就在后台预建截图温会话（见 `capture::prime_warm_session`）。
 ///
-/// 本函数被追踪循环**每拍调用**（见 `lib.rs` 阶段 3），因此刻意做成三级漏斗，越往后越贵：
+/// 【Steam 游戏不建截图链路（2026-09-29 拍板，改前必读）】
+/// 本函数对所有被追踪游戏一视同仁地预建 WGC 温会话，但 Steam 游戏**根本用不上本应用的截图**
+/// （截图入口早已对 Steam 静默退让，见 `trigger_screenshot` 的 `PlatformExcluded`）。
+/// 于是出现一种纯亏的局面：**热键路径退让了，后台预建却照旧把 WGC 会话挂上去**——
+/// 会话常驻在游戏窗口上，与 Steam Overlay、EA IGO Overlay 三方抢同一条 DX11 SwapChain。
+/// 实测 Titanfall 2（DX11 + 双 Overlay）在**温会话重建**后数分钟内即崩溃退出两次；
+/// 而头一次会话因复用不再重建，故能连玩两小时无事（详见当日实机日志）。
+/// 结论：Steam 游戏在**预建这一步**就应直接返回，让截图链路完全不建立，而不是等到按键才退让。
+///
+/// 判定放在本函数而非 `foreground_tracked_game_id` 内部：后者是纯粹的"前台是哪款游戏"匹配，
+/// 混入平台策略会污染其语义、也让单测难写。
+///
+/// 本函数被追踪循环**每拍调用**（见 `lib.rs` 阶段 3），因此刻意做成四级漏斗，越往后越贵：
 /// 1. 取前台 hwnd —— 纯 Win32 查询，**不碰任何锁**；
 /// 2. 查温会话挂在哪个窗口 —— `try_lock`，同样**不碰 tracker 锁**；
 ///    命中"已经挂在这个窗口上"就直接收工（绝大多数拍都停在这一步）；
-/// 3. 到此才判定"前台是不是被追踪的游戏"——这一步要持 **tracker 锁**并做一次进程路径查询，
+/// 3. 判定"前台是不是被追踪的游戏"——这一步要持 **tracker 锁**并做一次进程路径查询，
 ///    而 tracker 锁正是截图关键路径第 2 步也要拿的锁。能用前两步挡掉就别抢它，
-///    免得给"按键 → 画面到手"那条十几毫秒的链路掺入抖动。
+///    免得给"按键 → 画面到手"那条十几毫秒的链路掺入抖动；
+/// 4. 命中后查 `platform`：**Steam → 直接返回**（不建会话）；其余平台照常预建。
 ///
 /// 实际建会话与等首帧都在后台线程做，绝不阻塞追踪循环。预建失败是常态允许情况
 /// （游戏还在启动、窗口最小化），静默即可。
-pub fn maybe_prime_warm_session(tracker: &Arc<Mutex<PlayTimeTracker>>) {
+pub fn maybe_prime_warm_session(
+    tracker: &Arc<Mutex<PlayTimeTracker>>,
+    db: &Arc<Mutex<Database>>,
+) {
     use crate::core::capture::WarmTarget;
 
     // ① 前台 hwnd：纯 Win32 查询，不持锁
@@ -200,8 +246,25 @@ pub fn maybe_prime_warm_session(tracker: &Arc<Mutex<PlayTimeTracker>>) {
         _ => {}
     }
 
-    // ③ 昂贵判定：前台是不是被追踪的游戏（持 tracker 锁）
-    if !foreground_is_tracked_game(tracker, &foreground) {
+    // ③ 昂贵判定：前台是不是被追踪的游戏（持 tracker 锁）。未命中即返回 None，本节无额外代价。
+    let Some(game_id) = foreground_tracked_game_id(tracker, &foreground) else {
+        return;
+    };
+
+    // ③.5 已判定过是 Steam 豁免的游戏 → 直接返回，不再每拍查 DB（见 STEAM_EXEMPT 说明）。
+    //      这一条对 Steam 游戏是**唯一**的短路点：会话不会建，第 ② 步永远拦不住它。
+    if is_steam_exempt(&game_id) {
+        return;
+    }
+
+    // ④ Steam 游戏：不建截图链路（见函数头说明）。
+    //    查 platform 需要 DB 锁——注意它**在 tracker 锁已释放之后**才获取，
+    //    不会与截图关键路径的持锁顺序交叉，故无死锁风险。
+    if !should_prime_for_platform(platform_of_game(db, &game_id).as_deref()) {
+        tracing::debug!(
+            "[截图] 前台游戏 {game_id} 属 Steam，跳过温会话预建（Steam 游戏不建截图链路）"
+        );
+        mark_steam_exempt(&game_id);
         return;
     }
 
@@ -211,6 +274,36 @@ pub fn maybe_prime_warm_session(tracker: &Arc<Mutex<PlayTimeTracker>>) {
     {
         tracing::warn!("[截图] 无法创建温会话预建线程: {e}");
     }
+}
+
+/// 查某游戏的 `platform`；查不到条目或查询失败一律返回 `None`。
+///
+/// 【不可用 `.ok().flatten()` 吞掉错误】那会把"查不到"与"查失败"归并成同一个 None。
+/// 本函数两者处置相同（都按"非 Steam"放行预建），但错误仍显式记日志，
+/// 免得数据库故障被静默成"看起来一切正常"（与 `trigger_screenshot` 的既有教训一致）。
+fn platform_of_game(db: &Arc<Mutex<Database>>, game_id: &str) -> Option<String> {
+    let db_guard = lock_or_recover(db);
+    match db_guard.get_game_by_id(game_id) {
+        Ok(Some(g)) => Some(g.platform),
+        Ok(None) => {
+            tracing::debug!("[截图] 查不到游戏 {game_id} 的条目，按非 Steam 处理");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("[截图] 查询游戏 {game_id} 平台失败，按非 Steam 处理: {e}");
+            None
+        }
+    }
+}
+
+/// 该平台是否应当建立截图温会话。
+///
+/// **Steam 不建**：Steam 自带截图、且默认热键同为 F12，本应用截图入口早已对其静默退让
+/// （见 `trigger_screenshot`），故预建 WGC 会话纯属白付代价——还会与 Steam Overlay /
+/// EA IGO Overlay 抢 DX11 SwapChain，实测导致 Titanfall 2 崩溃（2026-09-29）。
+/// 其余平台（epic / local / 未知）照常预建。
+fn should_prime_for_platform(platform: Option<&str>) -> bool {
+    platform.is_none_or(|p| p != crate::core::platform::PLATFORM_STEAM)
 }
 
 /// 截图执行体（由 `dispatch_screenshot_async` 在独立线程里调用）。
@@ -954,5 +1047,51 @@ mod tests {
         ] {
             assert!(!is_generic_dir_name(good), "{good} 不应判为通用名");
         }
+    }
+
+    /// 【2026-09-29 Titanfall 2 崩溃修复的回归保护】
+    ///
+    /// Steam 游戏必须**不建**截图温会话：截图入口早已对 Steam 静默退让，预建纯属白付代价，
+    /// 且常驻 WGC 会话会与 Steam Overlay / EA IGO Overlay 抢 DX11 SwapChain，实测导致游戏崩溃。
+    /// 其余平台（epic / local / 未知）必须照常建，不得误伤。
+    ///
+    /// 这条测试锁住的是"别把 Steam 判定删掉或写反"——一旦删掉，Titanfall 2 会重新崩溃。
+    #[test]
+    fn steam_games_do_not_prime_warm_session() {
+        use crate::core::platform::{PLATFORM_EPIC, PLATFORM_STEAM};
+
+        // Steam → 不建（核心断言）
+        assert!(
+            !should_prime_for_platform(Some(PLATFORM_STEAM)),
+            "Steam 游戏绝不能建截图温会话"
+        );
+        // 大小写不同也照样预建？——平台常量恒为小写，此处显式钉住当前语义：
+        // 判定是精确比较，'Steam' 不匹配 → 照常预建。若将来要放宽需同步改 trigger_screenshot。
+        assert!(
+            should_prime_for_platform(Some("Steam")),
+            "当前口径为精确比较，非小写 steam 不在豁免之列"
+        );
+
+        // 其余平台一律照常建
+        assert!(should_prime_for_platform(Some(PLATFORM_EPIC)), "Epic 应照常预建");
+        assert!(should_prime_for_platform(Some("local")), "本地游戏应照常预建");
+        assert!(should_prime_for_platform(Some("gog")), "未知平台应照常预建");
+
+        // 查不到条目（None）不阻断预建：与既有行为一致，避免数据库异常导致截图功能静默失效
+        assert!(should_prime_for_platform(None), "查不到平台时应照常预建");
+    }
+
+    /// Steam 豁免缓存：命中后应短路（对 Steam 游戏这是唯一能挡住"每拍查 DB"的机制）。
+    ///
+    /// 注意本测试会写全局缓存，故用唯一 game_id，避免与其它测试互相污染。
+    #[test]
+    fn steam_exempt_cache_short_circuits() {
+        let id = format!("steam-exempt-test-{}", uuid::Uuid::new_v4());
+        assert!(!is_steam_exempt(&id), "未标记前不应豁免");
+        mark_steam_exempt(&id);
+        assert!(is_steam_exempt(&id), "标记后应豁免");
+        // 幂等：重复标记不报错也不改变结果
+        mark_steam_exempt(&id);
+        assert!(is_steam_exempt(&id));
     }
 }
