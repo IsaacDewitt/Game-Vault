@@ -11,7 +11,7 @@ use crate::utils;
 use super::lock_or_recover;
 
 /// 获取手账条目列表
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_reviews(
     db: State<'_, Arc<Mutex<Database>>>,
     filter: Option<ReviewFilter>,
@@ -22,7 +22,7 @@ pub fn get_reviews(
 }
 
 /// 获取单个手账条目详情
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_review_detail(
     db: State<'_, Arc<Mutex<Database>>>,
     review_id: String,
@@ -32,7 +32,7 @@ pub fn get_review_detail(
 }
 
 /// 添加手账条目（只需名字，元数据/封面由 refresh_review_info 后续填充）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_review(
     db: State<'_, Arc<Mutex<Database>>>,
     name: String,
@@ -65,36 +65,64 @@ pub fn add_review(
 /// 规则（判定口径与检索词切换保持一致：`str::is_ascii()`）：
 /// - 纯 ASCII → `name` 存原名（主显示名 + 去重键，列 NOT NULL 不能留空），
 ///   并在 `name_en` 为空时补成同名，保证英文名框与封面检索都有值；
-/// - 含非 ASCII → `name` 存中文原名，`name_en` 保持原状（等 LLM 补官方英文名）。
+/// - 含非 ASCII → `name` 存中文原名，**并清空 `name_en`**（2026-10-06 补，与
+///   `games.rs` `rename_game_inner` 的 else 分支同口径）。此前这里缺 else，改名成中文时
+///   旧英文名原样残留 → 卡片「英文名优先展示」显示的是**与当前条目对不上的旧名**，
+///   残留值还会被 `pick_search_term` 拿去当检索词搜错封面。清掉后由 LLM/手动重填。
 fn normalize_review_name(review: &mut Review) {
     let name = review.name.trim().to_string();
     if name.is_empty() {
         return;
     }
     review.name = name.clone();
-    if name.is_ascii() && review.name_en.as_deref().is_none_or(|v| v.trim().is_empty()) {
-        tracing::info!("名称为纯英文，同步填入英文名: '{}'", name);
-        review.name_en = Some(name);
+    if name.is_ascii() {
+        if review.name_en.as_deref().is_none_or(|v| v.trim().is_empty()) {
+            tracing::info!("名称为纯英文，同步填入英文名: '{}'", name);
+            review.name_en = Some(name);
+        }
+    } else if review.name_en.is_some() {
+        tracing::info!(
+            "新名称含非 ASCII 字符，清空不再匹配的英文名: {:?}",
+            review.name_en
+        );
+        review.name_en = None;
     }
 }
 
 /// 将 LLM 返回的元数据合并到手账条目（只更新非空字段，保留已有数据）
 fn apply_meta_to_review(updated: &mut Review, meta: &LlmGameMeta) {
+    let mut name_changed = false;
     if let Some(name) = &meta.name {
         let trimmed = name.trim().to_string();
         if !trimmed.is_empty() && trimmed != updated.name {
             tracing::info!("LLM 纠正手账名称: '{}' -> '{}'", updated.name, trimmed);
             updated.name = trimmed;
+            name_changed = true;
         }
     }
-    // 名称改过之后做一次语言归位（纯英文名自动补 name_en）。
-    // 必须早于下面的 name_en 分支：用户显式清除英文名（Some("")）要能盖掉这里的自动填充。
-    normalize_review_name(updated);
-    // name_en 特殊语义：Some("") 表示显式清除（手动编辑场景），其余非空才更新
+    // 名称**真的被本次调用改过**才做语言归位（纯英文名自动补 name_en；中文名清掉对不上的旧英文名）。
+    // 「只在改过时执行」是必须的：update_review_meta 支持**部分提交**（前端 saveNameEn 只传
+    // name_en、saveName 只传 name），若无条件跑归位，一次"只改英文名"的调用会因为
+    // 「现名恰好是中文」而先把用户已有的英文名清掉 —— 虽然紧接着的 name_en 分支会填回来，
+    // 但那是巧合而非契约；一旦将来出现别的部分提交入口就会静默丢数据。
+    // 位置必须早于下面的 name_en 分支：用户显式清除英文名（Some("")）要能盖掉这里的自动填充。
+    if name_changed {
+        normalize_review_name(updated);
+    }
+    // name_en 特殊语义：Some("") 表示显式清除（手动编辑场景），其余非空才更新。
+    // 语言闸门：name_en 的契约是「官方英文名」，含非 ASCII 字符（中文/日文等）一律拒收 ——
+    // LLM 有时偷懒把中文名原样复制到 name_en（如 name_name 都填「空洞骑士」），
+    // 一旦落库就会让卡片「英文名优先展示」退化成显示中文（2026-10-05 修复）。
     if let Some(name_en) = &meta.name_en {
         let trimmed = name_en.trim().to_string();
         if trimmed.is_empty() {
             updated.name_en = None;
+        } else if !trimmed.is_ascii() {
+            tracing::warn!(
+                "LLM 返回的 name_en 含非 ASCII 字符，已丢弃: '{}'（保留原值 {:?}）",
+                trimmed,
+                updated.name_en
+            );
         } else if trimmed != updated.name_en.as_deref().unwrap_or("") {
             tracing::info!("更新手账英文名: '{:?}' -> '{}'", updated.name_en, trimmed);
             updated.name_en = Some(trimmed);
@@ -260,7 +288,7 @@ pub async fn refresh_review_info(
 }
 
 /// 手动更新手账条目元数据（与 LLM 字段一致，含改名）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_review_meta(
     db: State<'_, Arc<Mutex<Database>>>,
     review_id: String,
@@ -279,7 +307,7 @@ pub fn update_review_meta(
 }
 
 /// 设置评分（0-10 分制，null 表示清除评分）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_review_rating(
     db: State<'_, Arc<Mutex<Database>>>,
     review_id: String,
@@ -303,7 +331,7 @@ pub fn set_review_rating(
 }
 
 /// 设置我的评价（null 表示清除）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_review_review(
     db: State<'_, Arc<Mutex<Database>>>,
     review_id: String,
@@ -324,7 +352,7 @@ pub fn set_review_review(
 }
 
 /// 设置手账状态: "wishlist" | "playing" | "completed" | "abandoned"
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_review_status(
     db: State<'_, Arc<Mutex<Database>>>,
     review_id: String,
@@ -349,7 +377,7 @@ pub fn set_review_status(
 /// 设置手账条目的截图目录（相对截图根目录的单层文件夹名；null/空串表示清除，回到自动推断）
 ///
 /// 手账自持该字段后，删不删游戏、改不改名都不再影响手账的截图库（2026-09-12）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_review_screenshot_dir(
     db: State<'_, Arc<Mutex<Database>>>,
     review_id: String,
@@ -376,7 +404,7 @@ pub fn set_review_screenshot_dir(
 ///
 /// `keep_cover`：默认保留——封面挪进 covers/archive 留档；`false` 则连图片一并删除
 /// （若该图与游戏封面共享则在引用计数归零前不会真删）。前端删除前会询问用户。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_review(
     db: State<'_, Arc<Mutex<Database>>>,
     review_id: String,
@@ -430,7 +458,7 @@ pub async fn fetch_review_cover_options(
     let cache_dir = utils::path::get_app_data_dir().join("covers");
     let fetcher = CoverFetcher::new(cache_dir, api_key).map_err(|e| e.to_string())?;
 
-    fetcher.fetch_cover_options(search_name, None)
+    fetcher.fetch_cover_options(search_name, None, None)
         .await
         .map_err(|e| e.to_string())
 }
@@ -471,8 +499,40 @@ pub async fn set_review_cover_from_url(
     Ok(())
 }
 
+/// 由游戏库条目构造手账条目：复用元数据 + 语言归位 + 补官方英文名。
+///
+/// 抽成独立函数是为了能直接单测 —— `import_review_from_game` 包着 `State` 壳子，
+/// 单测里没法调用（同 `games.rs::rename_game_inner` 的处理方式）。
+fn review_from_game(game: &crate::models::Game) -> Review {
+    let mut review = Review::new(game.name.clone());
+    review.description = game.description.clone();
+    review.developer = game.developer.clone();
+    review.publisher = game.publisher.clone();
+    review.release_date = game.release_date.clone();
+    review.genres = game.genres.clone();
+    review.hltb_main_story = game.hltb_main_story;
+    review.hltb_main_extra = game.hltb_main_extra;
+    review.hltb_completionist = game.hltb_completionist;
+    // 游戏库里的名字可能是纯英文原名（如 "Mafia: The Old Country"），
+    // 直接存进 name 会让它被当成中文名，故落库前做一次语言归位。
+    normalize_review_name(&mut review);
+    // 补游戏库里的官方英文名（2026-10-06）：中文题名的游戏只有在导入这条路径上才拿得到
+    // 英文名，否则封面检索只能拿中文名去 SteamGridDB 撞 0 命中 —— 而"复用游戏库的元数据"
+    // 正是导入手账的核心价值之一。
+    // 顺序必须在 normalize **之后**：normalize 的 else 分支会「名字含非 ASCII → 清空 name_en」，
+    // 先补就会被它抹掉。带 is_ascii 过滤，避免把游戏库里的历史脏值一起搬进手账。
+    if review.name_en.is_none() {
+        if let Some(en) = game.name_en.as_deref().map(str::trim) {
+            if !en.is_empty() && en.is_ascii() {
+                review.name_en = Some(en.to_string());
+            }
+        }
+    }
+    review
+}
+
 /// 从游戏库导入游戏到游戏手账（复用元数据与封面，评分/评价为空）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn import_review_from_game(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
@@ -488,18 +548,7 @@ pub fn import_review_from_game(
         return Err(format!("《{}》已存在于手账中", game.name));
     }
 
-    let mut review = Review::new(game.name.clone());
-    review.description = game.description.clone();
-    review.developer = game.developer.clone();
-    review.publisher = game.publisher.clone();
-    review.release_date = game.release_date.clone();
-    review.genres = game.genres.clone();
-    review.hltb_main_story = game.hltb_main_story;
-    review.hltb_main_extra = game.hltb_main_extra;
-    review.hltb_completionist = game.hltb_completionist;
-    // 游戏库里的名字可能是纯英文原名（如 "Mafia: The Old Country"），
-    // 直接存进 name 会让它被当成中文名，故落库前做一次语言归位。
-    normalize_review_name(&mut review);
+    let mut review = review_from_game(&game);
 
     // 截图目录：导入时若能确定就固化进手账（此后从游戏库删除游戏，手账的截图库照旧可用）。
     // 目录不存在或无图则留空，继续走运行时自动推断。
@@ -581,5 +630,133 @@ mod tests {
         normalize_review_name(&mut r);
         assert_eq!(r.name, "   ");
         assert_eq!(r.name_en, None);
+    }
+
+    /// LLM 把中文名原样塞进 name_en 时必须拒收，且不得覆盖已有英文名（2026-10-05 修复）
+    #[test]
+    fn llm返回的中文英文名被拒收() {
+        let mut r = Review::new("空洞骑士".to_string());
+        r.name_en = Some("Hollow Knight".to_string());
+        let meta = LlmGameMeta {
+            name: Some("空洞骑士".to_string()),
+            // 模型偷懒：把中文名复制进了 name_en
+            name_en: Some("空洞骑士".to_string()),
+            description: None,
+            developer: None,
+            publisher: None,
+            release_date: None,
+            genres: vec![],
+            hltb_main_story: None,
+            hltb_main_extra: None,
+            hltb_completionist: None,
+            save_paths: vec![],
+        };
+        apply_meta_to_review(&mut r, &meta);
+        // 中文 name_en 被丢弃，原英文名安然无恙
+        assert_eq!(r.name_en.as_deref(), Some("Hollow Knight"));
+    }
+
+    /// name_en 为空时，中文 name_en 被拒收后应保持 None（不落中文脏数据）
+    #[test]
+    fn llm中文英文名不落库() {
+        let mut r = Review::new("空洞骑士".to_string());
+        let meta = LlmGameMeta {
+            name: Some("空洞骑士".to_string()),
+            name_en: Some("空洞骑士".to_string()),
+            description: None,
+            developer: None,
+            publisher: None,
+            release_date: None,
+            genres: vec![],
+            hltb_main_story: None,
+            hltb_main_extra: None,
+            hltb_completionist: None,
+            save_paths: vec![],
+        };
+        apply_meta_to_review(&mut r, &meta);
+        assert_eq!(r.name_en, None);
+        assert_eq!(r.name, "空洞骑士");
+    }
+
+    /// 合法英文名（含标点/数字）正常写入
+    #[test]
+    fn llm合法英文名正常写入() {
+        let mut r = Review::new("四海兄弟：故乡".to_string());
+        let meta = LlmGameMeta {
+            name: Some("四海兄弟：故乡".to_string()),
+            name_en: Some("Mafia: The Old Country".to_string()),
+            description: None,
+            developer: None,
+            publisher: None,
+            release_date: None,
+            genres: vec![],
+            hltb_main_story: None,
+            hltb_main_extra: None,
+            hltb_completionist: None,
+            save_paths: vec![],
+        };
+        apply_meta_to_review(&mut r, &meta);
+        assert_eq!(r.name_en.as_deref(), Some("Mafia: The Old Country"));
+    }
+
+    /// 改名成中文必须清空旧英文名（2026-10-06 修：此前 normalize 缺 else 分支）。
+    /// 与 games.rs::rename_game_normalizes_name_en 是同一语义的对称防线。
+    #[test]
+    fn 改名成中文清空旧英文名() {
+        let mut r = Review::new("Hollow Knight".to_string());
+        r.name_en = Some("Hollow Knight".to_string());
+        let meta = LlmGameMeta {
+            name: Some("空洞骑士：丝之歌".to_string()),
+            ..Default::default()
+        };
+        apply_meta_to_review(&mut r, &meta);
+        assert_eq!(r.name, "空洞骑士：丝之歌");
+        assert_eq!(r.name_en, None, "改成中文名必须清空 name_en（防错配展示与错检索）");
+    }
+
+    /// 部分提交保护：只改英文名时，不能因为"现名恰好是中文"而先被归位清掉。
+    /// 这条守着 apply_meta_to_review 里 `if name_changed` 那道闸门。
+    #[test]
+    fn 只改英文名不被归位误清() {
+        let mut r = Review::new("空洞骑士".to_string());
+        r.name_en = Some("Hollow Knight".to_string());
+        // 前端 saveNameEn 的提交形态：只带 name_en，name 为 None
+        let meta = LlmGameMeta {
+            name_en: Some("Hollow Knight: Silksong".to_string()),
+            ..Default::default()
+        };
+        apply_meta_to_review(&mut r, &meta);
+        assert_eq!(r.name_en.as_deref(), Some("Hollow Knight: Silksong"));
+    }
+
+    /// 从游戏库导入手账：中文题名 + 游戏库有官方英文名 → 英文名必须带过来
+    /// （2026-10-06 修：此前只搬 name，英文名在此丢失，封面检索退回中文名 0 命中）
+    #[test]
+    fn 导入手账带上游戏库英文名() {
+        let mut g = crate::models::Game::new("空洞骑士".to_string());
+        g.name_en = Some("Hollow Knight".to_string());
+        let r = review_from_game(&g);
+        assert_eq!(r.name, "空洞骑士");
+        assert_eq!(r.name_en.as_deref(), Some("Hollow Knight"));
+    }
+
+    /// 导入时不得把游戏库里的中文脏英文名搬进手账（语言闸门同样适用于这条路径）
+    #[test]
+    fn 导入不搬中文脏英文名() {
+        let mut g = crate::models::Game::new("空洞骑士".to_string());
+        g.name_en = Some("空洞骑士".to_string());
+        let r = review_from_game(&g);
+        assert_eq!(r.name_en, None);
+    }
+
+    /// 导入纯英文题名：normalize 已把 name 补成 name_en，不该被后面的补全逻辑改动
+    #[test]
+    fn 导入纯英文题名沿用原名作英文名() {
+        let mut g = crate::models::Game::new("Hollow Knight".to_string());
+        g.name_en = Some("Hollow Knight: Silksong".to_string());
+        let r = review_from_game(&g);
+        assert_eq!(r.name, "Hollow Knight");
+        // normalize 先按 ASCII 名填了同名，补全分支不覆盖（name_en 已非 None）
+        assert_eq!(r.name_en.as_deref(), Some("Hollow Knight"));
     }
 }

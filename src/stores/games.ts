@@ -5,6 +5,19 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import type { Game } from "../lib/tauri";
 import * as api from "../lib/tauri";
 
+/**
+ * 卡片展示名：英文名优先（与手账 `reviews.ts` 的 `displayName` 同口径）。
+ *
+ * 仅在 `name_en` 为**纯 ASCII** 时优先——历史脏数据里存在中文被误写进 `name_en`
+ * 的条目，直接优先会把卡片名显示成中文。此时退回 `name`（2026-10-05 修复）。
+ */
+export function displayName(g: { name: string; name_en?: string | null }): string {
+  const en = g.name_en?.trim();
+  // eslint-disable-next-line no-control-regex
+  if (en && /^[\x00-\x7F]+$/.test(en)) return en;
+  return g.name;
+}
+
 export const useGamesStore = defineStore("games", () => {
   // 状态
   const games = ref<Game[]>([]);
@@ -94,10 +107,16 @@ export const useGamesStore = defineStore("games", () => {
   const filteredGames = computed(() => {
     let result = games.value;
 
-    // 搜索筛选
+    // 搜索筛选：中英文名都匹配（2026-10-06）。
+    // 卡片展示的是 displayName（英文名优先），若这里只匹配 name，用户照着卡片上的
+    // 英文名一搜就是 0 命中 —— 手账库（stores/reviews.ts）一直是中英文都匹配，此处对齐。
     if (searchQuery.value) {
       const query = searchQuery.value.toLowerCase();
-      result = result.filter((g) => g.name.toLowerCase().includes(query));
+      result = result.filter(
+        (g) =>
+          g.name.toLowerCase().includes(query) ||
+          (g.name_en ?? "").toLowerCase().includes(query)
+      );
     }
 
     // 状态筛选（与后端 get_status_stats 的智能推导保持一致：
@@ -409,19 +428,28 @@ export const useGamesStore = defineStore("games", () => {
     }
   }
 
-  async function renameGame(gameId: string, newName: string) {
+  /**
+   * 重命名游戏（中文名入口）。
+   *
+   * 后端改名时会顺带做语言归位（纯 ASCII 名补 `name_en`、中文名清 `name_en`），
+   * 故这里必须拿返回的完整 `Game` 把 `name` 与 `name_en` **一并**写回——
+   * 只同步 `name` 会让卡片（英文名优先）立刻退回中文名，看着像没生效
+   * （2026-10-05 修复）。
+   */
+  async function renameGame(gameId: string, newName: string): Promise<Game> {
     try {
-      await api.renameGame(gameId, newName);
+      const updated = await api.renameGame(gameId, newName);
       const idx = games.value.findIndex((g) => g.id === gameId);
       if (idx !== -1) {
-        games.value[idx].name = newName;
+        games.value[idx] = updated;
       }
       if (selectedGame.value?.id === gameId) {
-        selectedGame.value.name = newName;
+        selectedGame.value = updated;
       }
+      return updated;
     } catch (e) {
       console.error("重命名失败:", e);
-      throw e;
+      throw e;  // 向上传播错误，让调用方可以提示用户
     }
   }
 

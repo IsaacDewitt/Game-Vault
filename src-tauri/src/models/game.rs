@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 pub struct Game {
     pub id: String,
     pub name: String,
+    /// 官方英文名称（LLM 拉取或手动填写；专用于 SteamGridDB 封面检索）。
+    ///
+    /// SteamGridDB 只收录官方英文名，中文名（如「全面战争：三国」）必然 0 命中，
+    /// 文件夹名也常是 `TotalWarTHREEKINGDOMS` 这类去空格裸串，同样搜不到 ——
+    /// 2026-10-03 实测确认。故封面检索词优先用它，为空时退回 `name`。
+    /// 留空是有效信号（= 尚无英文别名），LLM 未启用或拉不到官方英文名时就保持 None。
+    #[serde(default)]
+    pub name_en: Option<String>,
     pub install_path: Option<String>,
     pub exe_path: Option<String>,
     pub exe_name: Option<String>,
@@ -67,6 +75,7 @@ impl Game {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             name,
+            name_en: None,
             install_path: None,
             exe_path: None,
             exe_name: None,

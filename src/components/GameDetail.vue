@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, toRef, computed, watch, onMounted, onUnmounted } from "vue";
+import { ref, toRef, computed, watch, onMounted, onUnmounted, nextTick } from "vue";
 import {
   NDrawer,
   NDrawerContent,
@@ -12,6 +12,7 @@ import {
   NTooltip,
   NProgress,
   NDropdown,
+  NInput,
   useMessage,
 } from "naive-ui";
 import {
@@ -72,6 +73,63 @@ const platformLabel = computed(() => {
   if (p === "epic") return "Epic";
   return "";
 });
+
+// ==================== 信息区「点击改名」（中文名 / 英文名） ====================
+// 就地编辑：点一下行 → 变输入框 → 失焦/回车提交，Esc 取消。
+// 中文名走 renameGame（改的是展示名/去重键），英文名走 updateGameMeta({ nameEn })。
+type InlineNameField = "name" | "name_en";
+const editingField = ref<InlineNameField | null>(null);
+const inlineName = ref("");
+const inlineNameEn = ref("");
+const nameEditRef = ref<InstanceType<typeof NInput> | null>(null);
+const nameEnEditRef = ref<InstanceType<typeof NInput> | null>(null);
+
+/** 进入某字段的就地编辑态（预填当前值），并把焦点交给输入框 */
+function startNameEdit(field: InlineNameField) {
+  editingField.value = field;
+  inlineName.value = props.game.name ?? "";
+  inlineNameEn.value = props.game.name_en ?? "";
+  nextTick(() => {
+    const r = field === "name" ? nameEditRef.value : nameEnEditRef.value;
+    r?.focus();
+  });
+}
+
+/** 放弃就地编辑，不改动任何数据 */
+function cancelNameEdit() {
+  editingField.value = null;
+}
+
+/**
+ * 提交就地编辑。
+ * - 中文名：空值或未变 → 不动；否则改展示名。
+ * - 英文名：空串 → 清除（哨兵语义）；未变 → 不动。
+ */
+async function commitNameEdit() {
+  const field = editingField.value;
+  if (!field) return;
+  editingField.value = null;
+  try {
+    if (field === "name") {
+      const name = inlineName.value.trim();
+      if (!name || name === props.game.name) return;
+      // 后端改名会顺带语言归位（纯 ASCII 补 name_en / 中文名清 name_en），
+      // store 已把返回的 name + name_en 一并写回，这里同步就地编辑的两个预填值，
+      // 免得再进编辑态时拿着旧值把新值覆盖回去。
+      const updated = await store.renameGame(props.game.id, name);
+      inlineNameEn.value = updated.name_en ?? "";
+      message.success("中文名已更新");
+    } else {
+      const trimmed = inlineNameEn.value.trim();
+      const current = props.game.name_en ?? "";
+      if (trimmed === current) return;
+      await store.updateGameMeta(props.game.id, { nameEn: trimmed });
+      message.success(trimmed ? "英文名已更新，点「刷新封面」可重新拉取封面" : "英文名已清除");
+    }
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e));
+  }
+}
 
 const store = useGamesStore();
 const message = useMessage();
@@ -631,6 +689,47 @@ async function handleRemoveSavePath(index: number) {
           <span class="info-label">平台</span>
           <span class="info-value">{{ platformLabel }}</span>
         </div>
+        <!-- 中文名 / 英文名：点击即可就地编辑（放在发行商等字段之前） -->
+        <div class="info-row editable" @click="startNameEdit('name')">
+          <span class="info-label">中文名</span>
+          <template v-if="editingField === 'name'">
+            <n-input
+              ref="nameEditRef"
+              v-model:value="inlineName"
+              size="small"
+              placeholder="中文名"
+              class="inline-input"
+              @blur="commitNameEdit"
+              @keyup.enter="commitNameEdit"
+              @keyup.esc="cancelNameEdit"
+              @click.stop
+            />
+          </template>
+          <template v-else>
+            <span class="info-value">{{ game.name || "—" }}</span>
+            <n-icon :component="CreateOutline" size="14" class="edit-icon" />
+          </template>
+        </div>
+        <div class="info-row editable" @click="startNameEdit('name_en')">
+          <span class="info-label">英文名</span>
+          <template v-if="editingField === 'name_en'">
+            <n-input
+              ref="nameEnEditRef"
+              v-model:value="inlineNameEn"
+              size="small"
+              placeholder="英文名（封面检索用，留空保存即清除）"
+              class="inline-input"
+              @blur="commitNameEdit"
+              @keyup.enter="commitNameEdit"
+              @keyup.esc="cancelNameEdit"
+              @click.stop
+            />
+          </template>
+          <template v-else>
+            <span class="info-value">{{ game.name_en || "—" }}</span>
+            <n-icon :component="CreateOutline" size="14" class="edit-icon" />
+          </template>
+        </div>
         <div class="info-row" v-if="game.developer">
           <span class="info-label">开发商</span>
           <span class="info-value">{{ game.developer }}</span>
@@ -909,6 +1008,56 @@ async function handleRemoveSavePath(index: number) {
 
 .info-row.clickable:hover {
   background-color: rgba(255, 255, 255, 0.05);
+}
+
+/* 可就地编辑的信息行（中文名 / 英文名）：整行可点，悬停淡底。
+ *
+ * 对齐要点（2026-10-05 修）：其它行只有「标签 + 值」，靠 space-between 让值贴右缘；
+ * 本行多出的笔形图标若参与 flex 布局，会把值顶得比别行靠左，右缘参差。
+ *
+ * 解法：图标**绝对定位**脱离文档流（悬停时钉在行右缘内侧的 4px 留白处），
+ * 行的 padding 与普通 `.info-row` **完全一致**（`8px 0`），值照旧走 space-between
+ * 贴右 —— 这样左右两缘都与上下各行逐像素对齐。
+ * 注意：切勿为了给图标腾位置而改成 `padding: 8px 20px 8px 4px` 之类的不对称内边距，
+ * 那会让本行整体右移/左偏，正是上一版「与其他行对不齐」的成因。
+ */
+.info-row.editable {
+  cursor: pointer;
+  align-items: center;
+  transition: background-color 0.2s;
+  border-radius: 4px;
+  padding: 8px 0;
+  position: relative;
+}
+
+.info-row.editable:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.info-row.editable .edit-icon {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  opacity: 0;
+  transition: opacity 0.2s;
+  color: #888;
+  pointer-events: none;
+}
+
+.info-row.editable:hover .edit-icon {
+  opacity: 0.8;
+}
+
+/* 编辑态：输入框贴右、宽度上限与 `.info-value` 同口径，保证切换不跳位 */
+.info-row.editable .n-input {
+  flex: 1;
+  max-width: 60%;
+  margin-left: auto;
+}
+
+:global(.light-theme) .info-row.editable:hover {
+  background-color: rgba(0, 0, 0, 0.05);
 }
 
 .info-row.clickable .edit-icon {

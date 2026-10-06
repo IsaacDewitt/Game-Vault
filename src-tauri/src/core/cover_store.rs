@@ -99,13 +99,20 @@ fn is_inside_covers(abs: &Path) -> bool {
     rel_path_of(abs).is_some()
 }
 
-/// 写文件：先写 `.tmp`，校验大小后替换正式文件（Windows 上 rename 不覆盖，先删旧）
+/// 写文件：先写同目录唯一命名的 `.tmp`，校验大小后**直接 rename 替换**正式文件。
+///
+/// 两处关键语义（2026-10-05 修正，与 `cover_fetcher::unique_temp_path` 同口径）：
+/// - **不先删旧文件**：`std::fs::rename` 在 Windows 走 `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`，
+///   本身就是替换语义。原实现「先 remove_file(target) 再 rename」不但多余，还在
+///   「删旧成功、rename 失败」（杀软锁定 / 权限抖动 / 文件被占用）的窗口里让封面**凭空消失**，
+///   而 DB 里的索引行仍指向它 —— 卡片永久破图且无法自愈。
+/// - **临时名必须唯一**：固定名 `.tmp` 会让并发写同一目标（连点上传 / 后台抓封面与手动上传撞车）
+///   互相删对方的临时文件；唯一名带 uuid，各写各的。
 fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = target.with_extension("tmp");
-    let _ = std::fs::remove_file(&tmp);
+    let tmp = super::cover_fetcher::unique_temp_path(target);
     std::fs::write(&tmp, bytes).with_context(|| format!("写入临时文件失败: {}", tmp.display()))?;
     // 校验：文件真的落盘且大小一致，避免半张图覆盖掉好图
     let written = std::fs::metadata(&tmp)?.len();
@@ -113,9 +120,11 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
         anyhow::bail!("封面写入校验失败（期望 {} 字节，实际 {}）", bytes.len(), written);
     }
-    let _ = std::fs::remove_file(target);
-    std::fs::rename(&tmp, target)
-        .with_context(|| format!("替换封面文件失败: {}", target.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        // rename 失败时旧文件原样保留（远好于"删了旧的又没换上新的"）；顺手清掉孤儿临时文件
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("替换封面文件失败: {}", target.display()));
+    }
     Ok(())
 }
 
@@ -185,8 +194,13 @@ fn has_real_alpha(img: &image::DynamicImage) -> bool {
     if !img.color().has_alpha() {
         return false;
     }
-    let rgba = img.to_rgba8();
-    rgba.pixels().any(|p| p.0[3] < 255)
+    // 零拷贝快路径：解码/缩放的产物通常本就是 Rgba8，`as_rgba8()` 命中时直接借用原缓冲扫描。
+    // 原实现无条件 `to_rgba8()`，每次都要整帧分配 + 逐像素转换（4K 封面 ≈ 48MB 临时内存、
+    // 1200 万次像素搬运），而这只为回答"有没有一个 alpha < 255"。判定结果与旧实现逐像素等价。
+    if let Some(rgba) = img.as_rgba8() {
+        return rgba.pixels().any(|p| p.0[3] < 255);
+    }
+    img.to_rgba8().pixels().any(|p| p.0[3] < 255)
 }
 
 fn encode_jpeg(img: &image::DynamicImage, quality: u8) -> Result<Vec<u8>> {
@@ -211,7 +225,7 @@ fn encode_lossless_webp(img: &image::DynamicImage) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// 生成缩略图：先等比缩到长边 ≤256，再按透明度选编码。
+/// 生成缩略图：先等比缩到长边 ≤ `THUMB_MAX_EDGE`（当前 512），再按透明度选编码。
 ///
 /// 返回 `(字节, 宽, 高, 扩展名)`——三者**都由真正落盘的那张缩略图导出**，一次算清：
 /// - 早前两个调用方拿到字节后各自又 `img.thumbnail()` 重算一遍，**只为读宽高**，

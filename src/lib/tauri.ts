@@ -5,6 +5,9 @@ import { invoke } from "@tauri-apps/api/core";
 export interface Game {
   id: string;
   name: string;
+  /** 官方英文名（SteamGridDB 封面检索专用）：中文名的游戏靠它才能搜到图。
+   *  LLM 拉取或手动填写；为空时检索退回 name（未启用 LLM 也能搜，只是命中率取决于原名） */
+  name_en: string | null;
   install_path: string | null;
   exe_path: string | null;
   exe_name: string | null;
@@ -390,7 +393,7 @@ export async function exportGameData(filePath: string): Promise<{ main_path: str
   return invoke("export_game_data", { filePath });
 }
 
-export async function renameGame(gameId: string, newName: string): Promise<void> {
+export async function renameGame(gameId: string, newName: string): Promise<Game> {
   return invoke("rename_game", { gameId, newName });
 }
 
@@ -451,6 +454,8 @@ export interface GameMetaInput {
   savePaths?: string[];
   /** 空串/纯空白 = 清空启动参数（后端按 trim 后为空处理） */
   launchArgs?: string;
+  /** 官方英文名（SteamGridDB 封面检索专用）。空串 = 清空，不传 = 保持现值 */
+  nameEn?: string;
 }
 
 export async function updateGameMeta(gameId: string, meta: GameMetaInput): Promise<Game> {
@@ -471,17 +476,41 @@ export interface SavesRestoreResult {
   errors: string[];
 }
 
-export async function importSavesBackup(zipPath: string): Promise<SavesRestoreResult> {
-  return invoke("import_saves_backup", { zipPath });
+/** ZIP 内一条冲突记录（大小 / CRC32 取自 ZIP 中央目录，不解压） */
+export interface SaveConflictEntry {
+  zip_name: string;
+  size: number;
+  crc32: number;
 }
 
-/** 存档恢复预览：即将写入的落点、会新建的目录、会被覆盖的文件 */
+/** 同落点冲突：多条 ZIP 条目映射到同一最终路径，且内容不同 */
+export interface SaveIntraConflict {
+  dest: string;
+  entries: SaveConflictEntry[];
+}
+
+/**
+ * 冲突裁决策略：`first` 保留靠前一份、`last` 保留靠后一份。
+ * 不传 = 后端按 abort 处理（拒绝恢复）—— 内容是同一份的重复条目会自动去重，不会被拦。
+ */
+export type SaveConflictPolicy = "first" | "last";
+
+export async function importSavesBackup(
+  zipPath: string,
+  conflictPolicy?: SaveConflictPolicy
+): Promise<SavesRestoreResult> {
+  return invoke("import_saves_backup", { zipPath, conflictPolicy });
+}
+
+/** 存档恢复预览：即将写入的落点、会新建的目录、会被覆盖的文件、备份内冲突 */
 export interface SavesRestorePreview {
   target_dirs: string[];
   dirs_to_create: string[];
   total_files: number;
   overwrite_count: number;
   overwrite_files: string[];
+  /** 非空时必须让用户裁决保留哪一份（否则恢复会静默互相覆盖） */
+  intra_conflicts: SaveIntraConflict[];
   warnings: string[];
 }
 

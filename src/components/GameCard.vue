@@ -5,6 +5,7 @@ import { HeartOutline, Heart, PlayOutline, FolderOutline, ImagesOutline } from "
 import type { Game } from "../lib/tauri";
 import { formatPlayTime } from "../lib/format";
 import { useCoverImage } from "../lib/useCoverImage";
+import { displayName } from "../stores/games";
 import ContextMenu from "./ContextMenu.vue";
 import type { ContextMenuItem } from "./ContextMenu.vue";
 
@@ -34,6 +35,9 @@ const contextMenuX = ref(0);
 const contextMenuY = ref(0);
 
 const { coverImage, imgFailed, handleImageError } = useCoverImage(toRef(props, "game"));
+
+/** 卡片展示名：英文名优先，但 `name_en` 为中文脏数据时退回中文名（见 stores/games.ts） */
+const cardName = computed(() => displayName(props.game));
 
 const contextMenuItems = computed<ContextMenuItem[]>(() => {
   const items: ContextMenuItem[] = [
@@ -183,7 +187,7 @@ function handleContextMenu(e: MouseEvent) {
     <!-- 游戏信息 -->
     <div class="info">
       <div class="name">
-        <n-ellipsis :tooltip="false">{{ game.name }}</n-ellipsis>
+        <n-ellipsis :tooltip="false">{{ cardName }}</n-ellipsis>
       </div>
       <div class="meta">
         <span v-if="game.play_time_seconds > 0" class="play-time">

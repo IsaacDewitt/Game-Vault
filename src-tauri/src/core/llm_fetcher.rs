@@ -36,7 +36,10 @@ impl Default for LlmConfig {
 }
 
 /// LLM 返回的游戏元数据
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` 供单测构造"只带某一个字段"的部分提交形态（与前端 saveNameEn 的提交一致），
+/// 不代表任何运行期语义 —— 所有字段的默认值就是 `None` / 空 vec，与 serde 缺省一致。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmGameMeta {
     /// LLM 纠正后的完整游戏名称（与原始输入语言一致）
     #[serde(default)]
@@ -78,25 +81,40 @@ where
     Ok(opt.unwrap_or_default())
 }
 
-/// 反序列化：兼容整数、浮点数（如 1560.0）、字符串数字、null
+/// 反序列化：兼容整数、浮点数（如 1560.0）、字符串数字、null。
+///
+/// **真正的业务闸门是 `sanitize_meta`**（第 3 条：`0 < v < 100_000` 分钟），本函数只负责
+/// 「把任意 JSON 数值形态收敛成一个可用的 u32」，不承担业务校验。
+/// 但这里必须避免 `v as u32` 的**静默回绕**（2026-10-06 修正）：`9_999_999_999_u64 as u32`
+/// 会变成一个看似合法的中间值，一旦将来有人挪走 sanitize_meta 的过滤就立刻变成脏数据。
+/// 超 u32 上界一律按 None —— 与既有行为在正常取值上完全一致。
 fn deserialize_flexible_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
+    /// u64 → u32：超出 u32::MAX 不再回绕，按 None 处理
+    fn from_u64(v: u64) -> Option<u32> {
+        u32::try_from(v).ok()
+    }
+    /// f64 → u32：NaN / Inf / 负数 / 超界一律 None（保持原判据，仅补上 is_finite）
+    fn from_f64(v: f64) -> Option<u32> {
+        if v.is_finite() && v >= 0.0 && v <= u32::MAX as f64 {
+            Some(v as u32)
+        } else {
+            None
+        }
+    }
+
     // 先用 Value 接收任意类型
     let val = serde_json::Value::deserialize(deserializer)?;
     match val {
         serde_json::Value::Null => Ok(None),
         serde_json::Value::Number(n) => {
             if let Some(v) = n.as_u64() {
-                Ok(Some(v as u32))
+                Ok(from_u64(v))
             } else if let Some(v) = n.as_f64() {
                 // 处理 LLM 返回 1560.0 这种浮点数
-                if v >= 0.0 && v <= u32::MAX as f64 {
-                    Ok(Some(v as u32))
-                } else {
-                    Ok(None)
-                }
+                Ok(from_f64(v))
             } else {
                 Ok(None)
             }
@@ -109,13 +127,9 @@ where
             }
             // 尝试解析 "1560" 或 "1560.0"
             if let Ok(v) = trimmed.parse::<u64>() {
-                Ok(Some(v as u32))
+                Ok(from_u64(v))
             } else if let Ok(v) = trimmed.parse::<f64>() {
-                if v >= 0.0 && v <= u32::MAX as f64 {
-                    Ok(Some(v as u32))
-                } else {
-                    Ok(None)
-                }
+                Ok(from_f64(v))
             } else {
                 Ok(None)
             }
@@ -581,8 +595,8 @@ fn build_system_prompt() -> String {
      \n\
      JSON 格式如下：\n\
      {\n\
-       \"name\": \"游戏的完整正式名称\",\n\
-       \"name_en\": \"游戏的官方英文名称\",\n\
+       \"name\": \"游戏的完整正式名称（语言与用户输入一致）\",\n\
+       \"name_en\": \"官方英文名称，必须为纯英文字母（严禁中文）\",\n\
        \"description\": \"游戏的简短描述（中文，100字以内）\",\n\
        \"developer\": \"开发商名称\",\n\
        \"publisher\": \"发行商名称\",\n\
@@ -613,7 +627,7 @@ fn build_system_prompt() -> String {
      注意事项：\n\
      - 如果用户输入的名称是缩写、不完整或有误，请返回该游戏最正确、最完整的正式名称，语言与用户输入保持一致\n\
      - 如果名称已经是正确的，也请返回完整的正式名称\n\
-     - name_en 必须是该游戏在 Steam 等平台使用的官方英文名称（无论用户输入何种语言都要提供），确实没有官方英文名时填 null\n\
+     - name_en 必须是该游戏在 Steam 等平台使用的官方英文名称，且必须是**纯英文字符（ASCII 字母/数字/标点）**，严禁填写中文或其他非英文字符；无论用户输入何种语言都要提供英文名（如 name=\"空洞骑士\" 时 name_en=\"Hollow Knight\"），确实没有官方英文名时填 null\n\
      - 某项信息确实无法确定时，填 null\n\
      - genres 必须从下面的【规范类型表】中选择 1-3 个，严格照抄表内写法（{genre_list}）\n\
      - genres 禁止自造类型、禁止写英文、禁止写表中没有的近义词；确实无法确定时填空数组 []\n\
@@ -991,6 +1005,19 @@ mod tests {
         assert!(user.contains("血缘"));
     }
 
+    /// 提示词必须把 name_en 的「纯英文」约束钉死：模板说明 + 注意事项双处提及，
+    /// 否则模型会把中文名原样复制进 name_en（2026-10-05 修复）
+    #[test]
+    fn test_system_prompt_pins_name_en_english_only() {
+        let prompt = build_system_prompt();
+        // 模板层（模型最看重的地方）必须写明「纯英文字母/严禁中文」
+        assert!(prompt.contains("必须为纯英文字母"));
+        assert!(prompt.contains("严禁中文"));
+        // 注意事项层必须给出反向禁止与中英映射示例
+        assert!(prompt.contains("严禁填写中文"));
+        assert!(prompt.contains("Hollow Knight"));
+    }
+
     #[test]
     fn test_normalize_chinese_date() {
         assert_eq!(normalize_date("2024年1月1日"), Some("2024-01-01".to_string()));
@@ -1017,6 +1044,24 @@ mod tests {
 
         // null
         let json = r#"{"hltb_main_story": null}"#;
+        let meta: LlmGameMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.hltb_main_story, None);
+
+        // 超 u32 上界的整数不得静默回绕（2026-10-06）：应得 None
+        let json = r#"{"hltb_main_story": 9999999999}"#;
+        let meta: LlmGameMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.hltb_main_story, None);
+
+        let json = r#"{"hltb_main_story": "9999999999"}"#;
+        let meta: LlmGameMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.hltb_main_story, None);
+
+        // 负数 / 非数字字符串一律 None
+        let json = r#"{"hltb_main_story": -5}"#;
+        let meta: LlmGameMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.hltb_main_story, None);
+
+        let json = r#"{"hltb_main_story": "很久"}"#;
         let meta: LlmGameMeta = serde_json::from_str(json).unwrap();
         assert_eq!(meta.hltb_main_story, None);
     }

@@ -42,6 +42,7 @@ const genreOptions: SelectOption[] = GENRE_GROUPS.map((g) => ({
 
 // 表单字段
 const description = ref("");
+const nameEn = ref("");
 const developer = ref("");
 const publisher = ref("");
 const releaseDate = ref<number | null>(null);
@@ -59,6 +60,7 @@ const isLocalGame = computed(() => (props.game.platform ?? "local") === "local")
 // 从 game 初始化表单
 function initForm() {
   description.value = props.game.description ?? "";
+  nameEn.value = props.game.name_en ?? "";
   developer.value = props.game.developer ?? "";
   publisher.value = props.game.publisher ?? "";
   // 将 YYYY-MM-DD 字符串转为时间戳
@@ -121,6 +123,8 @@ async function handleSave() {
       savePaths: savePaths.value.filter((p) => p.trim() !== ""),
       // 空串即清空（后端按 trim 后为空处理）
       launchArgs: launchArgs.value.trim(),
+      // 官方英文名：空串即清空（搜不到图时手填官方英文名，如「全面战争：三国」→ Total War: Three Kingdoms）
+      nameEn: nameEn.value.trim(),
     });
     message.success("游戏信息已保存");
     emit("saved");
@@ -163,6 +167,20 @@ async function handleSave() {
           :maxlength="200"
           show-count
         />
+      </div>
+
+      <!-- 英文名（SteamGridDB 封面检索专用） -->
+      <div class="form-field">
+        <label>英文名（用于搜封面）</label>
+        <n-input
+          v-model:value="nameEn"
+          placeholder="官方英文名，例如 Total War: Three Kingdoms"
+          clearable
+        />
+        <div class="form-hint">
+          封面图库（SteamGridDB）只认官方英文名，中文名多半搜不到。遇到搜不到图时，
+          在这里填上官方英文名，再点「刷新封面」即可。留空则沿用游戏名。
+        </div>
       </div>
 
       <!-- 开发商 / 发行商 -->

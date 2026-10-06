@@ -44,6 +44,24 @@ pub struct Database {
     conn: Connection,
 }
 
+/// 「该日期属于哪个 ISO 周」的归并键（SQL 表达式）。
+///
+/// 取该 ISO 周的**周四**的日期作为键 —— 一周七天必得同一个键，跨年天然不错位，
+/// 且只用到 `date` / `printf` / `strftime('%w')`，SQLite 3.8 起即支持（实测 bundled 是 3.45.0）。
+///
+/// **为什么不用 `strftime('%Y-%W')`（2026-10-06 修）**：`%W` 以周一为周首、`%Y` 是**日历年**，
+/// 于是一个跨年的 ISO 周（如 2025-12-29 周一 ~ 2026-01-04 周日）会被拆成 `2025-52` 与 `2026-00`
+/// 两个桶 —— 后果是 G-33 的「一周玩过几款不同游戏」被低估、G-37 的「一周七天都玩过」
+/// 在那一周**永远不可能成立**。
+///
+/// **为什么不用 `strftime('%G-%V')`（ISO 周年的标准写法）**：那要 SQLite ≥ 3.46；
+/// 低版本对未知格式符不会报错而是原样输出，会静默把所有行归进同一个桶 —— 比原 bug 更坏。
+///
+/// 推导：`%w` 是 0=周日…6=周六；`(x+6)%7` 得 0=周一…6=周日（距本周一的天数）；
+/// 本周四即 `day + (3 - 距周一的天数)`。
+const ISO_WEEK_KEY_SQL: &str =
+    "date(day, printf('%+d days', 3 - ((CAST(strftime('%w', day) AS INTEGER) + 6) % 7)))";
+
 impl Database {
     /// 创建新的数据库连接
     pub fn new(db_path: &Path) -> Result<Self> {
@@ -61,6 +79,9 @@ impl Database {
             CREATE TABLE IF NOT EXISTS games (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
+                -- 官方英文名（SteamGridDB 封面检索专用）：中文名的游戏靠它才能搜到图。
+                -- NULL/空串 = 尚无英文别名，检索时退回 name（与旧库行为一致）。
+                name_en TEXT,
                 install_path TEXT,
                 exe_path TEXT,
                 exe_name TEXT,
@@ -180,6 +201,9 @@ impl Database {
 
         // 迁移：为旧数据库添加 status 字段（必须在索引创建之前）
         self.migrate_add_status_column()?;
+
+        // 迁移：为旧游戏库数据库添加英文名字段（SteamGridDB 封面检索用）
+        self.migrate_add_game_name_en_column()?;
 
         // 迁移：为旧手账数据库添加英文名字段
         self.migrate_add_review_name_en_column()?;
@@ -542,6 +566,23 @@ impl Database {
 
     // ==================== 辅助函数 ====================
 
+    /// 迁移：为旧数据库的 games 表添加 name_en（官方英文名）字段（2026-10-03）
+    ///
+    /// 背景：SteamGridDB 只收录官方英文名，中文名（「全面战争：三国」）实测 0 命中，
+    /// 文件夹名兜底（`TotalWarTHREEKINGDOMS`）同样是 0 命中 —— 游戏库封面链路此前
+    /// 完全没有英文名机制（手账 0.7.3 已具备，见 migrate_add_review_name_en_column）。
+    fn migrate_add_game_name_en_column(&self) -> Result<()> {
+        if !self.has_column("games", "name_en")? {
+            tracing::info!("games.name_en 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE games ADD COLUMN name_en TEXT",
+                [],
+            )?;
+            tracing::info!("已添加 name_en 字段到 games 表");
+        }
+        Ok(())
+    }
+
     /// 迁移：为旧数据库的 reviews 表添加 name_en（官方英文名）字段
     fn migrate_add_review_name_en_column(&self) -> Result<()> {
         if !self.has_column("reviews", "name_en")? {
@@ -598,7 +639,7 @@ impl Database {
         // 15:play_count 16:is_favorite 17:status 18:added_at 19:updated_at
         // 20:hltb_main_story 21:hltb_main_extra 22:hltb_completionist 23:save_paths
         // 24:exe_modified_at 25:exe_file_size 26:platform 27:platform_id
-        // 28:launch_args
+        // 28:launch_args 29:name_en
         let genres_str: String = row.get(12)?;
         let genres: Vec<String> = serde_json::from_str(&genres_str).unwrap_or_default();
 
@@ -643,6 +684,11 @@ impl Database {
                 .get::<_, Option<String>>(28)?
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
+            // 空串按 None 归一：与手账 name_en 同款口径 ——「未填」只有一个表示法
+            name_en: row
+                .get::<_, Option<String>>(29)?
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         })
     }
 
@@ -653,7 +699,7 @@ impl Database {
         is_favorite, status, added_at, updated_at,
         hltb_main_story, hltb_main_extra, hltb_completionist,
         save_paths, exe_modified_at, exe_file_size,
-        platform, platform_id, launch_args
+        platform, platform_id, launch_args, name_en
     ";
 
     // ==================== 游戏 CRUD ====================
@@ -668,9 +714,9 @@ impl Database {
                 is_favorite, status, added_at, updated_at,
                 hltb_main_story, hltb_main_extra, hltb_completionist,
                 save_paths, exe_modified_at, exe_file_size,
-                platform, platform_id, launch_args
+                platform, platform_id, launch_args, name_en
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -702,7 +748,8 @@ impl Database {
                 -- 与 cover/description 同一口径：excluded 为 NULL 时保留库里已有的参数。
                 -- 平台扫描重导入入口流（exe_path 覆盖式）不会抹掉手填的启动参数；
                 -- 用户主动清空走 update_game，不受此影响。
-                launch_args = COALESCE(excluded.launch_args, games.launch_args)
+                launch_args = COALESCE(excluded.launch_args, games.launch_args),
+                name_en = COALESCE(excluded.name_en, games.name_en)
             ",
             params![
                 game.id,
@@ -734,6 +781,7 @@ impl Database {
                 game.platform,
                 game.platform_id,
                 game.launch_args,
+                game.name_en,
             ],
         )?;
         Ok(())
@@ -1200,8 +1248,9 @@ impl Database {
                 genres = ?12, is_favorite = ?13, status = ?14, updated_at = ?15,
                 hltb_main_story = ?16, hltb_main_extra = ?17, hltb_completionist = ?18,
                 save_paths = ?19, exe_modified_at = ?20, exe_file_size = ?21,
-                platform = ?22, platform_id = ?23, launch_args = ?24
-             WHERE id = ?25",
+                platform = ?22, platform_id = ?23, launch_args = ?24,
+                name_en = ?25
+             WHERE id = ?26",
             params![
                 game.name,
                 game.install_path,
@@ -1227,6 +1276,7 @@ impl Database {
                 game.platform,
                 game.platform_id,
                 game.launch_args,
+                game.name_en,
                 game.id,
             ],
         )?;
@@ -2223,9 +2273,13 @@ impl Database {
              WHERE strftime('%w', day) IN ('0','6') GROUP BY day)",
             [], |r| r.get::<_, i64>(0),
         )? as u64;
+        // 归并键取「该日期所属 ISO 周的周四」——同一 ISO 周七天必得同一个键，跨年不错位
         s.max_distinct_games_per_week = self.conn.query_row(
-            "SELECT COALESCE(MAX(cnt),0) FROM (SELECT COUNT(DISTINCT game_id) cnt FROM play_stats_daily \
-             GROUP BY strftime('%Y-%W', day))",
+            &format!(
+                "SELECT COALESCE(MAX(cnt),0) FROM (SELECT COUNT(DISTINCT game_id) cnt FROM play_stats_daily \
+                 GROUP BY {})",
+                ISO_WEEK_KEY_SQL
+            ),
             [], |r| r.get::<_, i64>(0),
         )? as u64;
         s.day_night_same_day = self.conn.query_row(
@@ -2235,8 +2289,11 @@ impl Database {
             [], |r| r.get::<_, i64>(0),
         )? != 0;
         s.has_full_week = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM (SELECT strftime('%Y-%W', day) wk, COUNT(DISTINCT day) dcnt \
-             FROM play_stats_daily GROUP BY wk) WHERE dcnt >= 7)",
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM (SELECT {} wk, COUNT(DISTINCT day) dcnt \
+                 FROM play_stats_daily GROUP BY wk) WHERE dcnt >= 7)",
+                ISO_WEEK_KEY_SQL
+            ),
             [], |r| r.get::<_, i64>(0),
         )? != 0;
 
@@ -3949,5 +4006,93 @@ mod tests {
         );
         // 回滚不应影响事务之前已提交的值
         assert_eq!(db.get_setting("probe").unwrap().as_deref(), Some("outer"));
+    }
+
+    /// ISO 周归并键必须把**跨年那一周**当成一个完整的周（2026-10-06 修）。
+    ///
+    /// 2025-12-29(周一) ~ 2026-01-04(周日) 属同一 ISO 周。旧的 `strftime('%Y-%W')` 会把它
+    /// 拆成 `2025-52` + `2026-00` 两个桶 → G-33 不同游戏数被低估、G-37「一周七天都玩过」
+    /// 在那周永远不成立。这条测试直接钉住"七天必须落进同一个桶"。
+    #[test]
+    fn iso_week_key_merges_year_crossing_week() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+        // 跨年周：g1 在上一年那几天，g2 在次年那几天 —— 同一周的"不同游戏数"应记为 2
+        for (d, g) in [
+            ("2025-12-29", "g1"),
+            ("2025-12-30", "g1"),
+            ("2025-12-31", "g1"),
+            ("2026-01-01", "g2"),
+            ("2026-01-02", "g2"),
+            ("2026-01-03", "g2"),
+            ("2026-01-04", "g2"),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO play_stats_daily (day, game_id, total_seconds, session_count) \
+                     VALUES (?1, ?2, 60, 1)",
+                    params![d, g],
+                )
+                .unwrap();
+        }
+
+        let s = db.get_achievement_global_stats().unwrap();
+        assert!(
+            s.has_full_week,
+            "跨年的一周必须能被算作完整一周（7 个不同日期）"
+        );
+        assert_eq!(
+            s.max_distinct_games_per_week, 2,
+            "跨年周的周内不同游戏数必须合并统计"
+        );
+
+        // 反向证明（防止本测试变成空转）：旧口径 `strftime('%Y-%W')` 确实会把这一周
+        // 拆成两个桶 —— 这正是被修的 bug。若哪天有人把实现改回去，上面两条断言会挂。
+        let old_bucket_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT strftime('%Y-%W', day)) FROM play_stats_daily",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            old_bucket_count, 2,
+            "旧口径把跨年周拆成 2 个桶（本测试的鉴别力来源）"
+        );
+        let new_bucket_count: i64 = db
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(DISTINCT {}) FROM play_stats_daily",
+                    ISO_WEEK_KEY_SQL
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_bucket_count, 1, "新口径必须把跨年周归成 1 个桶");
+
+        // 反例：同一 ISO 周只有 6 天时不得算完整
+        let db2 = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+        for d in [
+            "2026-03-02",
+            "2026-03-03",
+            "2026-03-04",
+            "2026-03-05",
+            "2026-03-06",
+            "2026-03-07",
+        ] {
+            db2.conn
+                .execute(
+                    "INSERT INTO play_stats_daily (day, game_id, total_seconds, session_count) \
+                     VALUES (?1, 'g1', 60, 1)",
+                    params![d],
+                )
+                .unwrap();
+        }
+        assert!(
+            !db2.get_achievement_global_stats().unwrap().has_full_week,
+            "只有 6 天不得算完整一周"
+        );
     }
 }

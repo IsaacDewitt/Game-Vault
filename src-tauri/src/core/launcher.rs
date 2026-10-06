@@ -50,6 +50,21 @@ impl GameLauncher {
 
         let mut cmd = std::process::Command::new(exe_path);
 
+        // 铁律 14（2026-10-03 血案）：本应用是 GUI 子系统、无控制台。spawn 控制台子系统的
+        // 程序（模拟器外壳 / 老游戏 / bat 转 exe 的启动器 / 带控制台的 Unity debug build）时
+        // 必须带 `CREATE_NO_WINDOW`，否则：
+        //   ① 黑窗**在整个游戏会话期间常驻**（不是一闪而过）；
+        //   ② spawn 会同步等 conhost 初始化（实测 ~13ms → ~280ms，见 platform.rs 注释），
+        //      叠加命令在主线程时会卡住 IPC 队列。
+        // 对 GUI 子系统的 exe 该标志是严格 no-op，绝大多数游戏零影响 —— 与 platform.rs:214、
+        // tracker.rs:1035 同款，补上这条唯一漏网的、也是最重要的一条启动路径。
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
         if let Some(ref install_path) = game.install_path {
             cmd.current_dir(install_path);
         }

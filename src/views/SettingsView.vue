@@ -225,6 +225,13 @@ function applyPresetSize(preset: { width: number; height: number }) {
 }
 
 async function saveSettings() {
+  // 主题色校验（2026-10-06）：自动保存 watch（见本文件上方）会拦掉非法值，但「保存设置」
+  // 是整存路径，若不拦，输入框里敲了一半的 "#63" / "#fff" 会直落库 → 下次启动
+  // lightenColor/darkenColor 按 parseInt 算出错误颜色（App.vue 已同步加启动兜底）。
+  if (!isValidHexColor(settings.value.accent_color)) {
+    message.error("主题色格式不正确，应为 #RRGGBB（如 #3b82f6）");
+    return;
+  }
   saving.value = true;
   try {
     await api.saveSettings(settings.value);
@@ -622,6 +629,90 @@ async function handleExportSaves() {
   }
 }
 
+/**
+ * 「备份内冲突」选择窗口（2026-10-06）。
+ *
+ * 触发条件：备份里有多条记录要写到**同一个位置**且内容不同。旧实现按 ZIP 顺序
+ * "谁在后面谁赢"地静默覆盖 —— 而两次覆盖共用同一个 `.bak`，第二次会把第一次留档的
+ * **原始本地存档**顶掉，原始文件永久消失。所以这里必须让用户显式裁决。
+ *
+ * 返回用户选择；取消 / 关闭返回 null（调用方直接放弃本次恢复）。
+ */
+function askConflictPolicy(
+  conflicts: api.SaveIntraConflict[]
+): Promise<api.SaveConflictPolicy | null> {
+  const MAX_SHOWN = 20;
+  const shown = conflicts.slice(0, MAX_SHOWN);
+  return new Promise((resolve) => {
+    // 用 destroy() 主动关闭自定义动作按钮，避免 dialog.destroyAll() 误伤别的弹窗
+    let inst: { destroy: () => void } | null = null;
+    const close = (v: api.SaveConflictPolicy | null) => {
+      inst?.destroy();
+      resolve(v);
+    };
+    inst = dialog.warning({
+      title: `备份内有 ${conflicts.length} 处文件冲突`,
+      style: "width: 640px;",
+      content: () =>
+        h(
+          "div",
+          { style: "max-height: 340px; overflow: auto; font-size: 13px;" },
+          [
+            h(
+              "p",
+              "备份里有多条记录要写到同一个位置，且内容不同。请选择保留哪一份（内容相同的会自动去重，无需选择）："
+            ),
+            h(
+              "pre",
+              {
+                style:
+                  "white-space: pre-wrap; word-break: break-all; margin: 6px 0;",
+              },
+              shown
+                .map(
+                  (c) =>
+                    `${c.dest}\n` +
+                    c.entries
+                      .map((e) => `    ${e.size} 字节    ${e.zip_name}`)
+                      .join("\n")
+                )
+                .join("\n\n") +
+                (conflicts.length > shown.length
+                  ? `\n…等共 ${conflicts.length} 处`
+                  : "")
+            ),
+            h(
+              "p",
+              "无论选哪一份，被覆盖的现有文件都会先改名为 .bak 留档。"
+            ),
+          ]
+        ),
+      action: () =>
+        h(NSpace, {}, {
+          default: () => [
+            h(
+              NButton,
+              { size: "small", onClick: () => close("first") },
+              { default: () => "保留靠前的" }
+            ),
+            h(
+              NButton,
+              { size: "small", type: "primary", onClick: () => close("last") },
+              { default: () => "保留靠后的" }
+            ),
+            h(
+              NButton,
+              { size: "small", onClick: () => close(null) },
+              { default: () => "取消恢复" }
+            ),
+          ],
+        }),
+      onClose: () => resolve(null),
+      onMaskClick: () => resolve(null),
+    }) as unknown as { destroy: () => void };
+  });
+}
+
 async function handleImportSaves() {
   importingSaves.value = true;
   try {
@@ -647,6 +738,18 @@ async function handleImportSaves() {
     // 会被覆盖"摊开给用户看。**只在真会覆盖现有存档时才拦一下** —— 没有冲突就保持
     // 原来"选完即恢复"的手感，不无谓增加点击。
     const preview = await api.previewSavesBackup(zipPath);
+
+    // ① 备份内冲突（2026-10-06）：同一落点被多条条目写入且内容不同 —— 必须先裁决，
+    //    否则恢复会静默互相覆盖，甚至把原始本地存档的 .bak 留档顶掉。
+    let conflictPolicy: api.SaveConflictPolicy | undefined;
+    if (preview.intra_conflicts.length > 0) {
+      const chosen = await askConflictPolicy(preview.intra_conflicts);
+      if (!chosen) {
+        importingSaves.value = false;
+        return;
+      }
+      conflictPolicy = chosen;
+    }
 
     if (preview.overwrite_count > 0) {
       const confirmed = await new Promise<boolean>((resolve) => {
@@ -690,7 +793,7 @@ async function handleImportSaves() {
       }
     }
 
-    const result = await api.importSavesBackup(zipPath);
+    const result = await api.importSavesBackup(zipPath, conflictPolicy);
 
     if (result.errors.length > 0) {
       message.warning(

@@ -765,6 +765,10 @@ fn resolve_screenshot_dir(
             ));
         }
 
+        // 【锁外枚举】（2026-10-05）`resolve_capture_target` 要 read_dir 截图根目录
+        // （Steam/NVIDIA 目录动辄上千子目录，慢盘上游可达数百毫秒）。DB 数据至此已全部取完，
+        // 先释放全局库锁再做目录 IO —— 否则每秒一次的时长轮询、成就结算、统计查询全要排队。
+        drop(db_guard);
         let target = screenshot::resolve_capture_target(
             &root(),
             &candidates,
@@ -793,6 +797,8 @@ fn resolve_screenshot_dir(
     // 详情页却盯着空的 `GoW` 说暂无截图"（实机案例，2026-09-14）。
     // 现在两侧共用 `capture_target_inputs` + `resolve_capture_target`，写哪里、看哪里永远一致。
     let (candidates, journal_dir) = capture_target_inputs(&db_guard, &game);
+    // 同上：目录枚举放到锁外（DB 数据已取齐，这里只差 IO）
+    drop(db_guard);
     if !candidates.is_empty() {
         let target = screenshot::resolve_capture_target(
             &root(),
@@ -818,7 +824,10 @@ fn resolve_screenshot_dir(
 /// - 都不传：打开截图根目录（设置页入口）。
 ///
 /// 目录不存在时创建，保证「打开」总能成功。
-#[tauri::command]
+///
+/// `(async)`（2026-10-05）：解析要枚举截图根目录（Steam/NVIDIA 目录动辄上千子目录），
+/// 留在主线程会在锁被占时卡住整个 IPC 队列。
+#[tauri::command(async)]
 pub fn open_screenshot_dir(
     db: State<'_, Arc<Mutex<Database>>>,
     app_handle: tauri::AppHandle,
@@ -842,7 +851,10 @@ pub fn open_screenshot_dir(
 
 /// 查询截图目录信息（路径 / 是否存在 / 已有截图数量 / 定位来源），不创建目录。
 /// 传 `game_id` 查该游戏目录，传 `review_id` 查手账条目目录，都不传查截图根目录。
-#[tauri::command]
+///
+/// `(async)`（2026-10-05）：**打开游戏详情抽屉即调用**，而 `count_images` 要枚举整个
+/// 截图目录（老爷的截图库 3,598+ 张）。留在主线程时开抽屉会有可感知停顿。
+#[tauri::command(async)]
 pub fn get_screenshot_dir(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: Option<String>,
@@ -867,7 +879,7 @@ pub struct ScreenshotDirOption {
 }
 
 /// 列出可选的截图目录（截图根目录下的子目录，仅含有图目录，按名称排序）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_screenshot_dirs(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<Vec<ScreenshotDirOption>, String> {

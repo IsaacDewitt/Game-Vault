@@ -5,7 +5,11 @@ use crate::models::*;
 use super::lock_or_recover;
 
 /// 获取成就汇总（全局 + 每游戏成就状态）
-#[tauri::command]
+///
+/// **`(async)`（2026-10-05 补）**：与同文件的 `check_achievements` 干的是同一件事
+/// （持 DB 锁走 `AchievementEngine::get_summary`），成就页首屏必调；留在主线程会
+/// 在锁被后台线程占用时卡住整个 IPC 队列。
+#[tauri::command(async)]
 pub fn get_achievements(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<AchievementSummary, String> {

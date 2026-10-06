@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, h } from "vue";
+import { ref, computed, onMounted, nextTick, h } from "vue";
 import {
   NInput,
   NButton,
@@ -157,6 +157,68 @@ const editingNameEn = ref("");
 const ratingInput = ref<number | null>(null);
 const reviewText = ref("");
 const savingReview = ref(false);
+
+// ==================== 元数据卡片内「点击改名」（中文名 / 英文名） ====================
+// 就地编辑：点一下值 → 变输入框 → 失焦/回车提交，Esc 取消。
+// 与上方「名称&英文名」两个大输入框是同一份数据的两个入口，各自独立保存、互不干扰。
+type InlineNameField = "name" | "name_en";
+const editingField = ref<InlineNameField | null>(null);
+const inlineName = ref("");
+const inlineNameEn = ref("");
+const nameEditRef = ref<InstanceType<typeof NInput> | null>(null);
+const nameEnEditRef = ref<InstanceType<typeof NInput> | null>(null);
+
+/** 进入某字段的就地编辑态（预填当前值），并把焦点交给输入框 */
+function startNameEdit(field: InlineNameField) {
+  if (!selected.value) return;
+  editingField.value = field;
+  inlineName.value = selected.value.name ?? "";
+  inlineNameEn.value = selected.value.name_en ?? "";
+  nextTick(() => {
+    const ref = field === "name" ? nameEditRef.value : nameEnEditRef.value;
+    ref?.focus();
+  });
+}
+
+/** 放弃就地编辑，不改动任何数据 */
+function cancelNameEdit() {
+  editingField.value = null;
+}
+
+/**
+ * 提交就地编辑。
+ *
+ * 口径与上方大输入框保持一致：
+ * - 中文名：空值或未变 → 不动；否则改名（后端对纯 ASCII 原名会自动补 name_en）。
+ * - 英文名：空串 → 清除（哨兵语义）；未变 → 不动。
+ */
+async function commitNameEdit() {
+  const field = editingField.value;
+  if (!field || !selected.value) return;
+  const id = selected.value.id;
+  editingField.value = null;
+  try {
+    if (field === "name") {
+      const name = inlineName.value.trim();
+      if (!name || name === selected.value.name) return;
+      const updated = await store.updateMeta(id, { name });
+      // 后端可能自动补了 name_en（纯英文原名），同步回大输入框，
+      // 否则下次 blur 英文名框时会拿旧值覆盖回去
+      editingName.value = updated.name;
+      editingNameEn.value = updated.name_en ?? "";
+      message.success("中文名已更新");
+    } else {
+      const trimmed = inlineNameEn.value.trim();
+      const current = selected.value.name_en ?? "";
+      if (trimmed === current) return;
+      await store.updateMeta(id, { name_en: trimmed });
+      editingNameEn.value = trimmed;
+      message.success(trimmed ? "英文名已更新，点「刷新信息」可重新拉取封面" : "英文名已清除");
+    }
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e));
+  }
+}
 
 const selected = computed(() => store.selectedReview);
 
@@ -749,7 +811,65 @@ onMounted(async () => {
           </n-button-group>
 
           <!-- 元数据 -->
-          <n-grid v-if="selected.description || selected.developer || selected.genres.length" class="detail-meta" :cols="2" :x-gap="16" :y-gap="10">
+          <n-grid
+            v-if="selected.description || selected.developer || selected.genres.length || selected.publisher || selected.name_en || selected.name"
+            class="detail-meta"
+            :cols="2"
+            :x-gap="16"
+            :y-gap="10"
+          >
+            <!-- 中文名 / 英文名：点击即可就地编辑（放在发行商等字段之前） -->
+            <n-gi>
+              <div class="meta-label">中文名</div>
+              <div
+                class="meta-value meta-editable"
+                :title="'点击修改中文名'"
+                @click="startNameEdit('name')"
+              >
+                <template v-if="editingField === 'name'">
+                  <n-input
+                    ref="nameEditRef"
+                    v-model:value="inlineName"
+                    size="small"
+                    placeholder="中文名（留空不改）"
+                    @blur="commitNameEdit"
+                    @keyup.enter="commitNameEdit"
+                    @keyup.esc="cancelNameEdit"
+                    @click.stop
+                  />
+                </template>
+                <template v-else>
+                  <span>{{ selected.name || "—" }}</span>
+                  <n-icon class="meta-edit-pen" :component="CreateOutline" :size="14" />
+                </template>
+              </div>
+            </n-gi>
+            <n-gi>
+              <div class="meta-label">英文名</div>
+              <div
+                class="meta-value meta-editable"
+                :title="'点击修改英文名'"
+                @click="startNameEdit('name_en')"
+              >
+                <template v-if="editingField === 'name_en'">
+                  <n-input
+                    ref="nameEnEditRef"
+                    v-model:value="inlineNameEn"
+                    size="small"
+                    placeholder="英文名（封面检索用，留空保存即清除）"
+                    @blur="commitNameEdit"
+                    @keyup.enter="commitNameEdit"
+                    @keyup.esc="cancelNameEdit"
+                    @click.stop
+                  />
+                </template>
+                <template v-else>
+                  <span>{{ selected.name_en || "—" }}</span>
+                  <n-icon class="meta-edit-pen" :component="CreateOutline" :size="14" />
+                </template>
+              </div>
+            </n-gi>
+
             <n-gi v-if="selected.developer">
               <div class="meta-label">开发商</div>
               <div class="meta-value">{{ selected.developer }}</div>
@@ -1222,6 +1342,56 @@ onMounted(async () => {
 
 .meta-value {
   font-size: 13px;
+}
+
+/* 可就地编辑的元数据值（中文名 / 英文名）：悬停浮现笔形图标，点击进入编辑态。
+ *
+ * 对齐口径（2026-10-05）：负外边距与内边距**严格相等**（各 4px），两者抵消后
+ * 文字的左缘与相邻普通 `.meta-value` 逐像素对齐；`min-height` 取「标签行 +
+ * 值行」的统一高度，避免本格比同排的普通格高出一截、把第二排顶下去。
+ * 切勿只改内边距不改外边距（或反之），那会让本列文字整体左右偏移。
+ */
+.meta-editable {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: -1px -4px;
+  min-height: 24px;
+  transition: background-color 0.15s ease;
+}
+
+.meta-editable:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* 笔形提示图标：平时隐藏，悬停才现身，避免干扰阅读 */
+.meta-edit-pen {
+  opacity: 0;
+  flex-shrink: 0;
+  transition: opacity 0.15s ease;
+}
+
+.meta-editable:hover .meta-edit-pen {
+  opacity: 0.5;
+}
+
+/* 编辑态：输入框撑满，不再显示悬停底色 */
+.meta-editable:has(.n-input) {
+  cursor: default;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+}
+
+.meta-editable :deep(.n-input) {
+  width: 100%;
+}
+
+:global(.light-theme) .meta-editable:hover {
+  background: rgba(0, 0, 0, 0.06);
 }
 
 .genre-tags {

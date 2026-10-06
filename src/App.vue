@@ -57,7 +57,14 @@ const themeOverrides = computed(() => ({
 async function loadThemeSettings() {
   try {
     const settings = await api.getSettings();
-    accentColor.value = settings.accent_color || DEFAULT_ACCENT_COLOR;
+    // 主题色校验（2026-10-06）：DB 里的脏值（比如输入框里敲了一半的 "#63"）如果直通，
+    // lightenColor/darkenColor 会按 parseInt 算出完全错误的颜色 → Naive UI 主题坏掉；
+    // 更麻烦的是输入框本身会拒绝纠正非法值，用户被自己写坏的颜色卡住。
+    // 运行时 updateAccentColor 与设置页 watch 都有这道校验，唯独启动加载这条路径漏了。
+    accentColor.value =
+      settings.accent_color && isValidHexColor(settings.accent_color)
+        ? settings.accent_color
+        : DEFAULT_ACCENT_COLOR;
     isDark.value = settings.theme !== "light";
   } catch (e) {
     console.error("加载主题设置失败:", e);
@@ -167,12 +174,32 @@ let unlistenClose: (() => void) | null = null;
 // 可修，只能检测 + 重放 resize 自愈，并把证据落日志（log_frontend_diag）。
 let vpToken = 0; // 防抖令牌：resize 风暴中只保留最新一次检测
 let vpRepairCount = 0; // 同一段 resize 内的自愈次数（上限 2，防循环折腾）
+let vpRepairing = false; // 自愈动作进行中：它自己引发的 resize 不再复查，避免自我激发的抖动循环
+
+/// 期望尺寸的合理下限（2026-10-06）。
+/// 真故障不会小于窗口最小尺寸约束（tauri.conf.json 是 900x600）；而**窗口最小化**时
+/// Windows 报出的是图标尺寸（实测日志里 15 次「期望=144x19」全是这一类）。
+const VP_MIN_EXPECT_W = 400;
+const VP_MIN_EXPECT_H = 300;
 
 async function viewportGuardCheck(expectW: number, expectH: number) {
   const token = ++vpToken;
   // 给正常链路留出完成时间（拖动边缘的连续 resize 期间，令牌失效的旧检查直接让位）
   await new Promise((r) => setTimeout(r, 160));
   if (token !== vpToken) return;
+  if (vpRepairing) return; // 自愈动作自身引发的 resize，跳过复查
+
+  // 【合理性闸门】最小化时页面仍保持最小化前的布局，而期望值变成了图标尺寸 →
+  // 旧实现会把它误判成"视口未跟随"并去 setSize 自愈 —— 自愈本身成了误报源，
+  // 还可能把窗口压成畸形尺寸。小于下限的值一律只记录、不改窗口。
+  if (expectW < VP_MIN_EXPECT_W || expectH < VP_MIN_EXPECT_H) {
+    const win = getCurrentWindow();
+    if (await win.isMinimized()) return; // 最小化是正常状态，不是视口故障
+    const detail = `期望尺寸 ${expectW}x${expectH} 不在合理区间，已跳过自愈`;
+    console.warn("[viewport-guard]", detail);
+    api.logDiag(detail).catch(() => {});
+    return;
+  }
 
   const dw = Math.abs(window.innerWidth - expectW);
   const dh = Math.abs(window.innerHeight - expectH);
@@ -188,17 +215,22 @@ async function viewportGuardCheck(expectW: number, expectH: number) {
   console.error("[viewport-guard]", detail);
   api.logDiag(detail).catch(() => {});
 
-  if (await win.isMaximized()) {
-    // 最大化态：重放一次「还原 → 最大化」，整条 resize 链路重走一遍
-    await win.unmaximize();
-    await new Promise((r) => setTimeout(r, 250));
-    await win.maximize();
-  } else {
-    // 普通态：物理尺寸抖动 1px，强制 wry 重新 SetBounds
-    const size = await win.outerSize();
-    await win.setSize(new PhysicalSize(size.width - 1, size.height - 1));
-    await new Promise((r) => setTimeout(r, 120));
-    await win.setSize(new PhysicalSize(size.width, size.height));
+  vpRepairing = true;
+  try {
+    if (await win.isMaximized()) {
+      // 最大化态：重放一次「还原 → 最大化」，整条 resize 链路重走一遍
+      await win.unmaximize();
+      await new Promise((r) => setTimeout(r, 250));
+      await win.maximize();
+    } else {
+      // 普通态：物理尺寸抖动 1px，强制 wry 重新 SetBounds
+      const size = await win.outerSize();
+      await win.setSize(new PhysicalSize(size.width - 1, size.height - 1));
+      await new Promise((r) => setTimeout(r, 120));
+      await win.setSize(new PhysicalSize(size.width, size.height));
+    }
+  } finally {
+    vpRepairing = false;
   }
   // 自愈动作本身会再触发 onResized → 由下一轮回调复查；同步标题栏图标状态
   isMaximized.value = await win.isMaximized();

@@ -14,7 +14,7 @@ use crate::utils::constants::COVER_MIN_FILE_SIZE;
 use super::lock_or_recover;
 
 /// 获取游戏列表
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_games(
     db: State<'_, Arc<Mutex<Database>>>,
     filter: Option<GameFilter>,
@@ -25,7 +25,7 @@ pub fn get_games(
 }
 
 /// 获取单个游戏详情
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_game_detail(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
@@ -35,7 +35,7 @@ pub fn get_game_detail(
 }
 
 /// 启动游戏
-#[tauri::command]
+#[tauri::command(async)]
 pub fn launch_game(
     db: State<'_, Arc<Mutex<Database>>>,
     tracker: State<'_, Arc<Mutex<PlayTimeTracker>>>,
@@ -116,7 +116,7 @@ pub fn launch_game(
 }
 
 /// 切换收藏状态
-#[tauri::command]
+#[tauri::command(async)]
 pub fn toggle_favorite(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
@@ -135,7 +135,7 @@ pub fn toggle_favorite(
 /// `keep_cover`：`Some(true)`（默认）保留封面——文件挪进 covers/archive 留档，重装认领后自动回归；
 /// `Some(false)` 连封面一起删。前端删除前会询问用户，二者都遵循
 /// 「删除游戏 = 仅移除库内条目」的大原则（历史时长/成就/封面都不随删除蒸发）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_game(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
@@ -276,7 +276,7 @@ pub(crate) fn insert_game_with_reclaim(db: &Database, mut game: Game) -> Result<
 }
 
 /// 手动添加游戏
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_game_manual(
     db: State<'_, Arc<Mutex<Database>>>,
     name: String,
@@ -378,7 +378,7 @@ pub fn refresh_exe_versions(
 
 /// 设置游戏封面（手动选择本地图片）
 /// 将用户选择的图片复制到 covers 目录，再将内部路径存入数据库
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_game_cover(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
@@ -414,7 +414,7 @@ pub fn set_game_cover(
 }
 
 /// 删除游戏封面（摘索引 + 引用计数归零才删文件）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_game_cover(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
@@ -641,7 +641,7 @@ pub async fn fetch_cover_options(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
 ) -> Result<Vec<CoverOption>, String> {
-    let (game_name, install_path, api_key) = {
+    let (game_name, name_en, install_path, api_key) = {
         let db_guard = lock_or_recover(&db);
         let game = db_guard.get_game_by_id(&game_id)
             .map_err(|e| e.to_string())?
@@ -649,7 +649,7 @@ pub async fn fetch_cover_options(
         let api_key = db_guard.get_setting("steamgriddb_api_key")
             .map_err(|e| e.to_string())?
             .unwrap_or_default();
-        (game.name, game.install_path, api_key)
+        (game.name, game.name_en, game.install_path, api_key)
     };
 
     if api_key.is_empty() {
@@ -659,7 +659,7 @@ pub async fn fetch_cover_options(
     let cache_dir = utils::path::get_app_data_dir().join("covers");
     let fetcher = CoverFetcher::new(cache_dir, api_key).map_err(|e| e.to_string())?;
 
-    fetcher.fetch_cover_options(&game_name, install_path.as_deref())
+    fetcher.fetch_cover_options(&game_name, name_en.as_deref(), install_path.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
@@ -713,6 +713,36 @@ fn apply_llm_meta(updated: &mut Game, meta: &LlmGameMeta) {
             tracing::info!("LLM 纠正游戏名称: '{}' -> '{}'", updated.name, trimmed);
             updated.name = trimmed;
         }
+    }
+    // 官方英文名（SteamGridDB 检索专用）：落库前 trim，空串按 None 归一。
+    // 不能只靠 LLM 每次都给——纯英文名的游戏本来就等于 name，据此兜底一次，
+    // 保证 name_en 在「名称为纯 ASCII」时也有值（与手账 normalize_review_name 同口径）。
+    //
+    // **语言闸门（2026-10-06，与手账 reviews.rs 同口径）**：`name_en` 的契约是「官方英文名」，
+    // 含非 ASCII 字符（中文/日文等）一律拒收。LLM 常偷懒把中文名原样复制进 name_en
+    // （如 name 与 name_en 都填「空洞骑士」），一旦落库：
+    //   ① `cover_fetcher::pick_search_term` 会拿这个中文脏值去 SteamGridDB 检索 → 必然 0 命中，
+    //      封面链路退化到"不如不填"；
+    //   ② 卡片「英文名优先展示」会显示成中文，正是 2026-10-05 那条修复想消灭的错配。
+    // 注意空串分支**保持原样不动**（不清除）——游戏侧没有手账那种"空串=显式清除"的语义，
+    // 凭空清掉用户手填的英文名属于功能倒退。
+    if let Some(en) = &meta.name_en {
+        let trimmed = en.trim().to_string();
+        if !trimmed.is_empty() {
+            if !trimmed.is_ascii() {
+                tracing::warn!(
+                    "LLM 返回的 name_en 含非 ASCII 字符，已丢弃: '{}'（保留原值 {:?}）",
+                    trimmed,
+                    updated.name_en
+                );
+            } else if trimmed != updated.name_en.as_deref().unwrap_or("") {
+                tracing::info!("更新游戏英文名: '{:?}' -> '{}'", updated.name_en, trimmed);
+                updated.name_en = Some(trimmed);
+            }
+        }
+    }
+    if updated.name_en.is_none() && updated.name.is_ascii() {
+        updated.name_en = Some(updated.name.clone());
     }
     if let Some(desc) = &meta.description {
         if !desc.is_empty() {
@@ -827,7 +857,7 @@ pub async fn fetch_game_info_llm(
 /// 未提交的字段（`None`，键缺失或值为 null 都会归到这）保持现值不变。
 // 参数对应前端 Tauri 命令调用契约，抽结构体重构会改变序列化签名、破坏前端调用，故此处放行。
 #[allow(clippy::too_many_arguments)]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_game_meta(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
@@ -841,6 +871,7 @@ pub fn update_game_meta(
     hltb_completionist: Option<u32>,
     save_paths: Option<Vec<String>>,
     launch_args: Option<String>,
+    name_en: Option<String>,
 ) -> Result<Game, String> {
     apply_game_meta_update(
         db.inner(),
@@ -855,6 +886,7 @@ pub fn update_game_meta(
         hltb_completionist,
         save_paths,
         launch_args,
+        name_en,
     )
 }
 
@@ -875,6 +907,7 @@ fn apply_game_meta_update(
     hltb_completionist: Option<u32>,
     save_paths: Option<Vec<String>>,
     launch_args: Option<String>,
+    name_en: Option<String>,
 ) -> Result<Game, String> {
     let db_guard = lock_or_recover(db);
     let mut game = db_guard.get_game_by_id(game_id)
@@ -927,32 +960,75 @@ fn apply_game_meta_update(
             Some(trimmed.to_string())
         };
     }
+    // 官方英文名：空串/纯空白 = 清空（前端清空输入框走这条，与 description 同口径）；
+    // 非空按 trim 后落库。未提交（None）保持现值。
+    if let Some(v) = name_en {
+        let trimmed = v.trim();
+        game.name_en = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
 
     db_guard.update_game(&game).map_err(|e| e.to_string())?;
     Ok(game)
 }
 
-/// 重命名游戏
-#[tauri::command]
+/// 重命名游戏。
+///
+/// 改名后要做一次**语言归位**（与手账 `normalize_review_name` 同口径），否则
+/// 「中文名」与「英文名」会变成两条互不相干的通道，典型错配：
+/// - 中文名改成中文（新名非 ASCII）→ 旧的英文名会跟着新中文名一起展示，语义错乱；
+///   此时清空 `name_en`，请用户重新点「刷新信息」拉官方英文名。
+/// - 中文名改成纯 ASCII（本身就是英文名）→ 自动补 `name_en`，
+///   免得卡片显示中文名、也没法用英文名去 SteamGridDB 检索封面。
+///
+/// 返回更新后的 `Game`：前端要据此把 `name` 与 `name_en` 一并写回 store，
+/// 只同步 `name` 会让卡片立刻显示成中文（2026-10-05 修复）。
+#[tauri::command(async)]
 pub fn rename_game(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
     new_name: String,
-) -> Result<(), String> {
+) -> Result<Game, String> {
+    rename_game_inner(&db, &game_id, new_name)
+}
+
+/// `rename_game` 的函数体（命令层只负责剥 State 壳）。
+/// 单独抽出是为了能直接用 `Arc<Mutex<Database>>` 做单元测试——语言归位语义
+/// 有 `rename_game_normalizes_name_en` 测试守着。
+fn rename_game_inner(
+    db: &Arc<Mutex<Database>>,
+    game_id: &str,
+    new_name: String,
+) -> Result<Game, String> {
     if new_name.trim().is_empty() {
         return Err("游戏名称不能为空".to_string());
     }
-    let db = lock_or_recover(&db);
-    let mut game = db.get_game_by_id(&game_id)
+    let db = lock_or_recover(db);
+    let mut game = db.get_game_by_id(game_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "游戏不存在".to_string())?;
-    game.name = new_name.trim().to_string();
+    let trimmed = new_name.trim().to_string();
+    game.name = trimmed.clone();
+    // 语言归位：纯 ASCII 名自动补英文名（已有非空英文名则不动，用户手填优先）；
+    // 中文名则清掉不再匹配的英文名（纯 ASCII ≠ 中文名，留着必然错配）。
+    if trimmed.is_ascii() {
+        if game.name_en.as_deref().is_none_or(|v| v.trim().is_empty()) {
+            tracing::info!("名称为纯英文，同步填入英文名: '{}'", trimmed);
+            game.name_en = Some(trimmed);
+        }
+    } else {
+        game.name_en = None;
+    }
     game.updated_at = Some(chrono::Utc::now().to_rfc3339());
-    db.update_game(&game).map_err(|e| e.to_string())
+    db.update_game(&game).map_err(|e| e.to_string())?;
+    Ok(game)
 }
 
 /// 更新游戏可执行文件路径（同时刷新 exe_name、install_path、exe_version）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_exe_path(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
@@ -992,7 +1068,7 @@ pub fn update_exe_path(
 }
 
 /// 设置游戏状态
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_game_status(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
@@ -1110,19 +1186,23 @@ fn derive_keys_path(file_path: &str) -> String {
 /// 导出游戏库数据为 JSON 文件。
 /// 主备份（file_path）脱敏 API Key；另存独立密钥文件（xxx.keys.json），
 /// 与主数据隔离，避免分享主备份时把密钥一并泄露出去。
-#[tauri::command]
+///
+/// **锁内只取快照（2026-10-05）**：序列化全库 + 两次原子写盘（`sync_all` 真刷盘）
+/// 都不该在全局库锁内做。用户把备份存到网盘 / 移动硬盘 / 慢 U 盘时单次可达数秒，
+/// 这数秒里所有其它命令（含每秒的后台时长落库）全部排队；命令本身亦已移出主线程。
+#[tauri::command(async)]
 pub fn export_game_data(
     db: State<'_, Arc<Mutex<Database>>>,
     file_path: String,
 ) -> Result<serde_json::Value, String> {
-    let db_guard = lock_or_recover(&db);
-
-    // 获取所有游戏数据
-    let filter = GameFilter::default();
-    let games = db_guard.get_games(&filter).map_err(|e| e.to_string())?;
-
-    // 获取设置
-    let settings = Settings::load_from_db(&db_guard).map_err(|e| e.to_string())?;
+    // 阶段 1：锁内只取快照（游戏列表 + 设置），随即释放
+    let (games, settings) = {
+        let db_guard = lock_or_recover(&db);
+        let games = db_guard.get_games(&GameFilter::default()).map_err(|e| e.to_string())?;
+        let settings = Settings::load_from_db(&db_guard).map_err(|e| e.to_string())?;
+        (games, settings)
+    };
+    // 阶段 2：无锁状态下序列化与落盘
 
     // 提前取出两个密钥（后续要写入独立文件）
     let sgdb_key = settings.steamgriddb_api_key.clone();
@@ -1184,7 +1264,7 @@ pub fn export_game_data(
 /// 现在分两阶段：
 ///   阶段 1 解析与校验（不碰数据库）—— 格式坏的条目在这里出局，不会污染库；
 ///   阶段 2 单事务落库 —— 要么全部生效，要么整体回滚，库保持原样。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn import_game_data(
     db: State<'_, Arc<Mutex<Database>>>,
     file_path: String,
@@ -1342,7 +1422,7 @@ pub async fn open_save_path(path: String, app_handle: tauri::AppHandle) -> Resul
 }
 
 /// 更新游戏存档路径列表
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_save_paths(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
@@ -1432,23 +1512,32 @@ pub fn check_save_paths(
 }
 
 /// 检查单个游戏的存档路径是否存在（编辑存档路径后局部刷新用，避免全量检查）
-#[tauri::command]
+///
+/// 与 `check_save_paths` 同构（2026-10-05 补齐）：**锁内只取 `save_paths` 快照 → 锁外做
+/// 文件探测 → 命令本身移出主线程**。原实现全程持锁做 `exists()`（`save_path_effectively_exists`
+/// 还会逐级向上探测），只要某条路径落在慢介质/离线位置，全应用所有命令都会被这把锁连带堵住。
+#[tauri::command(async)]
 pub fn check_save_paths_for_game(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: String,
 ) -> Result<bool, String> {
     use crate::utils::path::expand_env_vars;
 
-    let db_guard = lock_or_recover(&db);
-    let game = db_guard.get_game_by_id(&game_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "游戏不存在".to_string())?;
+    // 阶段 1：锁内只取快照（路径列表），随即释放
+    let save_paths: Vec<String> = {
+        let db_guard = lock_or_recover(&db);
+        let game = db_guard.get_game_by_id(&game_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "游戏不存在".to_string())?;
+        game.save_paths
+    };
 
-    if game.save_paths.is_empty() {
+    if save_paths.is_empty() {
         return Ok(false);
     }
 
-    let exists = game.save_paths.iter().any(|p| {
+    // 阶段 2：无锁状态下做文件 I/O
+    let exists = save_paths.iter().any(|p| {
         let expanded = expand_env_vars(p);
         save_path_effectively_exists(&expanded)
     });
@@ -1697,6 +1786,152 @@ fn normalize_logically(path: &std::path::Path) -> std::path::PathBuf {
     out
 }
 
+// ==================== 恢复落点冲突裁决（2026-10-06） ====================
+//
+// 背景：恢复循环是「逐条目：留档 .bak → 写入」。若**多条 ZIP 条目映射到同一落点**
+// （save_paths 重复填写、或两条不同目标根在磁盘上重叠），旧实现会"谁在后面谁赢"地静默覆盖：
+// 第二次留档把第一次的 .bak（即**原始本地存档**）顶掉，原始文件永久丢失，
+// 而 restored 计数用的是 prefix 集合，照样报「恢复成功」—— 最危险的一种失败形态。
+//
+// 现在：预览把冲突摊给用户看，导入按用户裁决**只保留一条**（同一落点只写一次，
+// 留档自然也就只做一次）。内容完全相同的重复条目自动去重，不打扰用户。
+
+/// ZIP 档案类型别名（恢复相关函数都吃这个）
+type SaveZipArchive = zip::ZipArchive<std::io::BufReader<std::fs::File>>;
+
+/// 冲突条目的一条记录（大小与 CRC32 都直接来自 ZIP 中央目录，读取**无需解压**）
+#[derive(serde::Serialize)]
+pub struct SaveConflictEntry {
+    pub zip_name: String,
+    pub size: u64,
+    pub crc32: u32,
+}
+
+/// 同落点冲突：多条 ZIP 条目映射到同一最终路径，且其中至少两条内容不同
+#[derive(serde::Serialize)]
+pub struct SaveIntraConflict {
+    /// 冲突的落点（规范化 + 小写后的绝对路径，匹配 Windows 大小写不敏感语义）
+    pub dest: String,
+    /// 参与冲突的 ZIP 条目（按 ZIP 内顺序）
+    pub entries: Vec<SaveConflictEntry>,
+}
+
+/// 落点归并键：纯逻辑规范化 + 小写（Windows 下 `C:\Saves\x.dat` 与 `c:\saves\X.DAT` 是同一文件）
+fn dest_group_key(dest: &std::path::Path) -> String {
+    normalize_logically(dest).to_string_lossy().to_lowercase()
+}
+
+/// 按落点把（非目录）条目分组，值为 `plan.entries` 里的下标
+fn group_entries_by_dest(
+    entries: &[ExtractEntry],
+) -> std::collections::BTreeMap<String, Vec<usize>> {
+    let mut groups: std::collections::BTreeMap<String, Vec<usize>> = std::collections::BTreeMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        if e.is_dir {
+            continue;
+        }
+        groups.entry(dest_group_key(&e.dest)).or_default().push(i);
+    }
+    groups
+}
+
+/// 读取一组条目的大小与 CRC32
+fn read_entry_metas(
+    archive: &mut SaveZipArchive,
+    plan: &ExtractPlan,
+    idxs: &[usize],
+) -> Result<Vec<SaveConflictEntry>, String> {
+    let mut metas = Vec::with_capacity(idxs.len());
+    for &i in idxs {
+        let e = &plan.entries[i];
+        let f = archive
+            .by_name(&e.zip_name)
+            .map_err(|err| format!("读取 ZIP 条目失败 {}: {}", e.zip_name, err))?;
+        metas.push(SaveConflictEntry {
+            zip_name: e.zip_name.clone(),
+            size: f.size(),
+            crc32: f.crc32(),
+        });
+    }
+    Ok(metas)
+}
+
+/// 一组条目是否内容全同（大小 + CRC32 双判据，zip 去重的标准做法；CRC 相同视为同一份）
+fn all_same_content(metas: &[SaveConflictEntry]) -> bool {
+    metas
+        .iter()
+        .all(|m| m.size == metas[0].size && m.crc32 == metas[0].crc32)
+}
+
+/// 找出**内容真冲突**的落点（同落点的多条条目里存在内容不同的组合）
+fn detect_intra_conflicts(
+    archive: &mut SaveZipArchive,
+    plan: &ExtractPlan,
+) -> Result<Vec<SaveIntraConflict>, String> {
+    let mut out = Vec::new();
+    for (dest, idxs) in group_entries_by_dest(&plan.entries) {
+        if idxs.len() < 2 {
+            continue;
+        }
+        let metas = read_entry_metas(archive, plan, &idxs)?;
+        if !all_same_content(&metas) {
+            out.push(SaveIntraConflict { dest, entries: metas });
+        }
+    }
+    Ok(out)
+}
+
+/// 按裁决策略算出实际要写出的条目下标（同落点只保留一条，顺序还原为计划顺序）。
+///
+/// 策略取值：`"first"` 保留靠前一条 / `"last"` 保留靠后一条（等价旧行为）/
+/// 其余（含 `"abort"` 与未知值）→ 拒绝恢复并回报冲突清单。
+/// **内容相同的重复条目在任何策略下都自动去重**，不会因此中止。
+fn select_entries(
+    archive: &mut SaveZipArchive,
+    plan: &ExtractPlan,
+    policy: &str,
+) -> Result<Vec<usize>, String> {
+    // 目录条目照旧全部保留：它们只做 create_dir_all，重复执行无副作用
+    let mut keep: Vec<usize> = plan
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.is_dir)
+        .map(|(i, _)| i)
+        .collect();
+    let mut conflicts: Vec<SaveIntraConflict> = Vec::new();
+
+    for (dest, idxs) in group_entries_by_dest(&plan.entries) {
+        if idxs.len() == 1 {
+            keep.push(idxs[0]);
+            continue;
+        }
+        let metas = read_entry_metas(archive, plan, &idxs)?;
+        if all_same_content(&metas) {
+            keep.push(idxs[0]);
+            continue;
+        }
+        match policy {
+            "first" => keep.push(idxs[0]),
+            "last" => keep.push(idxs[idxs.len() - 1]),
+            _ => conflicts.push(SaveIntraConflict { dest, entries: metas }),
+        }
+    }
+
+    if !conflicts.is_empty() {
+        let brief: Vec<String> = conflicts.iter().take(5).map(|c| c.dest.clone()).collect();
+        return Err(format!(
+            "备份内有 {} 处「多个文件写到同一位置且内容不同」，已中止恢复（请在预览中裁决后重试）: {}{}",
+            conflicts.len(),
+            brief.join("；"),
+            if conflicts.len() > brief.len() { " …" } else { "" }
+        ));
+    }
+
+    keep.sort_unstable();
+    Ok(keep)
+}
+
 /// 解析 ZIP 备份的 manifest，产出完整落盘计划。
 ///
 /// **纯解析：不建目录、不写文件**，因此可安全用于"恢复前预览"。
@@ -1836,14 +2071,19 @@ pub struct SavesRestorePreview {
     pub overwrite_count: u64,
     /// 将被覆盖的文件清单（最多列前 50 条，避免返回体过大）
     pub overwrite_files: Vec<String>,
+    /// **ZIP 内部冲突**：多条条目映射到同一落点且内容不同。非空时前端必须让用户
+    /// 裁决保留哪一份，否则恢复会静默互相覆盖（并可能顶掉原始文件的 .bak 留档）。
+    pub intra_conflicts: Vec<SaveIntraConflict>,
     /// 解析过程中的问题（非致命）
     pub warnings: Vec<String>,
 }
 
 /// 预览存档备份的恢复落点（**不写入任何东西**）。
 ///
-/// 前端在真正执行恢复前先调它；若 `overwrite_count > 0` 就弹确认框，
-/// 让用户先看清"这次恢复会覆盖掉哪些现有存档"。
+/// 前端在真正执行恢复前先调它：
+/// - `overwrite_count > 0` → 弹确认框，让用户看清"这次恢复会覆盖掉哪些现有存档"；
+/// - `intra_conflicts` 非空 → **必须**弹出选择窗口，让用户裁决每个落点保留备份内的哪一份
+///   （同落点被静默互相覆盖是真实丢数据路径，见 `select_entries` 的说明）。
 #[tauri::command]
 pub async fn preview_saves_backup(zip_path: String) -> Result<SavesRestorePreview, String> {
     tauri::async_runtime::spawn_blocking(move || preview_saves_backup_sync(&zip_path))
@@ -1860,6 +2100,7 @@ fn preview_saves_backup_sync(zip_path: &str) -> Result<SavesRestorePreview, Stri
         .map_err(|e| format!("读取 ZIP 文件失败: {}", e))?;
 
     let plan = build_extract_plan(&mut archive)?;
+    let intra_conflicts = detect_intra_conflicts(&mut archive, &plan)?;
 
     let dirs_to_create: Vec<String> = plan
         .target_dirs
@@ -1887,17 +2128,25 @@ fn preview_saves_backup_sync(zip_path: &str) -> Result<SavesRestorePreview, Stri
         total_files,
         overwrite_count,
         overwrite_files,
+        intra_conflicts,
         warnings: plan.errors,
     })
 }
 
-/// 从 ZIP 备份文件导入存档（不需要数据库锁，仅做文件 I/O）
+/// 从 ZIP 备份文件导入存档（不需要数据库锁，仅做文件 I/O）。
+///
+/// `conflict_policy`：ZIP 内多条条目映射到同一落点且内容不同时的裁决策略，
+/// 由前端在「备份内存在冲突条目」弹窗里选定：
+/// - `"first"` 保留靠前的一条；`"last"` 保留靠后的一条（等价旧行为）；
+/// - 缺省 / `"abort"` / 未知取值 → **拒绝恢复**（宁可停下让用户裁决，也不做静默覆盖）。
 #[tauri::command]
 pub async fn import_saves_backup(
     zip_path: String,
+    conflict_policy: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    let policy = conflict_policy.unwrap_or_else(|| "abort".to_string());
     // 解压同样是文件密集 I/O，放阻塞线程池执行
-    tauri::async_runtime::spawn_blocking(move || import_saves_backup_sync(&zip_path))
+    tauri::async_runtime::spawn_blocking(move || import_saves_backup_sync(&zip_path, &policy))
         .await
         .map_err(|e| format!("导入任务执行失败: {}", e))?
 }
@@ -1910,7 +2159,14 @@ pub async fn import_saves_backup(
 /// 覆盖行为（2026-09-23 改）：目标文件已存在时，先把原文件改成 `.bak` 留档再写新的；
 /// 新文件写入失败则把 `.bak` 挪回原位。旧实现是 `File::create` 直接截断覆盖 ——
 /// 选错备份就是当场丢掉当前存档，一点退路都没有。
-fn import_saves_backup_sync(zip_path: &str) -> Result<serde_json::Value, String> {
+///
+/// **同落点去重（2026-10-06）**：先按裁决只保留每个落点的一条条目。这同时修掉一个
+/// 真实的丢数据路径 —— 同一落点被写两次时，第二次留档会把第一次的 `.bak`
+/// （即原始本地存档）顶掉，原始文件永久消失，而计数照样报成功。
+fn import_saves_backup_sync(
+    zip_path: &str,
+    conflict_policy: &str,
+) -> Result<serde_json::Value, String> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| format!("打开 ZIP 文件失败: {}", e))?;
     let buf_reader = std::io::BufReader::new(file);
@@ -1918,7 +2174,9 @@ fn import_saves_backup_sync(zip_path: &str) -> Result<serde_json::Value, String>
         .map_err(|e| format!("读取 ZIP 文件失败: {}", e))?;
 
     let plan = build_extract_plan(&mut archive)?;
-    let mut errors = plan.errors;
+    // 先裁决再动手：拒绝恢复的路径必须在**任何文件被改动之前**返回
+    let keep = select_entries(&mut archive, &plan, conflict_policy)?;
+    let mut errors = plan.errors.clone();
 
     // 建出目标根目录（换机 / 存档丢失场景下这些目录本来并不存在）。
     // 注意 save_path 也可能指向**单个文件**：那种情况 create_dir_all 必然失败，跳过即可
@@ -1936,7 +2194,9 @@ fn import_saves_backup_sync(zip_path: &str) -> Result<serde_json::Value, String>
     // 成功恢复的存档路径（zip_prefix）集合，用于精确计数而非按 manifest 条目数虚报
     let mut restored_prefixes: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for entry in plan.entries {
+    // 只写裁决后保留的条目（`keep` 已是计划顺序，同落点唯一）
+    for i in keep {
+        let entry = &plan.entries[i];
         let mut zip_file = match archive.by_name(&entry.zip_name) {
             Ok(f) => f,
             Err(e) => {
@@ -1989,7 +2249,7 @@ fn import_saves_backup_sync(zip_path: &str) -> Result<serde_json::Value, String>
 
         match copy_result {
             Ok(_) => {
-                restored_prefixes.insert(entry.zip_prefix);
+                restored_prefixes.insert(entry.zip_prefix.clone());
             }
             Err(e) => {
                 errors.push(format!("写入文件失败 {}: {}", entry.dest.display(), e));
@@ -2168,6 +2428,51 @@ mod tests {
         g
     }
 
+    /// 改名必须做语言归位（2026-10-05 修复）：
+    /// 纯 ASCII 新名自动补 name_en；改成中文名则清掉形同虚设的旧英文名。
+    /// 这是「中文名/英文名两条通道互不相干」那个 bug 的回归防线。
+    #[test]
+    fn rename_game_normalizes_name_en() {
+        let db = test_db();
+        let id = {
+            let mut g = crate::models::Game::new("空洞骑士".to_string());
+            g.name_en = Some("Hollow Knight".to_string());
+            let id = g.id.clone();
+            db.lock().unwrap().upsert_game(&g).unwrap();
+            id
+        };
+
+        // 改成中文名 → 旧英文名与中文名不匹配，必须清空（避免错配展示）
+        let renamed = rename_game_inner(&db, &id, "空洞骑士：丝之歌".to_string())
+            .expect("改名不应失败");
+        assert_eq!(renamed.name, "空洞骑士：丝之歌");
+        assert_eq!(renamed.name_en, None, "改成中文名必须清空 name_en（防错配）");
+
+        // 改成纯 ASCII 名 → 自动补 name_en（卡片/封面检索都靠它）
+        let renamed = rename_game_inner(&db, &id, "Hollow Knight: Silksong".to_string())
+            .expect("改名不应失败");
+        assert_eq!(renamed.name, "Hollow Knight: Silksong");
+        assert_eq!(
+            renamed.name_en.as_deref(),
+            Some("Hollow Knight: Silksong"),
+            "纯 ASCII 名必须自动补 name_en"
+        );
+
+        // 已有非空英文名时，改中文名清空；改回英文名时不得覆盖用户手工填的英文名
+        db.lock().unwrap().upsert_game(&{
+            let mut g = renamed.clone();
+            g.name_en = Some("Official EN Name".to_string());
+            g
+        }).unwrap();
+        let kept = rename_game_inner(&db, &id, "Another ASCII Name".to_string())
+            .expect("改名不应失败");
+        assert_eq!(
+            kept.name_en.as_deref(),
+            Some("Official EN Name"),
+            "已有英文名不得被 ASCII 新名覆盖（用户手填优先）"
+        );
+    }
+
     /// 清空哨兵必须真正落成 None/空——这是 0.8.3「设值修了、清空仍静默失效」
     /// 那个 bug（R1，见 2026-09-22 审查报告）的回归防线。
     /// 哨兵语义：文本=空串 / genres=空数组 / hltb=0 / save_paths=空数组 / launch_args=空白。
@@ -2190,6 +2495,7 @@ mod tests {
             Some(0),                       // hltb_completionist 清空
             Some(vec![]),                 // save_paths 清空
             Some("   ".to_string()),       // launch_args 纯空白 → 清空
+            Some(String::new()),            // name_en 空串 → 清空
         )
         .expect("更新不应失败");
 
@@ -2205,6 +2511,7 @@ mod tests {
         assert_eq!(updated.hltb_completionist, None, "0 必须清空 hltb_completionist");
         assert!(updated.save_paths.is_empty(), "空数组必须清空 save_paths");
         assert_eq!(updated.launch_args, None, "纯空白必须清空 launch_args（trim 口径）");
+        assert_eq!(updated.name_en, None, "空串必须清空 name_en");
     }
 
     /// 设值与"未提交"（None = 字段缺失或 JSON null）保持现值
@@ -2231,6 +2538,7 @@ mod tests {
             Some(400),
             Some(vec!["D:/New/Path".to_string()]),
             Some("-fullscreen".to_string()),
+            Some("Total War: Three Kingdoms".to_string()), // name_en 设值
         )
         .expect("更新不应失败");
 
@@ -2248,6 +2556,11 @@ mod tests {
         assert_eq!(updated.hltb_completionist, Some(400));
         assert_eq!(updated.save_paths, vec!["D:/New/Path".to_string()]);
         assert_eq!(updated.launch_args, Some("-fullscreen".to_string()));
+        assert_eq!(
+            updated.name_en.as_deref(),
+            Some("Total War: Three Kingdoms"),
+            "name_en 设值应落库"
+        );
     }
 
     // ==================== 2026-09-23：存档备份加固的回归防线 ====================
@@ -2355,5 +2668,175 @@ mod tests {
         assert!(leftovers.is_empty(), "不应残留临时文件: {leftovers:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 游戏侧 `name_en` 语言闸门（2026-10-06 补，此前只有手账侧有）：
+    /// LLM 把中文名塞进 name_en 时必须拒收；合法英文名照常写入；空串维持"不动原值"的旧语义。
+    /// 与 hand账 reviews.rs::llm返回的中文英文名被拒收 是同一条契约的两侧防线。
+    #[test]
+    fn apply_llm_meta拒收中文英文名() {
+        // ① 已有英文名：中文脏值被拒收，原值安然无恙
+        let mut g = seeded_game();
+        g.name_en = Some("Hollow Knight".to_string());
+        apply_llm_meta(
+            &mut g,
+            &LlmGameMeta {
+                name_en: Some("空洞骑士".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(g.name_en.as_deref(), Some("Hollow Knight"));
+
+        // ② 原本没有英文名：中文脏值不得落库
+        let mut g2 = seeded_game();
+        g2.name = "空洞骑士".to_string();
+        apply_llm_meta(
+            &mut g2,
+            &LlmGameMeta {
+                name_en: Some("空洞骑士".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(g2.name_en, None, "中文 name_en 不得落库");
+
+        // ③ 合法英文名（含标点/冒号）正常写入
+        let mut g3 = seeded_game();
+        apply_llm_meta(
+            &mut g3,
+            &LlmGameMeta {
+                name_en: Some("Mafia: The Old Country".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(g3.name_en.as_deref(), Some("Mafia: The Old Country"));
+
+        // ④ 空串维持原语义：游戏侧没有手账那种"空串 = 显式清除"，不得清掉用户手填值
+        let mut g4 = seeded_game();
+        g4.name_en = Some("Keep Me".to_string());
+        apply_llm_meta(
+            &mut g4,
+            &LlmGameMeta {
+                name_en: Some("   ".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(g4.name_en.as_deref(), Some("Keep Me"));
+    }
+
+    // ==================== 2026-10-06：恢复落点冲突裁决的回归防线 ====================
+
+    /// 构造带**自定义内容**的临时 ZIP（同 `write_test_zip`，但每条内容可不同，
+    /// 冲突检测靠内容/CRC 判定，必须能造出"同一落点、两种内容"）。
+    fn write_test_zip_with(
+        entries: &[(&str, &[u8])],
+        manifest: &serde_json::Value,
+    ) -> std::path::PathBuf {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join(format!(
+            "gv-conflict-test-{}.zip",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let file = std::fs::File::create(&path).expect("建临时 ZIP 失败");
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::FileOptions::default();
+        zip.start_file("manifest.json", opts).unwrap();
+        zip.write_all(manifest.to_string().as_bytes()).unwrap();
+        for (name, content) in entries {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(content).unwrap();
+        }
+        zip.finish().unwrap();
+        path
+    }
+
+    /// 同一落点被两条**内容不同**的 ZIP 条目写入时：
+    /// ① 预览必须报出冲突；② abort 策略必须在动手之前返回、且**不改动任何文件**；
+    /// ③ last 保留靠后一条，且 `.bak` 里躺的必须是**原始本地存档**（留档只做一次）。
+    #[test]
+    fn 同落点内容冲突被拦下且不静默覆盖() {
+        let dir = std::env::temp_dir().join(format!("gv-cf-{}", uuid::Uuid::new_v4().simple()));
+        let target = dir.join("saves");
+        std::fs::create_dir_all(&target).unwrap();
+        let local = target.join("save.dat");
+        std::fs::write(&local, b"ORIGINAL-LOCAL").unwrap();
+
+        let manifest = serde_json::json!([
+            { "game_id": "g1", "original_path": target.display().to_string(), "zip_prefix": "a" },
+            { "game_id": "g2", "original_path": target.display().to_string(), "zip_prefix": "b" },
+        ]);
+        // 两个 prefix 都映射到同一个 target/save.dat，内容不同
+        let zip_path = write_test_zip_with(
+            &[("a/save.dat", b"FROM-A"), ("b/save.dat", b"FROM-B")],
+            &manifest,
+        );
+        let zp = zip_path.to_str().unwrap();
+
+        // ① 预览报冲突
+        let preview = preview_saves_backup_sync(zp).unwrap();
+        assert_eq!(preview.intra_conflicts.len(), 1, "同落点不同内容必须报冲突");
+        assert_eq!(preview.intra_conflicts[0].entries.len(), 2);
+
+        // ② abort：动手之前返回，原始文件原地不动，连 .bak 都不该出现
+        let err = import_saves_backup_sync(zp, "abort").unwrap_err();
+        assert!(err.contains("已中止恢复"), "错误信息需说清已中止: {err}");
+        assert_eq!(std::fs::read(&local).unwrap(), b"ORIGINAL-LOCAL");
+        assert!(
+            !target.join("save.dat.bak").exists(),
+            "被拦下的恢复不得产生任何留档"
+        );
+
+        // ③ last：保留靠后一条；.bak 是原始本地存档（只留档一次，没被第二次写入顶掉）
+        let r = import_saves_backup_sync(zp, "last").unwrap();
+        assert_eq!(r["restored"], 1);
+        assert_eq!(std::fs::read(&local).unwrap(), b"FROM-B");
+        assert_eq!(
+            std::fs::read(target.join("save.dat.bak")).unwrap(),
+            b"ORIGINAL-LOCAL",
+            "原始本地存档必须完整躺在 .bak 里"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip_path);
+    }
+
+    /// first 策略保留靠前一条；内容完全相同的重复条目在任何策略下都自动去重、不算冲突。
+    #[test]
+    fn 冲突策略first与同内容去重() {
+        let dir = std::env::temp_dir().join(format!("gv-cf2-{}", uuid::Uuid::new_v4().simple()));
+        let target = dir.join("saves");
+        std::fs::create_dir_all(&target).unwrap();
+        let local = target.join("save.dat");
+        std::fs::write(&local, b"ORIGINAL").unwrap();
+
+        let manifest = serde_json::json!([
+            { "game_id": "g1", "original_path": target.display().to_string(), "zip_prefix": "a" },
+            { "game_id": "g2", "original_path": target.display().to_string(), "zip_prefix": "b" },
+        ]);
+
+        // 不同内容 → first 保留靠前一条
+        let zip_diff = write_test_zip_with(
+            &[("a/save.dat", b"FROM-A"), ("b/save.dat", b"FROM-B")],
+            &manifest,
+        );
+        import_saves_backup_sync(zip_diff.to_str().unwrap(), "first").unwrap();
+        assert_eq!(std::fs::read(&local).unwrap(), b"FROM-A");
+
+        // 相同内容 → 不算冲突，abort 策略也照常恢复（自动去重）
+        std::fs::write(&local, b"ORIGINAL").unwrap();
+        let zip_same = write_test_zip_with(
+            &[("a/save.dat", b"SAME"), ("b/save.dat", b"SAME")],
+            &manifest,
+        );
+        let zp = zip_same.to_str().unwrap();
+        assert!(
+            preview_saves_backup_sync(zp).unwrap().intra_conflicts.is_empty(),
+            "内容相同的重复条目不该被报成冲突"
+        );
+        import_saves_backup_sync(zp, "abort").expect("内容相同应自动去重、不该被 abort 拦下");
+        assert_eq!(std::fs::read(&local).unwrap(), b"SAME");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip_diff);
+        let _ = std::fs::remove_file(&zip_same);
     }
 }

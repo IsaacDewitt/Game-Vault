@@ -4,9 +4,18 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import type { Review } from "../lib/tauri";
 import * as api from "../lib/tauri";
 
-/** 界面展示名：英文名优先（中英文名都搜，展示纯英文策略） */
+/**
+ * 界面展示名：英文名优先（中英文名都搜，展示纯英文策略）。
+ *
+ * 只在 `name_en` 为**纯 ASCII** 时优先 —— 历史脏数据里存在中文被误写进 `name_en`
+ * 的条目（LLM 早期未校验），若直接优先会把卡片名显示成中文。此时退回 `name`
+ * （中文名），至少语义正确（2026-10-05 修复）。
+ */
 export function displayName(r: { name: string; name_en?: string | null }): string {
-  return (r.name_en && r.name_en.trim()) || r.name;
+  const en = r.name_en?.trim();
+  // eslint-disable-next-line no-control-regex
+  if (en && /^[\x00-\x7F]+$/.test(en)) return en;
+  return r.name;
 }
 
 export const useReviewsStore = defineStore("reviews", () => {
@@ -151,7 +160,12 @@ export const useReviewsStore = defineStore("reviews", () => {
     return review;
   }
 
-  /** 从游戏库导入，随后自动刷新缺失信息 */
+  /**
+   * 从游戏库导入条目。
+   * 元数据与封面由后端在导入时**一并复用**（后端 import_review_from_game 内做封面共享），
+   * 因此这里**不**再自动刷新——不要照 addReview 的写法补一个 refreshReviewInfo，
+   * 那会多打一次无谓的 LLM / SteamGridDB 请求。
+   */
   async function importFromGame(gameId: string) {
     const review = await api.importReviewFromGame(gameId);
     reviews.value.unshift(review);

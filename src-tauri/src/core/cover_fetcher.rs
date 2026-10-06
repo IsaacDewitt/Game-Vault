@@ -15,6 +15,23 @@ pub struct CoverFetcher {
     download_client: Client,
 }
 
+/// 为 SteamGridDB 挑选检索词。
+///
+/// SteamGridDB 只收录**官方英文名**：中文名（「全面战争：三国」）必然 0 命中
+/// （2026-10-03 实测）。故名字含非 ASCII 字符时优先用 `name_en`；`name_en` 为空
+/// 则退回原名 —— 这正是「没启用 LLM 也能照常搜图」的兜底（搜得到与否取决于
+/// 原名本身，不会因为缺英文名而更差）。纯 ASCII 名直接用 `name`（`name_en`
+/// 通常与它相同，用哪个都一样，选 `name` 少一次比较）。
+fn pick_search_term<'a>(name: &'a str, name_en: Option<&'a str>) -> &'a str {
+    if name.is_ascii() {
+        return name;
+    }
+    match name_en {
+        Some(en) if !en.trim().is_empty() => en,
+        _ => name,
+    }
+}
+
 /// SteamGridDB 图源域名白名单（子域一并放行）
 const TRUSTED_COVER_HOSTS: &[&str] = &["steamgriddb.com"];
 
@@ -35,7 +52,7 @@ fn is_trusted_cover_host(url: &reqwest::Url) -> bool {
 /// 放在同目录（而非系统临时目录）是必须的：随后的 `rename` 要落在同一卷上，
 /// 跨卷 rename 会直接失败。名字里带进程内唯一随机串，是为了让并发写同一目标的
 /// 两次下载各有各的落地文件，不会互相覆盖或误删。
-fn unique_temp_path(actual_path: &Path) -> PathBuf {
+pub(crate) fn unique_temp_path(actual_path: &Path) -> PathBuf {
     let stem = actual_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -99,11 +116,12 @@ impl CoverFetcher {
             }
         }
 
-        // 3. 尝试 SteamGridDB（先用游戏名搜索，再用文件夹名搜索）
+        // 3. 尝试 SteamGridDB（优先官方英文名，其次游戏名，最后文件夹名）
         if !self.steamgriddb_api_key.is_empty() {
             let cache_path = self.get_cache_path(&game.id);
-            // 用游戏名搜索
-            match self.search_steamgriddb(&game.name).await {
+            // 首选检索词：中文等非 ASCII 名走 name_en（无英文名则退回原名）
+            let primary = pick_search_term(&game.name, game.name_en.as_deref());
+            match self.search_steamgriddb(primary).await {
                 Ok(Some(cover_url)) => {
                     if let Ok(actual_path) = self.download_image(&cover_url, &cache_path, true).await {
                         return Ok(Some(actual_path.to_string_lossy().to_string()));
@@ -113,7 +131,21 @@ impl CoverFetcher {
                 _ => {}
             }
 
-            // 用文件夹名作为备用搜索词
+            // 备用搜索词 1：游戏名本身（仅在首选不是它时才有意义）
+            if primary != game.name {
+                tracing::info!("尝试用游戏名搜索封面: {}", game.name);
+                match self.search_steamgriddb(&game.name).await {
+                    Ok(Some(cover_url)) => {
+                        if let Ok(actual_path) = self.download_image(&cover_url, &cache_path, true).await {
+                            return Ok(Some(actual_path.to_string_lossy().to_string()));
+                        }
+                    }
+                    Err(e) => return Err(e),
+                    _ => {}
+                }
+            }
+
+            // 备用搜索词 2：文件夹名（许多 repack 用官方英文名做目录名，仍值得一试）
             if let Some(ref install_path) = game.install_path {
                 let folder_name = std::path::Path::new(install_path)
                     .file_name()
@@ -303,19 +335,31 @@ impl CoverFetcher {
     }
 
     /// 获取游戏的所有可选封面（异步）
-    /// 先用游戏名搜索，如果没有结果再用文件夹名搜索
-    pub async fn fetch_cover_options(&self, game_name: &str, install_path: Option<&str>) -> Result<Vec<CoverOption>> {
-        // 用游戏名搜索
-        let mut grids = self.search_grids_for_game(game_name).await?;
+    /// 检索词顺序：官方英文名（非 ASCII 名时）→ 游戏名 → 文件夹名，先命中先返回
+    pub async fn fetch_cover_options(
+        &self,
+        game_name: &str,
+        name_en: Option<&str>,
+        install_path: Option<&str>,
+    ) -> Result<Vec<CoverOption>> {
+        // 首选：官方英文名 / 游戏名（见 pick_search_term）
+        let primary = pick_search_term(game_name, name_en);
+        let mut grids = self.search_grids_for_game(primary).await?;
 
-        // 如果没结果，用文件夹名搜索
+        // 备用 1：游戏名本身
+        if grids.is_empty() && primary != game_name {
+            tracing::info!("尝试用游戏名搜索封面选项: {}", game_name);
+            grids = self.search_grids_for_game(game_name).await?;
+        }
+
+        // 备用 2：文件夹名
         if grids.is_empty() {
             if let Some(path) = install_path {
                 let folder_name = std::path::Path::new(path)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string());
                 if let Some(ref folder) = folder_name {
-                    if *folder != game_name {
+                    if *folder != game_name && folder != primary {
                         tracing::info!("尝试用文件夹名搜索封面选项: {}", folder);
                         grids = self.search_grids_for_game(folder).await?;
                     }
@@ -541,5 +585,49 @@ impl CoverFetcher {
         }
 
         Ok(actual_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_search_term;
+
+    /// 中文名 + 有官方英文名 → 用英文名搜（SteamGridDB 只收录英文名，
+    /// 2026-10-03 实测「全面战争：三国」0 命中、「Total War: Three Kingdoms」命中）
+    #[test]
+    fn chinese_name_with_name_en_uses_english() {
+        assert_eq!(
+            pick_search_term("全面战争：三国", Some("Total War: Three Kingdoms")),
+            "Total War: Three Kingdoms"
+        );
+    }
+
+    /// 中文名 + 无英文名 → 退回中文名（不因缺英文名而比旧行为更差）
+    #[test]
+    fn chinese_name_without_name_en_falls_back_to_name() {
+        assert_eq!(pick_search_term("全面战争：三国", None), "全面战争：三国");
+        assert_eq!(pick_search_term("艾尔登法环", Some("   ")), "艾尔登法环");
+    }
+
+    /// 纯 ASCII 名直接用 name（此时 name_en 通常与它相同，无需比较）
+    #[test]
+    fn ascii_name_ignores_name_en() {
+        assert_eq!(
+            pick_search_term("Hollow Knight", Some("Hollow Knight")),
+            "Hollow Knight"
+        );
+    }
+
+    /// 混合 ASCII（含 CJK 标点/假名）按非 ASCII 处理：英文名存在时优先英文名
+    #[test]
+    fn mixed_script_name_prefers_english() {
+        assert_eq!(
+            pick_search_term("ペルソナ5", Some("Persona 5")),
+            "Persona 5"
+        );
+        assert_eq!(
+            pick_search_term("尼尔：机械纪元", Some("NieR:Automata")),
+            "NieR:Automata"
+        );
     }
 }

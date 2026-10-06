@@ -7,7 +7,7 @@ use tauri_plugin_autostart::AutoLaunchManager;
 use tauri::Manager;
 
 /// 获取所有设置
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_settings(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<Settings, String> {
@@ -101,7 +101,7 @@ fn reapply_gamepad_hotkey(new_hotkey: &str) {
 }
 
 /// 保存设置（整对象全量写库）——设置页「保存设置」按钮路径，覆盖全部字段
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_settings(
     app: tauri::AppHandle,
     db: State<'_, Arc<Mutex<Database>>>,
@@ -133,7 +133,7 @@ pub fn save_settings(
 /// 与 save_settings 的区别：patch 里的键经白名单过滤后才写入，其余设置以库中现值保持原样——
 /// 不会把用户改了但没点「保存设置」的密钥 / LLM / 窗口尺寸等手动字段顺带落盘。
 /// 合并语义（读库现值 → patch 覆盖 → 整写）也天然规避前端 settings 对象旧值污染。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_settings_partial(
     app: tauri::AppHandle,
     db: State<'_, Arc<Mutex<Database>>>,
@@ -191,7 +191,7 @@ pub fn save_settings_partial(
 }
 
 /// 获取开机自启动状态
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_autostart_enabled(
     manager: State<'_, AutoLaunchManager>,
 ) -> Result<bool, String> {
@@ -199,7 +199,7 @@ pub fn get_autostart_enabled(
 }
 
 /// 设置开机自启动
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_autostart_enabled(
     manager: State<'_, AutoLaunchManager>,
     enabled: bool,
@@ -211,26 +211,47 @@ pub fn set_autostart_enabled(
     }
 }
 
+/// 窗口尺寸的合法区间（与 `tauri.conf.json` 的 `minWidth` / `minHeight` 同口径）。
+///
+/// 命令层补一道钳位（2026-10-06）：此前完全依赖 tao / 系统按最小尺寸约束兜底 ——
+/// 用户可见行为虽不会坏（tao 把 min 约束交给 `WM_GETMINMAXINFO.ptMinTrackSize`），
+/// 但越界值会**原样落库**，而启动时的 clamp（`lib.rs`）仅在 `current_monitor()` 成功时才跑。
+/// 下界与配置一致；上界取 16384（远超任何单屏分辨率，含 200% 缩放下的 8K），只为挡住离谱值。
+/// **刻意不按当前显示器收窄上界** —— 「窗口可大于工作区」是既有行为，不在命令层改。
+const WINDOW_MIN_W: u32 = 900;
+const WINDOW_MIN_H: u32 = 600;
+const WINDOW_MAX_W: u32 = 16_384;
+const WINDOW_MAX_H: u32 = 16_384;
+
 /// 设置窗口大小并持久化到数据库
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_window_size(
     app: tauri::AppHandle,
     db: State<'_, Arc<Mutex<Database>>>,
     width: u32,
     height: u32,
 ) -> Result<(), String> {
+    // 先钳位：落库与 set_size 用的都是钳位后的值，不给库里留越界值
+    let (w, h) = (
+        width.clamp(WINDOW_MIN_W, WINDOW_MAX_W),
+        height.clamp(WINDOW_MIN_H, WINDOW_MAX_H),
+    );
+    if w != width || h != height {
+        tracing::warn!("窗口尺寸 {width}x{height} 越界，已钳位为 {w}x{h}");
+    }
+
     // 调整窗口大小。
     // 用逻辑尺寸：前端输入的是逻辑像素（与 tauri.conf.json 的 width/height 同口径），
     // 直接当物理像素用会在高 DPI 缩放屏上得到比预期小的窗口。
     if let Some(window) = app.get_webview_window("main") {
-        let size = tauri::LogicalSize::new(width as f64, height as f64);
+        let size = tauri::LogicalSize::new(w as f64, h as f64);
         window.set_size(tauri::Size::Logical(size)).map_err(|e| e.to_string())?;
     }
 
     // 持久化到数据库
     let db = lock_or_recover(&db);
-    db.set_setting("window_width", &width.to_string()).map_err(|e| e.to_string())?;
-    db.set_setting("window_height", &height.to_string()).map_err(|e| e.to_string())?;
+    db.set_setting("window_width", &w.to_string()).map_err(|e| e.to_string())?;
+    db.set_setting("window_height", &h.to_string()).map_err(|e| e.to_string())?;
 
     Ok(())
 }

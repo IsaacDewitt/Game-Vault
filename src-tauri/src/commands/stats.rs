@@ -18,7 +18,7 @@ const STATS_MAX_LIMIT: u32 = 1000; // 远超排行榜 / 明细页的单页需求
 const STATS_MAX_OFFSET: u32 = 1_000_000;
 
 /// 获取游戏时长排行榜
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_play_stats(
     db: State<'_, Arc<Mutex<Database>>>,
     limit: Option<u32>,
@@ -29,7 +29,7 @@ pub fn get_play_stats(
 }
 
 /// 获取每日游玩统计
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_daily_stats(
     db: State<'_, Arc<Mutex<Database>>>,
     days: Option<u32>,
@@ -40,7 +40,7 @@ pub fn get_daily_stats(
 }
 
 /// 获取概览统计
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_overview_stats(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<serde_json::Value, String> {
@@ -65,7 +65,7 @@ pub fn get_overview_stats(
 }
 
 /// 获取游戏类型统计
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_genre_stats(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<Vec<GenreStats>, String> {
@@ -74,7 +74,7 @@ pub fn get_genre_stats(
 }
 
 /// 获取热力图数据
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_heatmap_stats(
     db: State<'_, Arc<Mutex<Database>>>,
     days: Option<u32>,
@@ -85,7 +85,7 @@ pub fn get_heatmap_stats(
 }
 
 /// 获取游玩时段分布
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_hourly_stats(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<Vec<HourlyStats>, String> {
@@ -94,7 +94,7 @@ pub fn get_hourly_stats(
 }
 
 /// 获取游戏状态统计
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_status_stats(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<StatusStats, String> {
@@ -103,7 +103,7 @@ pub fn get_status_stats(
 }
 
 /// 获取游玩会话历史
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_play_sessions(
     db: State<'_, Arc<Mutex<Database>>>,
     game_id: Option<String>,
