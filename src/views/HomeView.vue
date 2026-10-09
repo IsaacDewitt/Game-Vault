@@ -56,6 +56,10 @@ onMounted(async () => {
         message.warning("当前没有从本库启动的游戏在运行，未截图");
       } else if (o.outcome === "foreground_mismatch") {
         message.warning("前台窗口不是从本库启动的游戏，未截图");
+      } else if (o.outcome === "no_foreground_window") {
+        // 与上一条区别：不是"在别的程序里"，而是系统层面前台窗口为空
+        // （全屏独占切换期等瞬态）。多数情况下再按一次即可成功。
+        message.warning("未能识别当前前台窗口（系统瞬时无前台窗口），未截图，请再试一次");
       }
     });
   } catch (e) {

@@ -954,7 +954,6 @@ async function handleImportSaves() {
             </div>
             <div>· 组合键会照常传给游戏，建议挑游戏里用不到的键</div>
             <div>· 中间那个 Xbox 指南键系统不给读，选不了</div>
-            <div>· Steam 游戏有自己的截图，本应用不抢</div>
             <div>· 只在本库的游戏运行期间生效，不玩游戏时完全不读手柄</div>
           </div>
         </n-popover>

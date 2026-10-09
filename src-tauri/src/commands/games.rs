@@ -149,12 +149,15 @@ pub fn delete_game(
         let game = db_guard.get_game_by_id(&game_id).map_err(|e| e.to_string())?;
 
         // 删除留档：写墓碑（2026-09-06）。历史汇总与成就本就删而留档，墓碑记住旧 id + 识别键
-        // （名字 + exe 文件名），重装再入库时按名字认领、复用旧 id，孤儿历史统计即可自动续接。
+        // （名字 + 官方英文名 + exe 文件名），重装再入库时按名字认领、复用旧 id，孤儿历史统计即可自动续接。
         // 路径刻意不存——换盘/挪目录重装照样能认领。墓碑写失败不应阻断删除，仅告警。
+        // name_en 必须一起留档（2026-10-09）：`name` 会被 LLM 刷新/就地编辑改成中文，
+        // 而重装导入的物品名是英文原名，只靠 `name` 认领会断链（见 database.rs::find_tombstone_for_reclaim）。
         if let Some(g) = &game {
             if let Err(e) = db_guard.insert_tombstone(
                 &g.id,
                 &g.name,
+                g.name_en.as_deref(),
                 g.exe_name.as_deref(),
                 &chrono::Utc::now().to_rfc3339(),
             ) {
@@ -706,12 +709,29 @@ pub async fn set_game_cover_from_url(
 
 /// 将 LLM 返回的元数据合并到游戏对象（只更新非空字段，保留用户已有数据）
 /// 供单游戏刷新与批量刷新共用
+///
+/// **仅 LLM 路径会走到这里**（手动改名走 `rename_game_inner`，不经过本函数），
+/// 因此这里可以安全地加「LLM 名称语言闸门」而不影响用户显式改名的自由。
 fn apply_llm_meta(updated: &mut Game, meta: &LlmGameMeta) {
+    // 名称语言闸门（2026-10-09，与手账 reviews.rs::drop_english_name_for_chinese_entry 同口径）：
+    // `name` 的契约是「中文主名」，但 LLM 面对英文原名的游戏常把官方英文名原样回填，
+    // 一旦落库就会把已有的中文名顶成英文；紧接着下方「ASCII 名自动补 name_en」又会把
+    // 两个字段填成同一个英文串 —— 界面上「中文名 / 英文名」双栏一起变英文，正是老爷报的症状。
+    // 判据：**纯 ASCII 的 name 无权覆盖含非 ASCII 的现名**。反向不受限（中文名可以顶掉英文名，
+    // 英文→英文的纠错也照常，如 'Gears of War Reloaded' → 'Gears of War: Reloaded'）。
     if let Some(name) = &meta.name {
         let trimmed = name.trim().to_string();
         if !trimmed.is_empty() && trimmed != updated.name {
-            tracing::info!("LLM 纠正游戏名称: '{}' -> '{}'", updated.name, trimmed);
-            updated.name = trimmed;
+            if trimmed.is_ascii() && !updated.name.is_ascii() {
+                tracing::warn!(
+                    "LLM 返回的 name 为纯 ASCII，拒绝覆盖现有中文名: '{}'（保留 {:?}）",
+                    trimmed,
+                    updated.name
+                );
+            } else {
+                tracing::info!("LLM 纠正游戏名称: '{}' -> '{}'", updated.name, trimmed);
+                updated.name = trimmed;
+            }
         }
     }
     // 官方英文名（SteamGridDB 检索专用）：落库前 trim，空串按 None 归一。
@@ -2668,6 +2688,51 @@ mod tests {
         assert!(leftovers.is_empty(), "不应残留临时文件: {leftovers:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 游戏侧 `name` 语言闸门（2026-10-09 补）：
+    /// LLM 把官方英文名原样回填进 name 时，无权覆盖已有中文名；英文→英文的纠错照常。
+    /// 病灶实证：2026-10-06 起 prompt 的 name 被写成「与用户输入一致」，God of War 这类
+    /// 英文标题刷新后 name 与 name_en 双双变英文（详情页双栏全英文）。
+    #[test]
+    fn apply_llm_meta拒收纯英文名覆盖中文名() {
+        // ① 现名中文 + LLM 回英文 → 拒收
+        let mut g = seeded_game();
+        g.name = "战神".to_string();
+        g.name_en = Some("God of War".to_string());
+        apply_llm_meta(
+            &mut g,
+            &LlmGameMeta {
+                name: Some("God of War".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(g.name, "战神", "英文名不得覆盖中文名");
+
+        // ② 现名英文 + LLM 回英文修正 → 照常采纳（不能被误伤）
+        let mut g2 = seeded_game();
+        g2.name = "Gears of War Reloaded".to_string();
+        apply_llm_meta(
+            &mut g2,
+            &LlmGameMeta {
+                name: Some("Gears of War: Reloaded".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(g2.name, "Gears of War: Reloaded");
+
+        // ③ 现名英文 + LLM 回中文 → 采纳，且中文名不会再被自动填进 name_en
+        let mut g3 = seeded_game();
+        g3.name = "God of War".to_string();
+        apply_llm_meta(
+            &mut g3,
+            &LlmGameMeta {
+                name: Some("战神".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(g3.name, "战神");
+        assert_eq!(g3.name_en, None, "中文名的条目不得把 name_en 填成中文");
     }
 
     /// 游戏侧 `name_en` 语言闸门（2026-10-06 补，此前只有手账侧有）：

@@ -208,6 +208,9 @@ impl Database {
         // 迁移：为旧手账数据库添加英文名字段
         self.migrate_add_review_name_en_column()?;
 
+        // 迁移：为旧墓碑表添加英文名字段（改名后重装仍能认领历史，2026-10-09）
+        self.migrate_add_tombstone_name_en_column()?;
+
         // 迁移：为旧手账数据库添加截图目录字段（手账自持，不再依赖游戏库活条目）
         self.migrate_add_review_screenshot_dir_column()?;
 
@@ -583,6 +586,26 @@ impl Database {
         Ok(())
     }
 
+    /// 迁移：为旧数据库的 game_tombstones 表添加 name_en 字段（2026-10-09）
+    ///
+    /// 背景：墓碑认领此前只认 `name`，而 `name` 是**可被改写**的展示名（LLM 刷新会写、
+    /// 用户可就地编辑）。一旦条目名字从英文原名（God of War）变成中文名（战神），
+    /// 下次「删除 → 重装」时新导入的英文原名就再也匹配不上墓碑里的中文名，
+    /// 留档的 play_stats_daily / achievement_unlocks 全部认领失败 —— 而"删了重装接回历史"
+    /// 正是墓碑机制存在的唯一理由。让墓碑同时记住官方英文名，认领时 name / name_en 任一命中
+    /// 即可，改名就不再有断链风险。
+    fn migrate_add_tombstone_name_en_column(&self) -> Result<()> {
+        if !self.has_column("game_tombstones", "name_en")? {
+            tracing::info!("game_tombstones.name_en 字段不存在，正在添加...");
+            self.conn.execute(
+                "ALTER TABLE game_tombstones ADD COLUMN name_en TEXT",
+                [],
+            )?;
+            tracing::info!("已添加 name_en 字段到 game_tombstones 表");
+        }
+        Ok(())
+    }
+
     /// 迁移：为旧数据库的 reviews 表添加 name_en（官方英文名）字段
     fn migrate_add_review_name_en_column(&self) -> Result<()> {
         if !self.has_column("reviews", "name_en")? {
@@ -885,12 +908,22 @@ impl Database {
 
     // ==================== 游戏墓碑（删除留档，重装按名字认领续接历史） ====================
 
-    /// 删除游戏时写墓碑：记录被删条目的旧 id 与识别键（名字 + exe 文件名）。
+    /// 删除游戏时写墓碑：记录被删条目的旧 id 与识别键（名字 + 英文原名 + exe 文件名）。
     /// 历史统计 play_stats_daily/hourly 与成就本就删而留档，靠墓碑记住的旧 id 才能在新条目入库时认领回来。
-    pub fn insert_tombstone(&self, id: &str, name: &str, exe_name: Option<&str>, deleted_at: &str) -> Result<()> {
+    ///
+    /// `name_en` 是**官方英文原名**（2026-10-09 补）：`name` 是展示名、会被 LLM 刷新或就地编辑
+    /// 改写成中文（God of War → 战神），而重装导入的物品名通常是英文原名 —— 只认 `name` 会断链。
+    pub fn insert_tombstone(
+        &self,
+        id: &str,
+        name: &str,
+        name_en: Option<&str>,
+        exe_name: Option<&str>,
+        deleted_at: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO game_tombstones (id, name, exe_name, deleted_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, name, exe_name, deleted_at],
+            "INSERT OR REPLACE INTO game_tombstones (id, name, name_en, exe_name, deleted_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, name, name_en, exe_name, deleted_at],
         )?;
         Ok(())
     }
@@ -912,26 +945,37 @@ impl Database {
     ///   （2026-09-12 修订：此前 SQL 附加 `exe_name IS NULL`，使"换了 exe 名重装"根本领不回
     ///   历史，与本函数承诺相反；现由命令层以前置条件"库中已无同名活条目"防误接。）
     ///
+    /// **名字键同时比 `name` 与 `name_en`**（2026-10-09）：`name` 是可被 LLM 刷新/就地编辑
+    /// 改写的展示名，改中文后二次重装时新条目带的是英文原名，只比 `name` 会断链。
+    ///
     /// 不存路径，换盘/挪目录重装照样命中。
     pub fn find_tombstone_for_reclaim(
         &self,
         name: &str,
         exe_name: Option<&str>,
     ) -> Result<Option<String>> {
+        /// ?1 = 待认领的名字；墓碑的 name 或 name_en 任一命中即可
+        const NAME_MATCH: &str = "((LOWER(TRIM(name)) = LOWER(TRIM(?1))) \
+             OR (name_en IS NOT NULL AND TRIM(name_en) <> '' \
+                 AND LOWER(TRIM(name_en)) = LOWER(TRIM(?1))))";
         let result = if let Some(exe) = exe_name {
             self.conn.query_row(
-                "SELECT id FROM game_tombstones
-                 WHERE LOWER(TRIM(name)) = LOWER(TRIM(?1))
-                   AND LOWER(TRIM(exe_name)) = LOWER(TRIM(?2))
-                 ORDER BY deleted_at DESC LIMIT 1",
+                &format!(
+                    "SELECT id FROM game_tombstones
+                     WHERE {NAME_MATCH}
+                       AND LOWER(TRIM(exe_name)) = LOWER(TRIM(?2))
+                     ORDER BY deleted_at DESC LIMIT 1"
+                ),
                 params![name, exe],
                 |r| r.get::<_, String>(0),
             )
         } else {
             self.conn.query_row(
-                "SELECT id FROM game_tombstones
-                 WHERE LOWER(TRIM(name)) = LOWER(TRIM(?1))
-                 ORDER BY deleted_at DESC LIMIT 1",
+                &format!(
+                    "SELECT id FROM game_tombstones
+                     WHERE {NAME_MATCH}
+                     ORDER BY deleted_at DESC LIMIT 1"
+                ),
                 params![name],
                 |r| r.get::<_, String>(0),
             )
@@ -947,10 +991,14 @@ impl Database {
     ///
     /// 用途与认领不同：这里只是**借 exe 名定位截图目录**（手账的截图库在游戏被删除后仍要可用）。
     /// 缺失或墓碑里 exe 为空都返回 None，由调用方决定退回自动推断。
+    ///
+    /// 与认领同款：名字键同时比 `name` 与 `name_en`（2026-10-09），改名后仍能借到 exe 名。
     pub fn find_tombstone_exe_by_name(&self, name: &str) -> Result<Option<String>> {
         let result = self.conn.query_row(
             "SELECT exe_name FROM game_tombstones
-             WHERE LOWER(TRIM(name)) = LOWER(TRIM(?1))
+             WHERE ((LOWER(TRIM(name)) = LOWER(TRIM(?1)))
+                OR (name_en IS NOT NULL AND TRIM(name_en) <> ''
+                    AND LOWER(TRIM(name_en)) = LOWER(TRIM(?1))))
                AND exe_name IS NOT NULL AND TRIM(exe_name) <> ''
              ORDER BY deleted_at DESC LIMIT 1",
             params![name],
@@ -3324,6 +3372,7 @@ mod tests {
         db.insert_tombstone(
             &old_id,
             &game.name,
+            game.name_en.as_deref(),
             game.exe_name.as_deref(),
             "2026-09-06T00:00:00Z",
         )
@@ -3385,7 +3434,7 @@ mod tests {
         game_a.id = a_id.clone();
         db.upsert_game(&game_a).unwrap();
         db.delete_game(&a_id).unwrap();
-        db.insert_tombstone(&a_id, &game_a.name, None, "2026-09-10T00:00:00Z")
+        db.insert_tombstone(&a_id, &game_a.name, None, None, "2026-09-10T00:00:00Z")
             .unwrap();
         db.conn
             .execute_batch(&format!(
@@ -3410,7 +3459,7 @@ mod tests {
         game_b.id = b_id.clone();
         db.upsert_game(&game_b).unwrap();
         db.delete_game(&b_id).unwrap();
-        db.insert_tombstone(&b_id, &game_b.name, None, "2026-09-10T00:00:00Z")
+        db.insert_tombstone(&b_id, &game_b.name, None, None, "2026-09-10T00:00:00Z")
             .unwrap();
 
         // ── 在库游戏 C：回归保障，别把在库条目弄丢
@@ -3490,6 +3539,7 @@ mod tests {
         db.insert_tombstone(
             &gone_id,
             "Mafia: The Old Country",
+            None,
             Some("MafiaTheOldCountry.exe"),
             "2026-09-10T00:00:00Z",
         )
@@ -3589,6 +3639,7 @@ mod tests {
         db.insert_tombstone(
             &id,
             &game.name,
+            game.name_en.as_deref(),
             game.exe_name.as_deref(),
             "2026-09-10T00:00:00Z",
         )
@@ -3670,6 +3721,73 @@ mod tests {
         assert_eq!(n_again, 1);
     }
 
+    /// 改名后重装仍能认领历史（2026-10-09）：
+    /// 墓碑同时留档 `name`（可能已被 LLM/用户改成中文）与 `name_en`（官方英文原名），
+    /// 认领（与截图目录的 exe 借用）在名字键上比 `name` 或 `name_en` 任一命中即可。
+    ///
+    /// 不这么做的话，「中文名条目被删 → 重装导入英文原名」会因名字对不上而认领失败，
+    /// 留档的 play_stats_daily / achievement_unlocks 全部接不回来 —— 这正是墓碑存在的理由。
+    #[test]
+    fn tombstone_reclaim_survives_rename() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+
+        // 已刷过 LLM 的游戏：name 是中文、name_en 留官方英文名
+        let id = uuid::Uuid::new_v4().to_string();
+        db.insert_tombstone(
+            &id,
+            "战神",
+            Some("God of War"),
+            Some("GoW.exe"),
+            "2026-10-09T00:00:00Z",
+        )
+        .unwrap();
+
+        // ① 重装导入带的是英文原名（Steam 物品名）→ 靠 name_en 命中
+        assert_eq!(
+            db.find_tombstone_for_reclaim("God of War", None).unwrap().as_deref(),
+            Some(id.as_str()),
+            "英文原名必须能通过墓碑 name_en 认领"
+        );
+
+        // ② 中文名一样能命中（两个方向都兜住）
+        assert_eq!(
+            db.find_tombstone_for_reclaim("战神", None).unwrap().as_deref(),
+            Some(id.as_str()),
+            "中文名必须能通过墓碑 name 认领"
+        );
+
+        // ③ exe 双键路径同样认 name_en：exe 一致 + 英文原名 → 命中
+        assert_eq!(
+            db.find_tombstone_for_reclaim("God of War", Some("GoW.exe"))
+                .unwrap()
+                .as_deref(),
+            Some(id.as_str())
+        );
+        // ④ exe 不一致仍然不命中（防同名不同游戏误接）
+        assert!(
+            db.find_tombstone_for_reclaim("God of War", Some("Other.exe"))
+                .unwrap()
+                .is_none()
+        );
+
+        // ⑤ 截图目录借用 exe 名：改名后拿中文名来问，也得给回 GoW.exe
+        assert_eq!(
+            db.find_tombstone_exe_by_name("战神").unwrap().as_deref(),
+            Some("GoW.exe")
+        );
+        assert_eq!(
+            db.find_tombstone_exe_by_name("God of War").unwrap().as_deref(),
+            Some("GoW.exe")
+        );
+
+        // ⑥ 无关名字不该被吸进来
+        assert!(
+            db.find_tombstone_for_reclaim("God of War Ragnarök", None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// 名字兜底认领语义（2026-09-12 修订）：**换 exe 名重装也能接回历史**。
     ///
     /// ① `Some(exe)` 走名字 + exe 双键，能区分同名不同游戏，exe 对不上则双键不命中；
@@ -3681,7 +3799,7 @@ mod tests {
 
         // 一条带 exe 的墓碑（原为 Steam 版）
         let exe_id = uuid::Uuid::new_v4().to_string();
-        db.insert_tombstone(&exe_id, "叙事驱动小品", Some("story.exe"), "2026-09-06T01:00:00Z")
+        db.insert_tombstone(&exe_id, "叙事驱动小品", None, Some("story.exe"), "2026-09-06T01:00:00Z")
             .unwrap();
 
         // 双键：exe 对得上 → 命中；对不上 → 不命中（交给名字兜底）
@@ -3710,7 +3828,7 @@ mod tests {
 
         // 同名多条墓碑（无 exe 的那条更早删）→ 取最近删除的一条
         let no_exe_id = uuid::Uuid::new_v4().to_string();
-        db.insert_tombstone(&no_exe_id, "叙事驱动小品", None, "2026-09-05T00:00:00Z")
+        db.insert_tombstone(&no_exe_id, "叙事驱动小品", None, None, "2026-09-05T00:00:00Z")
             .unwrap();
         assert_eq!(
             db.find_tombstone_for_reclaim("叙事驱动小品", None)
@@ -3847,6 +3965,7 @@ mod tests {
         db.insert_tombstone(
             &uuid::Uuid::new_v4().to_string(),
             "Mafia: The Old Country",
+            None,
             Some("MafiaTheOldCountry.exe"),
             "2026-09-10T13:26:02Z",
         )

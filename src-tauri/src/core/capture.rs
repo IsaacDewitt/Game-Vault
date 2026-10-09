@@ -59,6 +59,15 @@ const WARM_FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(2000);
 /// 足以排除"上一轮其实还在正常等待"的情况，避免误接管导致并发拷帧。
 const PENDING_STALE: Duration = Duration::from_secs(5);
 
+/// `foreground_hwnd_fallback` 里重查前台窗口的次数与间隔。
+///
+/// 【为什么给 3×8ms】前台句柄丢失是**毫秒级**的瞬态（焦点切换、全屏切换的窗口期），
+/// 重试只要覆盖住这个抖动即可。单次重试必须极短，因为整个截图链路是用户按完键在等的
+/// 关键路径 —— 3 次 8ms 合计最多 24ms，比一次冷启动抓帧（~170ms）便宜一个数量级，
+/// 而换来的是"系统抖一下就不再失手"。
+const FOREGROUND_RETRY_TIMES: u32 = 3;
+const FOREGROUND_RETRY_INTERVAL: Duration = Duration::from_millis(8);
+
 /// 捕获到的一帧 HDR 原始数据
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {
@@ -282,6 +291,57 @@ fn window_alive(hwnd: isize) -> bool {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
     unsafe { IsWindow(Some(HWND(hwnd as *mut std::ffi::c_void))).as_bool() }
+}
+
+/// 取「当前截图目标窗口」的兜底链路，供 `trigger_screenshot` 在
+/// `Window::foreground()` 返回 `Err(NoActiveWindow)` 时使用。
+///
+/// # 为什么需要它（2026-10-06 实机，真三国无双3重制版）
+///
+/// 该游戏按 F9 / 手柄键截图**四次全部**死在第一步：`Window::foreground()` →
+/// `GetForegroundWindow()` 返回 NULL。而同一窗口的温会话在同一分钟内**预建成功**
+/// （预建路径第一步同样是 `Window::foreground()`），说明前台句柄是**间歇性取不到**，
+/// 而非窗口不存在。成因是「UE 启动器壳 + 真身双进程」在全屏独占下的焦点切换窗口期，
+/// 系统短暂置前台窗口为空。
+///
+/// 原来的实现一遇 `NoActiveWindow` 就放弃，等于把「系统抖了一下」当成「没有游戏在跑」，
+/// 用户看到的是**截图键彻底不灵**。本函数给出两条兜底：
+///
+/// 1. **`GetForegroundWindow` 原始调用 + 极短重试**：前台句柄的丢失往往只持续几毫秒，
+///    隔一小会儿再查一次多半就有了。用 `windows` crate 直查，绕开 windows-capture 的
+///    一次性封装。**优先走这条**：它是"前台窗口"的**真值**，不会截错窗口。
+/// 2. **温会话已挂的窗口**（末位兜底）：两条前台查询都空时，才退而用会话当前挂着的 hwnd。
+///    依据是"温会话只挂在前台游戏窗口上"（预建由追踪循环在前台命中游戏时触发，且游戏
+///    退出即释放），故它通常是同一个窗口。代价是这属于**推断**而非直读 —— 若前台真
+///    切换到了别处，后续的进程匹配（`find_active_game_by_process`）仍会把它拦成
+///    `ForegroundMismatch`，**不会误截别的窗口**，最坏只是白跑一次匹配。
+///
+/// 全部失败返回 `None`，调用方按原来的「放弃」处理 —— 兜底只增加成功机会，不改变失败语义。
+///
+/// 【为什么不用 `EnumWindows` 按 PID 反查】会话侧只知道「exe 名 / 安装目录」，要按 PID 反查
+/// 就得先枚举全系统进程并逐个比对路径，代价与复杂度都远超收益；而上面两条兜底已覆盖
+/// 实测到的全部失败形态（窗口刚丢焦点 → ①；前台查询持续为空 → ②）。
+pub fn foreground_hwnd_fallback() -> Option<isize> {
+    // ① 直查前台窗口，并给几次极短重试（前台句柄丢失通常只持续数毫秒）。
+    //    这条是前台窗口的**真值**来源，必须先试。
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    for _ in 0..FOREGROUND_RETRY_TIMES {
+        let hwnd = unsafe { GetForegroundWindow() };
+        if !hwnd.is_invalid() {
+            return Some(hwnd.0 as isize);
+        }
+        std::thread::sleep(FOREGROUND_RETRY_INTERVAL);
+    }
+
+    // ② 前台查询始终为空 → 退而用温会话当前挂着的窗口（推断值，见函数头"末位兜底"）。
+    //    必须在 ① 之后：它是推断，只有当真值拿不到时才允许使用。
+    if let WarmTarget::Window(hwnd) = warm_session_target() {
+        if window_alive(hwnd) {
+            return Some(hwnd);
+        }
+    }
+
+    None
 }
 
 /// 温会话槽位的查询结果（供后台预建判断是否已就绪）
@@ -715,5 +775,45 @@ mod tests {
         s.frame = None;
         assert!(reclaim_stale_pending(&mut s));
         assert!(s.pending.is_none(), "接管后必须可复用，否则每次都要重建会话");
+    }
+
+    /// 兜底取窗口：没有温会话时不能 panic，且失败要干净地返回 `None`。
+    ///
+    /// 【这条测试挡什么】`foreground_hwnd_fallback` 会在**每一次取前台窗口失败**时被调用
+    /// （真三国无双3重制版那类双进程全屏游戏），而它第一步就查温会话槽位。
+    /// 若无会话时这里读锁出错或 unwrap 失败，就会把"前台窗口取不到"升级成**截图线程 panic**
+    /// —— 比原来的失败更糟（`ShotInFlightGuard` 能复位闸门，但这一张图彻底没了）。
+    /// 本测试在无会话的前提下证实它安全返回（`None` 或某个真实前台窗口，取决于测试机当前状态）。
+    #[test]
+    fn foreground_hwnd_fallback_is_safe_without_warm_session() {
+        release_warm_session();
+        // 只要不 panic 即通过：测试机若无前台窗口应得 None，若有则拿到有效 hwnd。
+        let fallback = foreground_hwnd_fallback();
+        if let Some(hwnd) = fallback {
+            assert!(window_alive(hwnd), "兜底返回的句柄必须是活着的窗口");
+        }
+        // 再调一次，确认不残留状态（可重复调用）
+        let _ = foreground_hwnd_fallback();
+    }
+
+    /// 兜底重试预算必须**远小于**一次冷启动抓帧（~170ms）——否则兜底本身就变成了体感卡顿。
+    ///
+    /// 【为什么钉这个数】重试发生在用户按完快门等着出图的关键路径上。若日后有人把次数
+    /// 或间隔调大（比如为了"更稳"改成 20×50ms = 1s），截图会从"偶发失败"变成"偶发卡一秒"，
+    /// 比原故障更难受。这条测试把预算上限钉死在 100ms，同时钉住"至少重试一次"
+    /// （用 `const` 断言而非运行时 assert，避免 clippy 报"constant value"）。
+    #[test]
+    fn foreground_retry_budget_stays_under_100ms() {
+        const BUDGET: Duration = FOREGROUND_RETRY_INTERVAL.saturating_mul(FOREGROUND_RETRY_TIMES);
+        const _: () = assert!(
+            BUDGET.as_millis() <= 100,
+            "兜底重试预算过大：它加在按键→出图的路径上，必须远小于冷启动抓帧的 ~170ms"
+        );
+        const _: () = assert!(
+            FOREGROUND_RETRY_TIMES >= 1,
+            "至少要试一次，否则兜底无意义"
+        );
+        // 运行时复核一次（防止上面 const 断言被误删后测试静默通过）
+        assert_eq!(BUDGET, FOREGROUND_RETRY_INTERVAL * FOREGROUND_RETRY_TIMES);
     }
 }

@@ -1285,7 +1285,7 @@ mod tests {
 
         // 已移除游戏：只有墓碑，没有封面
         let gone_id = uuid::Uuid::new_v4().to_string();
-        db.insert_tombstone(&gone_id, "Mafia: The Old Country", Some("MafiaTheOldCountry.exe"), "2026-09-10T00:00:00Z").unwrap();
+        db.insert_tombstone(&gone_id, "Mafia: The Old Country", None, Some("MafiaTheOldCountry.exe"), "2026-09-10T00:00:00Z").unwrap();
 
         let report = migrate(&db).unwrap();
         assert!(report.relinked >= 1, "已移除条目应从同名手账回挂封面");

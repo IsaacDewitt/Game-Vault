@@ -1,6 +1,6 @@
 //! 截图相关 Tauri 命令：热键触发的截图入口 + 打开截图文件夹。
 
-use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use tauri::{Emitter, State};
 use windows_capture::window::Window;
 
@@ -34,11 +34,14 @@ pub enum ScreenshotOutcome {
     NoActiveGame,
     /// 前台窗口不是从本库启动的游戏，忽略
     ForegroundMismatch,
-    /// 该游戏所属平台自带截图能力（Steam），本应用**静默退让**
+    /// **系统当前没有前台窗口**（`GetForegroundWindow()` 返回空），无法判断游戏，未截图。
     ///
-    /// 刻意不发提示音：Steam 默认截图键同为 F12，若在 Steam 里按 F12 时
-    /// 本应用跟着响一声，会没完没了地打扰用户。
-    PlatformExcluded,
+    /// 【为什么不并入 `ForegroundMismatch`】二者的用户可操作性完全不同：`ForegroundMismatch`
+    /// 是"你此刻在别的程序里"，用户切回游戏即可；本项是**系统层面取不到前台窗口**
+    /// （全屏独占切换期、UAC 桌面、锁屏等瞬态），用户往往什么都没做错 —— 提示语必须能区分，
+    /// 否则真三国无双3重制版那类"按了没反应"的故障又会被一句含糊的
+    /// 「前台窗口不是从本库启动的游戏」掩盖过去（2026-10-06 实机教训）。
+    NoForegroundWindow,
     /// 截图失败
     Failed { message: String },
 }
@@ -165,69 +168,28 @@ fn foreground_tracked_game_id(
         .or_else(|| guard.find_pending_game_by_process(&process_name, full_path.as_deref()))
 }
 
-/// 本次运行内**已判定为"不建截图链路"的游戏**（当前只有 Steam）缓存。
-///
-/// 【为什么必须有】对 Steam 游戏，第 ② 步（会话已挂在当前窗口 → 短路）**永远不会命中**，
-/// 因为会话压根不会建。于是每一拍（1 秒）都会走到第 ③ 步持 tracker 锁查进程路径、
-/// 第 ④ 步再查一次 DB —— 而 Steam 游戏恰恰是主力库，这个空转开销会持续整个游戏会话。
-/// 缓存后：同一 game_id 只在**首次**判定时查一次 DB，之后直接短路。
-///
-/// 【为什么可以永久缓存】`platform` 是游戏的固有属性，运行期内不会变（改库不重载）。
-/// 代价是"运行中把某游戏平台从 steam 改成 epic"需重启应用才生效——这是可接受的取舍，
-/// 且该场景实际不会发生（平台由扫描导入时确定）。
-///
-/// 【为什么只缓存"命中"不缓存"未命中"】未命中（非 Steam 平台）的判定结果不该固化：
-/// 一是没必要（非 Steam 游戏会建会话，第 ② 步自然短路，不构成每拍开销）；
-/// 二是若将来平台可变，缓存未命中反而会让改动不生效。只缓存豁免名单，语义更清晰。
-static STEAM_EXEMPT: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-
-/// 该 game_id 是否已被判定为"Steam 豁免"（不建截图链路）
-fn is_steam_exempt(game_id: &str) -> bool {
-    STEAM_EXEMPT
-        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains(game_id)
-}
-
-/// 把 game_id 记入"Steam 豁免"名单（幂等）
-fn mark_steam_exempt(game_id: &str) {
-    STEAM_EXEMPT
-        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(game_id.to_string());
-}
-
 /// 若前台是被追踪的游戏，就在后台预建截图温会话（见 `capture::prime_warm_session`）。
 ///
-/// 【Steam 游戏不建截图链路（2026-09-29 拍板，改前必读）】
-/// 本函数对所有被追踪游戏一视同仁地预建 WGC 温会话，但 Steam 游戏**根本用不上本应用的截图**
-/// （截图入口早已对 Steam 静默退让，见 `trigger_screenshot` 的 `PlatformExcluded`）。
-/// 于是出现一种纯亏的局面：**热键路径退让了，后台预建却照旧把 WGC 会话挂上去**——
-/// 会话常驻在游戏窗口上，与 Steam Overlay、EA IGO Overlay 三方抢同一条 DX11 SwapChain。
-/// 实测 Titanfall 2（DX11 + 双 Overlay）在**温会话重建**后数分钟内即崩溃退出两次；
-/// 而头一次会话因复用不再重建，故能连玩两小时无事（详见当日实机日志）。
-/// 结论：Steam 游戏在**预建这一步**就应直接返回，让截图链路完全不建立，而不是等到按键才退让。
+/// 【所有平台一视同仁（2026-10-09 拍板，改前必读）】
+/// 本函数对所有被追踪游戏一律预建 WGC 温会话：Steam / Epic / 本地不再有任何区别。
+/// 此前 Steam 曾被"不建截图链路"豁免（Steam 自带截图 + 默认热键同为 F12；且会话常驻会与
+/// Steam Overlay / EA IGO Overlay 抢同一条 DX11 SwapChain，实测致《泰坦陨落 2》在温会话
+/// 重建后数分钟内崩两次）。老爷 2026-10-09 决定取消该豁免，让 Steam 游戏与其它平台完全同权，
+/// 截图体验一致（首张即为温的 ~11ms）。
+/// 【须知】豁免取消意味着上述 SwapChain 争抢风险重新暴露于 DX11 + 多 Overlay 游戏——
+/// 这是老爷知悉并接受的取舍；若日后同类游戏再现崩溃，第一嫌疑点即在此。
 ///
-/// 判定放在本函数而非 `foreground_tracked_game_id` 内部：后者是纯粹的"前台是哪款游戏"匹配，
-/// 混入平台策略会污染其语义、也让单测难写。
-///
-/// 本函数被追踪循环**每拍调用**（见 `lib.rs` 阶段 3），因此刻意做成四级漏斗，越往后越贵：
+/// 本函数被追踪循环**每拍调用**（见 `lib.rs` 阶段 3），因此刻意做成三级漏斗，越往后越贵：
 /// 1. 取前台 hwnd —— 纯 Win32 查询，**不碰任何锁**；
 /// 2. 查温会话挂在哪个窗口 —— `try_lock`，同样**不碰 tracker 锁**；
 ///    命中"已经挂在这个窗口上"就直接收工（绝大多数拍都停在这一步）；
 /// 3. 判定"前台是不是被追踪的游戏"——这一步要持 **tracker 锁**并做一次进程路径查询，
 ///    而 tracker 锁正是截图关键路径第 2 步也要拿的锁。能用前两步挡掉就别抢它，
-///    免得给"按键 → 画面到手"那条十几毫秒的链路掺入抖动；
-/// 4. 命中后查 `platform`：**Steam → 直接返回**（不建会话）；其余平台照常预建。
+///    免得给"按键 → 画面到手"那条十几毫秒的链路掺入抖动。
 ///
 /// 实际建会话与等首帧都在后台线程做，绝不阻塞追踪循环。预建失败是常态允许情况
 /// （游戏还在启动、窗口最小化），静默即可。
-pub fn maybe_prime_warm_session(
-    tracker: &Arc<Mutex<PlayTimeTracker>>,
-    db: &Arc<Mutex<Database>>,
-) {
+pub fn maybe_prime_warm_session(tracker: &Arc<Mutex<PlayTimeTracker>>) {
     use crate::core::capture::WarmTarget;
 
     // ① 前台 hwnd：纯 Win32 查询，不持锁
@@ -246,25 +208,9 @@ pub fn maybe_prime_warm_session(
         _ => {}
     }
 
-    // ③ 昂贵判定：前台是不是被追踪的游戏（持 tracker 锁）。未命中即返回 None，本节无额外代价。
-    let Some(game_id) = foreground_tracked_game_id(tracker, &foreground) else {
-        return;
-    };
-
-    // ③.5 已判定过是 Steam 豁免的游戏 → 直接返回，不再每拍查 DB（见 STEAM_EXEMPT 说明）。
-    //      这一条对 Steam 游戏是**唯一**的短路点：会话不会建，第 ② 步永远拦不住它。
-    if is_steam_exempt(&game_id) {
-        return;
-    }
-
-    // ④ Steam 游戏：不建截图链路（见函数头说明）。
-    //    查 platform 需要 DB 锁——注意它**在 tracker 锁已释放之后**才获取，
-    //    不会与截图关键路径的持锁顺序交叉，故无死锁风险。
-    if !should_prime_for_platform(platform_of_game(db, &game_id).as_deref()) {
-        tracing::debug!(
-            "[截图] 前台游戏 {game_id} 属 Steam，跳过温会话预建（Steam 游戏不建截图链路）"
-        );
-        mark_steam_exempt(&game_id);
+    // ③ 昂贵判定：前台是不是被追踪的游戏（持 tracker 锁）。未命中即返回，本节无额外代价。
+    //    命中后所有平台一律照常预建，不再有 Steam 分支。
+    if foreground_tracked_game_id(tracker, &foreground).is_none() {
         return;
     }
 
@@ -276,34 +222,45 @@ pub fn maybe_prime_warm_session(
     }
 }
 
-/// 查某游戏的 `platform`；查不到条目或查询失败一律返回 `None`。
+/// 解析「当前要截图的窗口」：正常走 `Window::foreground()`，失败时走兜底链路。
 ///
-/// 【不可用 `.ok().flatten()` 吞掉错误】那会把"查不到"与"查失败"归并成同一个 None。
-/// 本函数两者处置相同（都按"非 Steam"放行预建），但错误仍显式记日志，
-/// 免得数据库故障被静默成"看起来一切正常"（与 `trigger_screenshot` 的既有教训一致）。
-fn platform_of_game(db: &Arc<Mutex<Database>>, game_id: &str) -> Option<String> {
-    let db_guard = lock_or_recover(db);
-    match db_guard.get_game_by_id(game_id) {
-        Ok(Some(g)) => Some(g.platform),
-        Ok(None) => {
-            tracing::debug!("[截图] 查不到游戏 {game_id} 的条目，按非 Steam 处理");
-            None
-        }
-        Err(e) => {
-            tracing::warn!("[截图] 查询游戏 {game_id} 平台失败，按非 Steam 处理: {e}");
-            None
-        }
+/// 返回值两态（见 `ForegroundProbe`），对应 `trigger_screenshot` 里两种处置：
+/// - `Resolved(window)`：正常拿到前台窗口（**绝大多数情况走这条，零额外开销**）；
+/// - `Absent`：连"当前有没有前台窗口"都取不到 —— 已经过兜底仍为空，属系统层面的前台
+///   句柄缺失，与"人在别的程序里"是两回事，故映射到独立的 `NoForegroundWindow` 提示语。
+///
+/// 【为什么抽成函数】把"取窗口"这一件事与 `trigger_screenshot` 的主体分开，一是让
+/// 「成功路径一次返回、零额外开销」这条不变量在代码上一目了然（能在返回值里读出），
+/// 二是兜底的两条分支（温会话窗口 / 直查重试）与 `capture::foreground_hwnd_fallback`
+/// 的职责划分更清晰。每条失败分支照旧留日志（可观测性铁律）。
+///
+/// 【兜底为什么必要（2026-10-06，真三国无双3重制版）】详见
+/// `capture::foreground_hwnd_fallback` 的文档：UE 启动器壳 + 真身双进程在全屏独占下，
+/// `GetForegroundWindow()` 会间歇性返回 NULL，旧实现就此放弃 → 截图键表现为彻底失灵。
+fn resolve_foreground_window() -> ForegroundProbe {
+    match Window::foreground() {
+        Ok(w) => ForegroundProbe::Resolved(w),
+        Err(e) => match crate::core::capture::foreground_hwnd_fallback() {
+            Some(hwnd) => {
+                tracing::warn!("[截图] 取前台窗口失败({e:?})，兜底命中窗口 {hwnd:#x}，继续截图");
+                ForegroundProbe::Resolved(Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void))
+            }
+            None => {
+                tracing::warn!(
+                    "[截图] 当前无前台窗口（直查与重试均返回空），放弃: {e:?}"
+                );
+                ForegroundProbe::Absent
+            }
+        },
     }
 }
 
-/// 该平台是否应当建立截图温会话。
-///
-/// **Steam 不建**：Steam 自带截图、且默认热键同为 F12，本应用截图入口早已对其静默退让
-/// （见 `trigger_screenshot`），故预建 WGC 会话纯属白付代价——还会与 Steam Overlay /
-/// EA IGO Overlay 抢 DX11 SwapChain，实测导致 Titanfall 2 崩溃（2026-09-29）。
-/// 其余平台（epic / local / 未知）照常预建。
-fn should_prime_for_platform(platform: Option<&str>) -> bool {
-    platform.is_none_or(|p| p != crate::core::platform::PLATFORM_STEAM)
+/// `resolve_foreground_window` 的结果：拿到窗口 / 系统层面前台窗口为空。
+enum ForegroundProbe {
+    /// 成功解析出前台窗口
+    Resolved(Window),
+    /// 系统当前没有前台窗口（`GetForegroundWindow()` 为空，且兜底重试也未命中）
+    Absent,
 }
 
 /// 截图执行体（由 `dispatch_screenshot_async` 在独立线程里调用）。
@@ -313,8 +270,10 @@ fn should_prime_for_platform(platform: Option<&str>) -> bool {
 /// 2. 本库没有任何会话（活跃 + 待命都为 0）→ 忽略；
 /// 3. 按「进程名匹配 **或** 进程路径落在安装目录下」反查游戏；活跃会话不中再试**待命**会话
 ///    （平台游戏进程已现身但 10 秒轮询尚未转正的窗口期，游戏就在眼前，照常截图）；
-/// 4. **Steam 游戏静默退让** —— Steam 自带截图、且默认热键同为 F12，必须不响不截；
-/// 5. WGC 抓屏（HDR 源 → tonemap → PNG），按**会话 exe 名**归档（与手账/详情页同口径）。
+/// 4. WGC 抓屏（HDR 源 → tonemap → PNG），按**会话 exe 名**归档（与手账/详情页同口径）。
+///
+/// 【所有平台一视同仁（2026-10-09）】不再对 Steam 游戏静默退让：Steam / Epic / 本地走完全
+/// 相同的链路，按键即截。
 ///
 /// 每条返回分支都会写日志，见下方"可观测性铁律"。
 pub fn trigger_screenshot(
@@ -329,19 +288,27 @@ pub fn trigger_screenshot(
     // 【可观测性铁律】本函数每条失败分支都必须留下日志。此前 4 条分支只播个提示音就返回，
     // 而提示音在游戏里未必听得见、toast 又藏在应用窗口里，导致"按了 F9 毫无反应"类问题
     // 完全没有线索（排查 Epic 截图失效时被迫用外部探针反推）。任何新增分支同理。
-    let foreground = match Window::foreground() {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::warn!("[截图] 取前台窗口失败，放弃: {e:?}");
+    //
+    // 【兜底：NoActiveWindow 不再直接放弃（2026-10-06，真三国无双3重制版实机）】
+    // 该游戏（UE 启动器壳 + 真身双进程）在全屏独占下，`GetForegroundWindow()` 会**间歇性**
+    // 返回 NULL —— 同一窗口的温会话彼时还挂得好好的（预建成功过），说明是系统前台句柄的
+    // 瞬态抖动，不是窗口不存在。旧实现在这里直接 return，等于把"抖了一下"当"没有游戏在跑"，
+    // 四次按键四次失败，用户看到的是截图键彻底失灵。
+    // 现改为：`Window::foreground()` 失败时先走 `foreground_hwnd_fallback()`（直查前台窗口
+    // 并极短重试 → 仍为空才退用温会话已挂的 hwnd），只有全部落空才按原样放弃。
+    // **成功路径完全不变**：能取到前台窗口就一次返回，不引入任何额外查询或延迟。
+    let foreground = match resolve_foreground_window() {
+        ForegroundProbe::Resolved(w) => w,
+        ForegroundProbe::Absent => {
             screenshot::play_feedback(screenshot::FeedbackTone::Notice);
-            return Some(ScreenshotOutcome::ForegroundMismatch);
+            return Some(ScreenshotOutcome::NoForegroundWindow);
         }
     };
     // PID 先行：即使后续取名失败，日志里也要有 pid 可追
     let pid = match foreground.process_id() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("[截图] 取前台窗口 PID 失败，放弃: {e:?}");
+            tracing::warn!("[截图] 取前台窗口 PID 失败（进程可能已退出），放弃: {e:?}");
             screenshot::play_feedback(screenshot::FeedbackTone::Notice);
             return Some(ScreenshotOutcome::ForegroundMismatch);
         }
@@ -443,22 +410,21 @@ pub fn trigger_screenshot(
         (id, archive_name)
     };
 
-    // 3. 关键路径上只留一次主键查询：判定 Steam 静默退让
+    // 3. 关键路径上只留一次主键查询（微秒级）：把游戏条目查出来，供抓帧后的落盘目录解析使用。
     //
-    // 【为什么只剩这一件事（2026-09-22 链路重排）】旧实现在抓帧**之前**就把
+    // 【为什么全压到这里（2026-09-22 链路重排）】旧实现在抓帧**之前**就把
     // 「查游戏 + 读设置 + 查手账 + 解析落盘目录」全做完了，其中解析落盘目录要对截图根目录
     // 做 read_dir + 逐目录计数 —— 实测机械盘冷缓存下 `H:\GameCapture`（190 个子目录）要 **411ms**，
     // 这段时间全压在"按键 → 画面到手"的关键路径上。现在这里只留一次主键查询（微秒级），
     // 读设置 / 查手账 / 解析目录 / tonemap / PNG / 写盘全部后移到抓帧之后。
     //
-    // Steam 自带截图，且其默认截图键同为 F12：本应用必须**静默退让**——不截图、也不发提示音。
-    // 因此这个判定必须发生在"响快门、抓帧"之前。判定显式按 platform 来，不能指望
-    // "Steam 条目没有 exe 名所以匹配不上"这种巧合——一旦将来 exe_name 被填上就会误触发。
-    // （Epic 无此冲突：其覆盖层热键是 Shift+F2，故 Epic 游戏照常支持截图。）
+    // 【2026-10-09 取消 Steam 静默退让】此前这里会按 platform 判定，Steam 游戏直接返回
+    // `PlatformExcluded`（不截图、不响快门，让给 Steam 自带截图）。老爷决定所有平台统一支持
+    // 截图，故该判定已移除 —— Steam 游戏与 Epic / 本地游戏走完全相同的链路。
     let matched_game = {
         let db_guard = lock_or_recover(db);
         // 【不可用 .ok().flatten() 吞掉错误】那会把「查不到」与「查失败」归并成同一个 None，
-        // 导致 platform 退化为空串 → Steam 静默退让失效 → 跟 Steam 抢拍一张（症状诡异、日志正常）。
+        // 数据库故障会被静默成"看起来一切正常"。此处显式区分并记日志（与截图链路既有教训一致）。
         match db_guard.get_game_by_id(&matched_game_id) {
             Ok(g) => g,
             Err(e) => {
@@ -470,17 +436,6 @@ pub fn trigger_screenshot(
             }
         }
     };
-    let platform = matched_game
-        .as_ref()
-        .map(|g| g.platform.clone())
-        .unwrap_or_default();
-    if platform == crate::core::platform::PLATFORM_STEAM {
-        tracing::info!(
-            "前台游戏 {} 属 Steam（自带截图，默认键同为 F12），本应用静默退让",
-            matched_game_id
-        );
-        return Some(ScreenshotOutcome::PlatformExcluded);
-    }
 
     // 4. 【关键路径终点】响快门 + 抓帧
     //
@@ -990,6 +945,7 @@ mod tests {
                 .insert_tombstone(
                     &uuid::Uuid::new_v4().to_string(),
                     "四海兄弟：故乡",
+                    Some("Mafia: The Old Country"),
                     Some("MafiaTheOldCountry.exe"),
                     "2026-09-10T13:26:02Z",
                 )
@@ -1061,49 +1017,4 @@ mod tests {
         }
     }
 
-    /// 【2026-09-29 Titanfall 2 崩溃修复的回归保护】
-    ///
-    /// Steam 游戏必须**不建**截图温会话：截图入口早已对 Steam 静默退让，预建纯属白付代价，
-    /// 且常驻 WGC 会话会与 Steam Overlay / EA IGO Overlay 抢 DX11 SwapChain，实测导致游戏崩溃。
-    /// 其余平台（epic / local / 未知）必须照常建，不得误伤。
-    ///
-    /// 这条测试锁住的是"别把 Steam 判定删掉或写反"——一旦删掉，Titanfall 2 会重新崩溃。
-    #[test]
-    fn steam_games_do_not_prime_warm_session() {
-        use crate::core::platform::{PLATFORM_EPIC, PLATFORM_STEAM};
-
-        // Steam → 不建（核心断言）
-        assert!(
-            !should_prime_for_platform(Some(PLATFORM_STEAM)),
-            "Steam 游戏绝不能建截图温会话"
-        );
-        // 大小写不同也照样预建？——平台常量恒为小写，此处显式钉住当前语义：
-        // 判定是精确比较，'Steam' 不匹配 → 照常预建。若将来要放宽需同步改 trigger_screenshot。
-        assert!(
-            should_prime_for_platform(Some("Steam")),
-            "当前口径为精确比较，非小写 steam 不在豁免之列"
-        );
-
-        // 其余平台一律照常建
-        assert!(should_prime_for_platform(Some(PLATFORM_EPIC)), "Epic 应照常预建");
-        assert!(should_prime_for_platform(Some("local")), "本地游戏应照常预建");
-        assert!(should_prime_for_platform(Some("gog")), "未知平台应照常预建");
-
-        // 查不到条目（None）不阻断预建：与既有行为一致，避免数据库异常导致截图功能静默失效
-        assert!(should_prime_for_platform(None), "查不到平台时应照常预建");
-    }
-
-    /// Steam 豁免缓存：命中后应短路（对 Steam 游戏这是唯一能挡住"每拍查 DB"的机制）。
-    ///
-    /// 注意本测试会写全局缓存，故用唯一 game_id，避免与其它测试互相污染。
-    #[test]
-    fn steam_exempt_cache_short_circuits() {
-        let id = format!("steam-exempt-test-{}", uuid::Uuid::new_v4());
-        assert!(!is_steam_exempt(&id), "未标记前不应豁免");
-        mark_steam_exempt(&id);
-        assert!(is_steam_exempt(&id), "标记后应豁免");
-        // 幂等：重复标记不报错也不改变结果
-        mark_steam_exempt(&id);
-        assert!(is_steam_exempt(&id));
-    }
 }

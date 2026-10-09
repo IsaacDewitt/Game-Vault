@@ -41,7 +41,7 @@ impl Default for LlmConfig {
 /// 不代表任何运行期语义 —— 所有字段的默认值就是 `None` / 空 vec，与 serde 缺省一致。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmGameMeta {
-    /// LLM 纠正后的完整游戏名称（与原始输入语言一致）
+    /// LLM 纠正后的完整游戏名称（**简体中文优先**：中文区官方译名；官方确实没有中文名时才保留原文）
     #[serde(default)]
     pub name: Option<String>,
     /// 游戏官方英文名称（用于 SteamGridDB 等图库检索；输入为英文时与 name 相同）
@@ -595,7 +595,7 @@ fn build_system_prompt() -> String {
      \n\
      JSON 格式如下：\n\
      {\n\
-       \"name\": \"游戏的完整正式名称（语言与用户输入一致）\",\n\
+       \"name\": \"游戏的完整正式名称，简体中文优先（中文区官方译名；官方确实没有中文名时才保留原文）\",\n\
        \"name_en\": \"官方英文名称，必须为纯英文字母（严禁中文）\",\n\
        \"description\": \"游戏的简短描述（中文，100字以内）\",\n\
        \"developer\": \"开发商名称\",\n\
@@ -625,8 +625,11 @@ fn build_system_prompt() -> String {
      }\n\
      \n\
      注意事项：\n\
-     - 如果用户输入的名称是缩写、不完整或有误，请返回该游戏最正确、最完整的正式名称，语言与用户输入保持一致\n\
+     - 如果用户输入的名称是缩写、不完整或有误，请返回该游戏最正确、最完整的正式名称\n\
      - 如果名称已经是正确的，也请返回完整的正式名称\n\
+     - **name 一律使用简体中文，取该游戏在中文区的官方译名，与用户输入的语种无关**：输入是英文原名（如 God of War）时 name 也必须给中文「战神」，不要原样回填英文；只有该游戏官方确实没有中文名（如 Black Mesa）时才保留原文\n\
+     - name 与 name_en 分工必须分清：name 是中文主名（详情页「中文名」栏、中文搜索），name_en 是官方英文原名（SteamGridDB 检索、卡片展示名），**两者不得填成同一个英文串**\n\
+     - name / name_en 语言对照：输入 God of War → name=\"战神\", name_en=\"God of War\"；输入 Hollow Knight → name=\"空洞骑士\", name_en=\"Hollow Knight\"；输入 Sekiro: Shadows Die Twice → name=\"只狼：影逝二度\", name_en=\"Sekiro: Shadows Die Twice\"\n\
      - name_en 必须是该游戏在 Steam 等平台使用的官方英文名称，且必须是**纯英文字符（ASCII 字母/数字/标点）**，严禁填写中文或其他非英文字符；无论用户输入何种语言都要提供英文名（如 name=\"空洞骑士\" 时 name_en=\"Hollow Knight\"），确实没有官方英文名时填 null\n\
      - 某项信息确实无法确定时，填 null\n\
      - genres 必须从下面的【规范类型表】中选择 1-3 个，严格照抄表内写法（{genre_list}）\n\
@@ -648,9 +651,14 @@ fn build_user_prompt(game_name: &str) -> String {
         .filter(|c| !c.is_control())
         .collect();
     // 平台限定在 user prompt 再钉一次：部分模型对 system prompt 的遵循弱于 user prompt，
-    // 尤其「主机独占名作」很容易顺口给主机版发售日期/存档路径
+    // 尤其「主机独占名作」很容易顺口给主机版发售日期/存档路径。
+    //
+    // 「name 给中文名」也在这里再钉一次（2026-10-09）：system prompt 里 name 的语种约束
+    // 曾写成「语言与用户输入一致」，被模型读成「与游戏标题语种一致」——英文标题进就回英文名，
+    // 中文名从此不再产出。中文语境下 user prompt 的约束权重更高，用一句显式指令压住。
     format!(
-        "请提供游戏《{}》的 Windows PC 版信息（发售日期与存档路径以 PC 版为准）。",
+        "请提供游戏《{}》的 Windows PC 版信息（发售日期与存档路径以 PC 版为准），\
+         name 请给该游戏在中文区的官方简体中文名。",
         sanitized.trim()
     )
 }
@@ -1016,6 +1024,32 @@ mod tests {
         // 注意事项层必须给出反向禁止与中英映射示例
         assert!(prompt.contains("严禁填写中文"));
         assert!(prompt.contains("Hollow Knight"));
+    }
+
+    /// 提示词必须把 name 的「简体中文优先」契约钉死（2026-10-09 修复）。
+    ///
+    /// 病灶：2026-10-06 那次给 name 的说明加了「（语言与用户输入一致）」，模型把它读成
+    /// 「与游戏标题语种一致」，于是英文标题进 → 英文 name 出，中文译名再也没产出过
+    /// （日志实证：10-06 之后 `Dynasty Warrior 2 RE`、`God of War` 均原样回英文）。
+    /// 本测试守住三层：模板说明、注意事项（含中英对照示例）、user prompt。
+    #[test]
+    fn test_system_prompt_pins_name_chinese_first() {
+        let prompt = build_system_prompt();
+        // 模板层（模型最看重的地方）
+        assert!(prompt.contains("简体中文优先"));
+        // 注意事项层：以中文区官方译名为准
+        assert!(prompt.contains("中文区的官方译名"));
+        // 那条把语言判断权交给「输入」的表述必须彻底消失
+        assert!(!prompt.contains("语言与用户输入一致"));
+        // 注意事项层：分工说明 + 反向对照示例
+        assert!(prompt.contains("不得填成同一个英文串"));
+        assert!(prompt.contains("name=\"战神\""));
+        assert!(prompt.contains("只狼：影逝二度"));
+
+        // user prompt 层（模型次高权重）
+        let user = build_user_prompt("God of War");
+        assert!(user.contains("简体中文名"));
+        assert!(user.contains("God of War"));
     }
 
     #[test]

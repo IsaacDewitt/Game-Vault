@@ -89,6 +89,28 @@ fn normalize_review_name(review: &mut Review) {
     }
 }
 
+/// LLM 名称语言闸门（2026-10-09，与 `games.rs::apply_llm_meta` 内的同款判据同口径）：
+/// 条目现名含中文（非 ASCII）时，**丢弃** LLM 返回的纯 ASCII `name`。
+///
+/// 病灶：LLM 面对英文原名的游戏常把官方英文名原样回填进 name，一次「刷新信息」就把
+/// 用户手上的中文名顶成英文；随后 `normalize_review_name` 见现名是 ASCII，又会把 `name_en`
+/// 补成同一个英文串 —— 详情页「中文名 / 英文名」双栏一起变英文。
+///
+/// **只在 LLM 路径调用**：`update_review_meta`（手动改名）复用的是 `apply_meta_to_review`，
+/// 把闸门塞进那里会连用户「故意把条目改成英文名」的操作一并挡掉。
+fn drop_english_name_for_chinese_entry(meta: &mut LlmGameMeta, current_name: &str) {
+    if let Some(incoming) = meta.name.as_deref() {
+        if incoming.trim().is_ascii() && !current_name.is_ascii() {
+            tracing::warn!(
+                "LLM 返回的 name 为纯 ASCII，拒绝覆盖现有中文名: {:?}（保留 {:?}）",
+                meta.name,
+                current_name
+            );
+            meta.name = None;
+        }
+    }
+}
+
 /// 将 LLM 返回的元数据合并到手账条目（只更新非空字段，保留已有数据）
 fn apply_meta_to_review(updated: &mut Review, meta: &LlmGameMeta) {
     let mut name_changed = false;
@@ -194,9 +216,12 @@ pub async fn refresh_review_info(
         };
 
         let fetcher = LlmFetcher::new().map_err(|e| format!("创建 LLM 客户端失败: {}", e))?;
-        let meta = fetcher.fetch_game_meta(&config, &review.name)
+        let mut meta = fetcher.fetch_game_meta(&config, &review.name)
             .await
             .map_err(|e| format!("LLM 获取游戏信息失败: {}", e))?;
+        // 名称语言闸门只作用于 LLM 路径（手动改名走 update_review_meta，用户说了算），
+        // 故在合入之前先把越界的 name 摘掉
+        drop_english_name_for_chinese_entry(&mut meta, &review.name);
         apply_meta_to_review(&mut review, &meta);
     }
 
@@ -630,6 +655,44 @@ mod tests {
         normalize_review_name(&mut r);
         assert_eq!(r.name, "   ");
         assert_eq!(r.name_en, None);
+    }
+
+    /// LLM 名称语言闸门（2026-10-09）：纯 ASCII 的 name 不得覆盖手账已有中文名，
+    /// 否则「刷新信息」会把中文名顶成英文，随后 normalize 再把 name_en 补成同一个英文串。
+    /// 现名是英文时不拦（英文→英文纠错、英文→中文都放行）。
+    #[test]
+    fn llm纯英文名不得覆盖手账中文名() {
+        // ① 现名中文 + LLM 回英文 → name 被摘掉
+        let mut meta = LlmGameMeta {
+            name: Some("  God of War  ".to_string()),
+            ..Default::default()
+        };
+        drop_english_name_for_chinese_entry(&mut meta, "战神");
+        assert_eq!(meta.name, None, "英文 name 必须被摘掉");
+
+        // ② 现名英文 → 不拦（修正是合法的）
+        let mut meta2 = LlmGameMeta {
+            name: Some("Gears of War: Reloaded".to_string()),
+            ..Default::default()
+        };
+        drop_english_name_for_chinese_entry(&mut meta2, "Gears of War Reloaded");
+        assert_eq!(meta2.name.as_deref(), Some("Gears of War: Reloaded"));
+
+        // ③ 中文名覆盖中文名 → 放行
+        let mut meta3 = LlmGameMeta {
+            name: Some("只狼：影逝二度".to_string()),
+            ..Default::default()
+        };
+        drop_english_name_for_chinese_entry(&mut meta3, "只狼");
+        assert_eq!(meta3.name.as_deref(), Some("只狼：影逝二度"));
+
+        // ④ name 为 null 时不动
+        let mut meta4 = LlmGameMeta {
+            name: None,
+            ..Default::default()
+        };
+        drop_english_name_for_chinese_entry(&mut meta4, "战神");
+        assert_eq!(meta4.name, None);
     }
 
     /// LLM 把中文名原样塞进 name_en 时必须拒收，且不得覆盖已有英文名（2026-10-05 修复）

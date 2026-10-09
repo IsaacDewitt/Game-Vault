@@ -652,8 +652,8 @@ pub fn run() {
 
                     // 阶段 3：前台是被追踪的游戏时，后台预建截图温会话。
                     // 有了它，连"会话里的第一张截图"也是温的（~11ms），不必先付一次建会话的 ~170ms。
-                    // 【Steam 游戏不建截图链路】传 db 进去供其判定 platform（见函数头说明）。
-                    commands::screenshots::maybe_prime_warm_session(&tracker_arc, &db_arc);
+                    // 【所有平台一视同仁（2026-10-09）】Steam / Epic / 本地不再区分，一律预建。
+                    commands::screenshots::maybe_prime_warm_session(&tracker_arc);
                 }
             });
 

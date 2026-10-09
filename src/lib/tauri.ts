@@ -566,8 +566,13 @@ export type ScreenshotOutcome =
     }
   | { outcome: "no_active_game" }
   | { outcome: "foreground_mismatch" }
-  /** Steam 游戏：本应用静默退让（Steam 自带截图，且默认热键同为 F12） */
-  | { outcome: "platform_excluded" }
+  /**
+   * 系统当前没有前台窗口（`GetForegroundWindow()` 返回空，兜底重试也未命中）。
+   *
+   * 与 `foreground_mismatch` 分列：后者是"你此刻在别的程序里"，前者是系统层面取不到
+   * 前台句柄（全屏独占切换期等瞬态），两者提示语必须能区分。
+   */
+  | { outcome: "no_foreground_window" }
   | { outcome: "failed"; message: string };
 
 /** 截图目录信息（路径 / 是否存在 / 已有截图数量 / 定位来源） */
