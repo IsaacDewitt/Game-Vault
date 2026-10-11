@@ -104,7 +104,8 @@ pub struct CaptureTarget {
 ///    覆盖 `SILENT HILL 2` 这种与标题对不上的特殊命名。存在却是空壳的视为失效（理由见函数内注释）；
 /// 2. 根目录下与任一候选名（手账英文名 → 库内题名 → exe 名 / 安装目录名）对得上、**且含图片**
 ///    的既有目录：复用其原始名字，既不新建也不改名（保留用户目录里的大小写与空格）；
-/// 3. 都没有：按第一个可用候选名（游戏标题）新建；标题全空时退回 `fallback`（会话 exe 名）。
+/// 3. 都没有：新建。**目录名优先取英文（纯 ASCII）候选**，无英文候选时才用中文题名，
+///    候选全空时退回 `fallback`（会话 exe 名）。理由见下方第 3 步注释（2026-10-11）。
 ///
 /// 比较统一走 `match_key`（只留字母数字、转小写，并**把拉丁重音折叠到 ASCII 基字母**），
 /// 与手账回填同口径，因此 `Assassin's Creed: Brotherhood` 与 `Assassin's Creed  Brotherhood`（双空格）能对上，
@@ -160,11 +161,24 @@ pub fn resolve_capture_target(
         }
     }
 
-    // 3) 新建：游戏标题优先，空则退回会话 exe 名
-    let from_title = candidates
+    // 3) 新建：**英文名优先**，全无英文名时才退回中文题名；再不行用会话 exe 名兜底
+    //
+    // 【为什么英文优先，2026-10-11 老爷拍板】截图库目录名必须是英文，否则会和用户多年积攒的
+    // 英文目录（`God of War` 569 张、`Alan Wake 2` 453 张……）割裂成两摊。旧实现直接取
+    // `candidates[0]`，而候选首位是 `name_en`、次位才是中文 `name`：`name_en` 为空的条目
+    // （LLM 未刷出官方英文名、或人工库里就只填了中文）于是**新建出中文目录**
+    // （实机：`刺客信条：大革命`、`真·三国无双3：完全版 重制版`）。
+    // 现在改为先扫全部候选里的英文（纯 ASCII）项，只有确实一个都没有时才用中文名。
+    let pick = candidates
         .iter()
         .map(|c| sanitize_component(c))
-        .find(|c| !c.is_empty() && c != "." && c != "..");
+        .filter(|c| !c.is_empty() && c != "." && c != "..")
+        .collect::<Vec<_>>();
+    let from_title = pick
+        .iter()
+        .find(|c| c.is_ascii())
+        .or_else(|| pick.first())
+        .cloned();
     match from_title {
         Some(name) => CaptureTarget {
             dir: root.join(&name),
@@ -767,5 +781,55 @@ mod tests {
         );
         assert_eq!(t.source, CaptureDirSource::ExistingDir);
         assert_eq!(t.dir, root.join("Assassin's Creed IV Black Flag (SP)"), "取图片多的那摊");
+    }
+
+    /// 新建目录时**英文名优先**（2026-10-11）：候选里只要有英文名，就用英文名建目录；
+    /// 只有全无英文名时才退回中文题名 —— 修复"截图库默认落中文目录名"。
+    #[test]
+    fn capture_target_prefers_ascii_name_for_new_dir() {
+        let (root, _g) = temp_root("langsel");
+
+        // a) 候选 [英文名, 中文名] → 建英文目录（旧实现也会如此，锁死防回退）
+        let t = resolve_capture_target(
+            &root,
+            &["God of War".to_string(), "战神".to_string()],
+            None,
+            "GoW.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::GameTitle);
+        assert_eq!(t.dir, root.join("God of War"));
+
+        // b) 候选首位是中文（手账没刷出英文名、英文名缺失）→ 命中靠后的英文候选，仍建英文目录。
+        //    旧实现取 candidates[0]，会建出 `真·三国无双3：完全版 重制版`（实机病症）。
+        let t = resolve_capture_target(
+            &root,
+            &[
+                "真·三国无双3：完全版 重制版".to_string(),
+                "DYNASTY WARRIORS 3: Complete Edition Remastered".to_string(),
+            ],
+            None,
+            "DW3CE_RE.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::GameTitle);
+        assert_eq!(
+            t.dir,
+            root.join("DYNASTY WARRIORS 3  Complete Edition Remastered"),
+            "候选里有英文名时不得用中文名建目录"
+        );
+
+        // c) 确实一个英文候选都没有 → 允许中文名（比 exe 名占位更有意义）
+        let t = resolve_capture_target(
+            &root,
+            &["心灵杀手2".to_string()],
+            None,
+            "AlanWake2.exe",
+        );
+        assert_eq!(t.source, CaptureDirSource::GameTitle);
+        assert_eq!(t.dir, root.join("心灵杀手2"));
+
+        // d) 候选全空 → 仍退回会话 exe 名
+        let t = resolve_capture_target(&root, &["".to_string()], None, "Frostpunk.exe");
+        assert_eq!(t.source, CaptureDirSource::SessionExe);
+        assert_eq!(t.dir, root.join("Frostpunk"));
     }
 }
