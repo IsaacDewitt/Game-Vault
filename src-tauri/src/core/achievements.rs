@@ -313,8 +313,26 @@ impl AchievementEngine {
             });
         }
 
-        let unlocked_count = global_unlocked.len() as u32
-            + per_game_unlocked.values().map(|m| m.len() as u32).sum::<u32>();
+        // 已解锁数（去重口径，2026-10-12 拍板）：数的是**至少解锁过一次的成就定义条目**——
+        // 每款游戏的同名成就（如各游戏各自的「破冰」）只计一次，与 total_count（展平定义
+        // 条目数）同单位，百分比恒 ≤ 100%。
+        // 为什么改：旧口径把「解锁记录条数」当分子（每款游戏各一份记录，随游戏数膨胀），
+        // 单游戏解锁攒过 72 − 全局解锁数后就会显示破百（实机 84/72 = 117%）。
+        // 只采信**仍在册**的定义：已删定义（如 G-23/G-28）留下的历史解锁行不计入。
+        let mut unlocked_def_ids: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for id in global_unlocked.keys() {
+            unlocked_def_ids.insert(id.as_str());
+        }
+        for unlocks_of_game in per_game_unlocked.values() {
+            for id in unlocks_of_game.keys() {
+                unlocked_def_ids.insert(id.as_str());
+            }
+        }
+        let unlocked_count = defs
+            .iter()
+            .filter(|d| unlocked_def_ids.contains(d.id.as_str()))
+            .count() as u32;
 
         Ok(AchievementSummary {
             global,
@@ -350,5 +368,39 @@ mod tests {
         assert_eq!(global_bases.len(), 38, "全局成就基础数应为 38");
         assert_eq!(pergame_bases.len(), 16, "单游戏成就基础数应为 16");
         assert_eq!(defs.len(), 72, "展平后成就记录总数应为 72");
+    }
+
+    /// 汇总计数去重口径（2026-10-12 拍板）：已解锁数 = 至少解锁过一次的**定义条目**数，
+    /// 每款游戏的同名成就（如各游戏各自的「破冰」）只计一次；已删定义的幽灵行不计入。
+    ///
+    /// 回归背景：旧口径按「解锁记录条数」累加（本场景旧算法 = g01_1 + g23_1 + p01_1×3 = 5），
+    /// 分子随游戏数膨胀，实机出现 84/72 = 117%；本断言把口径钉死在 2。
+    #[test]
+    fn summary_counts_unlocked_definitions_once() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+        let now = "2026-10-12T00:00:00+00:00";
+
+        // 三款游戏各自解锁「破冰」(p01_1)；再加一条全局「初来乍到」(g01_1)；
+        // 以及一条**已删定义** G-23 的历史解锁行（幽灵行）
+        for gid in ["g-a", "g-b", "g-c"] {
+            let mut game = Game::new(format!("测试游戏 {gid}"));
+            game.id = gid.to_string();
+            db.upsert_game(&game).unwrap();
+            db.try_unlock_achievement("p01_1", gid, now).unwrap();
+        }
+        db.try_unlock_achievement("g01_1", "", now).unwrap();
+        db.try_unlock_achievement("g23_1", "", now).unwrap();
+
+        let summary = AchievementEngine::get_summary(&db).unwrap();
+
+        // 分母：展平定义条目数（55 全局 + 17 单游戏），不随游戏数变化
+        assert_eq!(summary.total_count, 72, "分母应为展平定义条目数");
+        // 分子：p01_1 三份记录只计一次 + g01_1 一次 = 2；g23_1 已删定义不计
+        assert_eq!(
+            summary.unlocked_count, 2,
+            "去重口径：同名成就跨游戏只计一次，且只采信仍在册的定义"
+        );
+        // 不变量：百分比恒 ≤ 100%
+        assert!(summary.unlocked_count <= summary.total_count);
     }
 }

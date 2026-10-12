@@ -71,7 +71,9 @@ pub struct GameAchievements {
 pub struct AchievementSummary {
     pub global: Vec<GlobalAchievementStatus>,
     pub per_game: Vec<GameAchievements>,
+    /// 展平定义条目总数（55 全局 + 17 单游戏；单游戏条目**只算一份**，不乘游戏数）
     pub total_count: u32,
+    /// 已解锁条目数（去重口径：同一成就定义至少解锁过一次即计一次，与 total_count 同单位）
     pub unlocked_count: u32,
 }
 
