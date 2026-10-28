@@ -41,7 +41,41 @@ pub const PROCESS_POLL_IDLE_SECS: u64 = 10;
 /// 点查报死、全表确认却仍活着的会话（句柄打不开的受保护进程），
 /// 在此时长内不再理会点查结果，避免每拍都触发一次全表刷新。
 /// 代价是该类会话的退出检测最坏滞后这么多秒——远小于旧版固定 10 秒。
-pub const POLL_FALLBACK_COOLDOWN_SECS: u64 = 3;
+///
+/// 【2026-10-20 由 3 秒提到 10 秒】幽灵会话（游戏已退出但被残留进程顶住）期间，
+/// 该冷却会以「每 3 秒一次全表刷新 + 两行日志」的节奏持续数十分钟
+/// （实测《猛鬼追魂》一次 52 分钟刷出 2071 行）。10 秒把开销压到三分之一，
+/// 且这类会话本就处于「全表口径仍在运行」的稳态，迟几秒发现退出无实害。
+pub const POLL_FALLBACK_COOLDOWN_SECS: u64 = 10;
+
+/// 挂死观察的 CPU 采样间隔（秒）
+///
+/// 进程树还活着、但 CPU 时间完全不再增长的会话，按每分钟一次抽样足够；
+/// 采样本身要一次全表刷新（~3ms）+ 每进程一次带 CPU 的增量刷新，每分钟一次可忽略。
+pub const HANG_CPU_SAMPLE_SECS: u64 = 60;
+
+/// 挂死判定的阈值（秒）：进程树 CPU 连续这么久毫无活动**且已无可视窗口**才判「退出挂起」
+///
+/// 背景（2026-10-20）：UE5 游戏退出时常见「存档写完、窗口消失、进程却挂在关机流程里」，
+/// 进程仍在 ⇒ 时长一直计，UI 永远显示「游玩中」。真实游玩必然持续消耗 CPU，
+/// 挂死进程则恒为 0；而「最小化 / 后台挂机」虽然也可能近乎零 CPU，但窗口仍在，
+/// 由 `tracker::any_visible_window` 兜住，故两个条件必须同时成立。
+pub const HANG_CPU_IDLE_SECS: u64 = 600;
+
+/// 同树/同目录里**不是游戏本体**的伴随进程名（小写、不含扩展名、按前缀匹配）
+///
+/// 这些进程会活过游戏本体，把它们算作「游戏还在跑」正是幽灵会话的成因之一。
+/// 只放心收录「绝无可能是可玩游戏进程」的名字，宁可漏也不能误杀真游戏。
+pub const GAME_SIBLING_HELPERS: &[&str] = &[
+    // UE 的崩溃上报器（随引擎一起躺在 Engine\Binaries\Win64 下，路径前缀过滤拦不住；
+    // 前缀匹配一并覆盖 CrashReportClientEditor.exe）
+    "crashreportclient",
+    // Epic 在线服务 / 覆盖层
+    "eosoverlayrenderer",
+    "epicwebhelper",
+    // Steam 客户端自身的渲染进程
+    "steamwebhelper",
+];
 
 /// 平台游戏「待命窗口」（秒）
 ///
@@ -55,8 +89,49 @@ pub const PLATFORM_ARM_WINDOW_SECS: i64 = 300;
 
 // ==================== HTTP 超时 ====================
 
-/// 封面下载 HTTP 超时（秒）
-pub const COVER_FETCH_TIMEOUT_SECS: u64 = 30;
+/// 建连（含 TCP + TLS 握手）超时（秒）。
+///
+/// **必须与总超时分开**：2026-10-18 实测，本机到 Cloudflare 的 TLS 握手约有
+/// 21% 的概率直接卡死（TCP 通、ClientHello 无响应）。旧实现只有一个 30 秒的
+/// 总超时，一次卡死就烧掉整整 30 秒才进入下一次尝试；掐到 8 秒才能快速失败重试。
+pub const COVER_CONNECT_TIMEOUT_SECS: u64 = 8;
+
+/// SteamGridDB API **单次尝试**的总超时（秒，含建连、响应头、响应体）
+pub const COVER_FETCH_TIMEOUT_SECS: u64 = 20;
+
+/// 单次读取超时（秒）：两次收到数据之间的最长间隔。
+///
+/// 图床在"慢但不断"的状态下（实测一次成功下载耗时 41 秒）不该被总超时掐死，
+/// 但"卡住不动"要能尽快判死。两者靠这个值分开。
+pub const COVER_READ_TIMEOUT_SECS: u64 = 12;
+
+/// 封面图片下载**单次尝试**的总超时（秒）。比 API 宽松，理由见上。
+pub const COVER_DOWNLOAD_TIMEOUT_SECS: u64 = 45;
+
+/// **单次抓取的总预算（秒）**——这是"不卡死"的唯一保证。
+///
+/// 没有它的时候：3 个候选图 × 3 次重试 × 每次 25 秒 ≈ 3.5 分钟，
+/// 老爷看到的就是"点了刷新一直转圈"（2026-10-18 实测日志：13:45:27 → 13:48:54）。
+/// 预算靠**逐请求缩短超时**实现：每次发请求前把 timeout 压到
+/// `min(原超时, 剩余预算)`，因此实际总耗时不会超出这个数太多。
+pub const COVER_TOTAL_BUDGET_SECS: u64 = 40;
+
+/// 「更换封面」弹窗取列表的预算（秒）：用户正盯着弹窗，要比后台抓取更紧
+pub const COVER_OPTIONS_BUDGET_SECS: u64 = 25;
+
+/// 网络请求重试次数（含首次）。
+///
+/// 握手卡死是概率事件：单次成功率 80% 时，3 次尝试的成功率约 99.2%。
+pub const COVER_RETRY_ATTEMPTS: u32 = 3;
+
+/// 重试退避基数（毫秒）
+pub const COVER_RETRY_BACKOFF_MS: u64 = 400;
+
+/// 一次检索里最多尝试下载几张候选图（第一张失败还有后备）
+pub const COVER_DOWNLOAD_CANDIDATES: usize = 3;
+
+/// 批量抓封面时每个游戏之间的间隔（毫秒），避免撞 SteamGridDB 免费层限流
+pub const COVER_BATCH_INTERVAL_MS: u64 = 250;
 
 /// LLM 请求超时（秒）— 工具调用循环可能需要更长时间
 pub const LLM_REQUEST_TIMEOUT_SECS: u64 = 120;

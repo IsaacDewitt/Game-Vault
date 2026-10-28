@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick, h } from "vue";
+import { ref, computed, onMounted, nextTick, watch, h } from "vue";
 import {
   NInput,
   NButton,
@@ -40,6 +40,8 @@ import { useGamesStore } from "../stores/games";
 import { getScreenshotDir, openScreenshotDir, listScreenshotDirs } from "../lib/tauri";
 import type { CoverOption, ScreenshotDirInfo, ScreenshotDirOption } from "../lib/tauri";
 import { DEBOUNCE_MS } from "../lib/constants";
+import { formatPlayTime, formatDate } from "../lib/format";
+import { countChars, parseRichText, previewText } from "../lib/richText";
 import ContextMenu from "../components/ContextMenu.vue";
 import type { ContextMenuItem } from "../components/ContextMenu.vue";
 
@@ -50,24 +52,13 @@ const dialog = useDialog();
 
 // ==================== 状态与筛选 ====================
 
-const statusOptions = [
-  { label: "全部", value: "" },
-  { label: "想玩", value: "wishlist" },
-  { label: "游玩中", value: "playing" },
-  { label: "已通关", value: "completed" },
-  { label: "已弃坑", value: "abandoned" },
-];
-
-const statusMeta: Record<string, { label: string; color: string }> = {
-  wishlist: { label: "想玩", color: "#4098ff" },
-  playing: { label: "游玩中", color: "#36ad6a" },
-  completed: { label: "已通关", color: "#d4a72c" },
-  abandoned: { label: "已弃坑", color: "#8a8f98" },
-};
-
+// 手账里记录的必然都是玩过的游戏，故**没有状态分类**（2026-10-28 老爷拍板）：
+// 「想玩 / 游玩中 / 已通关 / 已弃坑」四态就此从手账彻底移除 —— 筛选、角标、
+// 详情切换一并去掉，`reviews.status` 只留库内历史值（新增默认 completed）。
 const sortOptions = [
   { label: "添加时间", value: "added_at" },
   { label: "评分", value: "rating" },
+  { label: "游玩时长", value: "play_time" },
   { label: "最近更新", value: "updated_at" },
   { label: "名称", value: "name" },
 ];
@@ -75,13 +66,6 @@ const sortOptions = [
 const sortOrderOptions = [
   { label: "降序", value: "desc" },
   { label: "升序", value: "asc" },
-];
-
-const statusButtonOptions = [
-  { label: "想玩", value: "wishlist" },
-  { label: "游玩中", value: "playing" },
-  { label: "已通关", value: "completed" },
-  { label: "已弃坑", value: "abandoned" },
 ];
 
 // 类型筛选选项（从已有条目动态收集）
@@ -156,7 +140,161 @@ const editingName = ref("");
 const editingNameEn = ref("");
 const ratingInput = ref<number | null>(null);
 const reviewText = ref("");
-const savingReview = ref(false);
+
+// ==================== 评价：阅读 / 编辑双态 ====================
+//
+// 口径（2026-10-24）：写成长文后，5 行高的文本框里扒拉太难受，故默认**阅读态**：
+// 按段落渲染（空行分段、`- ` 列表、`**加粗**`，见 `lib/richText.ts`），超 8 行折叠；
+// 点「编辑」才切回输入框。两点刻意为之：
+// - 点正文**不进**编辑态——读的时候手一抖就变输入框，比多按一次按钮更烦；
+// - 退出编辑只认「完成」与 Ctrl/Cmd+Enter，**不用 Esc**——中文输入法里 Esc 是
+//   取消候选词，绑上去必然误伤。
+const reviewEditing = ref(false);
+const reviewExpanded = ref(false);
+const reviewInputRef = ref<InstanceType<typeof NInput> | null>(null);
+
+/** 折叠阈值：8 行或 260 字，任一超出即折叠（纯行数判不出长句，纯字数判不出短行列表） */
+const REVIEW_COLLAPSE_LINES = 8;
+const REVIEW_COLLAPSE_CHARS = 260;
+/** 对象字面量要提到外面：写在模板里每次渲染都是新引用，会让 n-input 重算高度 */
+const REVIEW_AUTOSIZE = { minRows: 4, maxRows: 14 };
+
+const reviewBlocks = computed(() => parseRichText(reviewText.value));
+const reviewCharCount = computed(() => countChars(reviewText.value));
+const reviewShouldCollapse = computed(() => {
+  if (!reviewText.value.trim()) return false;
+  return (
+    reviewCharCount.value > REVIEW_COLLAPSE_CHARS ||
+    reviewText.value.split("\n").length > REVIEW_COLLAPSE_LINES
+  );
+});
+
+/** 进入编辑态：预填当前文本并把焦点交给输入框 */
+function startReviewEdit() {
+  reviewEditing.value = true;
+  nextTick(() => reviewInputRef.value?.focus());
+}
+
+/**
+ * 退出编辑态。
+ *
+ * 先在本地收刀，再等落库；**保存失败则退回编辑态**，否则错误提示会跟着
+ * 编辑框一起消失，用户只会以为写进去了。
+ */
+async function finishReviewEdit() {
+  reviewEditing.value = false;
+  const ok = await saveReviewNow();
+  if (!ok) reviewEditing.value = true;
+}
+
+// ==================== 评价自动保存 ====================
+//
+// 口径（2026-10-17）：
+// - 停手 AUTOSAVE_IDLE_MS 后自动落库，不弹成功提示（否则每段话都弹一次，吵）；
+// - 切换条目 / 关闭抽屉时**立即 flush**，不能等防抖——否则旧条目的编辑会被新条目覆盖；
+// - 无变化不写库（`text === savedText`），避免打开条目就产生一次无谓 UPDATE
+//   （它会推进 updated_at，让「最近更新」排序凭空跳动）；
+// - 失败时保留本地文本并露出重试入口，不静默吞掉。
+const AUTOSAVE_IDLE_MS = 1000;
+
+type ReviewSaveState = "idle" | "pending" | "saving" | "saved" | "error";
+
+/** 当前正在编辑的条目 id（比 selected 可靠：关闭抽屉后 selected 会先被清空） */
+let editingReviewId: string | null = null;
+/** 详情打开的请求序号：快速连点两个条目时，先发起的那次作废（避免状态串台） */
+let detailOpenSeq = 0;
+/** 已成功落库的文本，用于跳过无变化保存 */
+let savedText = "";
+
+const reviewSaveState = ref<ReviewSaveState>("idle");
+const reviewSavedAt = ref<Date | null>(null);
+const reviewSaveError = ref<string | null>(null);
+
+/** 「已保存 · HH:mm」的时间部分 */
+const reviewSavedAtText = computed(() => {
+  const d = reviewSavedAt.value;
+  if (!d) return "";
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+});
+
+/** 正在飞的那一次写库；并发调用方直接复用它，避免连点触发两次 UPDATE */
+let savingPromise: Promise<boolean> | null = null;
+
+/** 立即把当前文本落库；返回是否成功（无变化也算成功） */
+function saveReviewNow(): Promise<boolean> {
+  if (savingPromise) return savingPromise;
+  savingPromise = doSaveReview().finally(() => {
+    savingPromise = null;
+  });
+  return savingPromise;
+}
+
+async function doSaveReview(): Promise<boolean> {
+  const id = editingReviewId;
+  if (!id) return true;
+
+  const text = reviewText.value;
+  if (text === savedText) {
+    // 无变化：把「待保存」的指示收回，回到「修改后自动保存」。
+    // 不覆盖错误态——那个要用户手动重试，不能被一次空跑抹掉。
+    if (reviewSaveState.value === "pending") reviewSaveState.value = "idle";
+    return true;
+  }
+
+  reviewSaveState.value = "saving";
+  try {
+    await store.setReview(id, text);
+    savedText = text;
+    // 保存期间可能已切到别的条目：只在仍是同一条目时更新可见状态
+    if (editingReviewId === id) {
+      reviewSaveState.value = "saved";
+      reviewSavedAt.value = new Date();
+      reviewSaveError.value = null;
+    }
+    return true;
+  } catch (e) {
+    if (editingReviewId === id) {
+      reviewSaveState.value = "error";
+      reviewSaveError.value = e instanceof Error ? e.message : String(e);
+    }
+    return false;
+  }
+}
+
+const debouncedSaveReview = useDebounceFn(() => {
+  void saveReviewNow();
+}, AUTOSAVE_IDLE_MS);
+
+watch(reviewText, () => {
+  if (!editingReviewId) return;
+  if (reviewText.value === savedText) return;
+  // 正在写库时不要退回「待保存」，否则状态会在 saving 与 pending 之间闪
+  if (reviewSaveState.value !== "saving") reviewSaveState.value = "pending";
+  debouncedSaveReview();
+});
+
+/** 关闭抽屉（点 X / 点遮罩都会走到这里，故清理由 watch(showDetail) 统一做） */
+function closeDetail() {
+  showDetail.value = false;
+}
+
+watch(showDetail, (open) => {
+  if (open) return;
+  // 关闭前把手上的文本冲掉，再清选中态。
+  // 用 detailOpenSeq 做守卫：写库是异步的，若这段时间用户又点开了别的条目，
+  // 本次清理必须让位——否则会把新条目刚设好的 editingReviewId / selected 清掉。
+  const seq = detailOpenSeq;
+  const closingId = editingReviewId;
+  void saveReviewNow().finally(() => {
+    if (detailOpenSeq !== seq) return;
+    store.clearSelection();
+    if (editingReviewId === closingId) editingReviewId = null;
+    reviewSaveState.value = "idle";
+    // 双态与展开状态跟着条目走：下次打开任何条目都从阅读态、未展开开始
+    reviewEditing.value = false;
+    reviewExpanded.value = false;
+  });
+});
 
 // ==================== 元数据卡片内「点击改名」（中文名 / 英文名） ====================
 // 就地编辑：点一下值 → 变输入框 → 失焦/回车提交，Esc 取消。
@@ -228,12 +366,35 @@ const selectedNameIsAscii = computed(() => {
   return name.length > 0 && /^[\x20-\x7E]+$/.test(name);
 });
 
-function openDetail(review: (typeof store.reviews)[number]) {
+async function openDetail(review: (typeof store.reviews)[number]) {
+  const seq = ++detailOpenSeq;
+
+  // 切条目先把上一条的未落库评价冲掉：防抖队列里那次保存是按
+  // editingReviewId 取的，若先把它改成新条目，旧内容就再也写不回去了。
+  if (editingReviewId && editingReviewId !== review.id) {
+    await saveReviewNow();
+  }
+
+  // 等待写库期间用户可能又点了别的条目——本次让位，否则会用旧条目的
+  // 数据覆盖新条目刚设好的 editingReviewId / reviewText。
+  if (seq !== detailOpenSeq) return;
+
+  editingReviewId = review.id;
+  savedText = review.review ?? "";
+  // 刚打开时显示「修改后自动保存」即可；不冒充一次「已保存」，
+  // 否则会有「已保存」却没有时间戳的怪状态（那条内容本来就在库里）。
+  reviewSaveState.value = "idle";
+  reviewSavedAt.value = null;
+  reviewSaveError.value = null;
+
   store.selectReview(review);
   editingName.value = review.name;
   editingNameEn.value = review.name_en ?? "";
   ratingInput.value = review.rating;
-  reviewText.value = review.review ?? "";
+  reviewText.value = savedText;
+  // 换条目一律回到阅读态、收起长文：沿用上一条的展开状态会让人以为换了一篇
+  reviewEditing.value = false;
+  reviewExpanded.value = false;
   loadScreenshotInfo(review.id);
   showDetail.value = true;
 }
@@ -333,11 +494,6 @@ async function saveDirPicker() {
   }
 }
 
-function closeDetail() {
-  showDetail.value = false;
-  store.clearSelection();
-}
-
 function coverOf(review: (typeof store.reviews)[number]): string | null {
   return store.coverSrc(review);
 }
@@ -355,20 +511,6 @@ async function handleSetRating(value: number | null) {
     message.success(value == null ? "已清除评分" : `已评分 ${value} 分`);
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e));
-  }
-}
-
-/** 保存评价 */
-async function saveReviewText() {
-  if (!selected.value || savingReview.value) return;
-  savingReview.value = true;
-  try {
-    await store.setReview(selected.value.id, reviewText.value);
-    message.success("评价已保存");
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e));
-  } finally {
-    savingReview.value = false;
   }
 }
 
@@ -402,16 +544,6 @@ async function saveNameEn() {
   }
 }
 
-/** 状态切换 */
-async function handleSetStatus(status: string) {
-  if (!selected.value) return;
-  try {
-    await store.setStatus(selected.value.id, status);
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e));
-  }
-}
-
 /** 刷新信息（LLM + 封面） */
 async function handleRefreshInfo(review: (typeof store.reviews)[number]) {
   try {
@@ -428,6 +560,9 @@ function confirmDelete(review: (typeof store.reviews)[number]) {
 
   const doDelete = async (keepCover: boolean) => {
     try {
+      // 条目即将消失：断开自动保存的归属，避免关闭抽屉时又
+      // 对着一个已删除的 id 发起 UPDATE（会以「条目不存在」失败告终）
+      editingReviewId = null;
       await store.removeReview(review.id, keepCover);
       showDetail.value = false;
       message.success(keepCover ? "已删除，封面图片已留档" : "已删除");
@@ -574,6 +709,13 @@ function formatHltb(minutes: number | null): string {
   return m > 0 ? `${h}h ${m}m` : `${h}h`;
 }
 
+// ==================== 我的游玩时长（按名匹配游戏库，含已删游戏历史） ====================
+
+/** 选中条目的游玩时长（无匹配/无历史为 undefined，整栏不渲染） */
+const selectedPlayTime = computed(() =>
+  selected.value ? store.playTimes[selected.value.id] : undefined
+);
+
 // ==================== 初始化 ====================
 
 onMounted(async () => {
@@ -601,12 +743,6 @@ onMounted(async () => {
             <n-icon :component="SearchOutline" />
           </template>
         </n-input>
-        <n-select
-          v-model:value="store.statusFilter"
-          class="filter-select"
-          :options="statusOptions"
-          placeholder="状态"
-        />
         <n-select
           v-model:value="store.genreFilter"
           class="filter-select"
@@ -670,16 +806,12 @@ onMounted(async () => {
                   </n-icon>
                   {{ review.rating }}
                 </div>
-                <!-- 状态角标 -->
-                <div
-                  v-if="review.status"
-                  class="status-corner"
-                  :style="{ backgroundColor: statusMeta[review.status]?.color }"
-                >
-                  {{ statusMeta[review.status]?.label }}
-                </div>
               </div>
               <div class="card-name" :title="displayName(review)">{{ displayName(review) }}</div>
+              <!-- 评价摘要：长文在墙上也留个抓手（Markdown 记号会被抹平，只求一眼看懂） -->
+              <div v-if="review.review && review.review.trim()" class="card-summary">
+                {{ previewText(review.review, 56) }}
+              </div>
             </div>
           </div>
         </template>
@@ -798,17 +930,6 @@ onMounted(async () => {
               </div>
             </div>
           </div>
-          <n-button-group class="status-segmented">
-            <n-button
-              v-for="opt in statusButtonOptions"
-              :key="opt.value"
-              size="small"
-              :type="selected.status === opt.value ? 'primary' : 'default'"
-              @click="handleSetStatus(opt.value)"
-            >
-              {{ opt.label }}
-            </n-button>
-          </n-button-group>
 
           <!-- 元数据 -->
           <n-grid
@@ -882,6 +1003,15 @@ onMounted(async () => {
               <div class="meta-label">发售日期</div>
               <div class="meta-value">{{ selected.release_date }}</div>
             </n-gi>
+            <n-gi v-if="selectedPlayTime">
+              <div class="meta-label">我的游玩时长</div>
+              <div class="meta-value">
+                {{ formatPlayTime(selectedPlayTime.play_time_seconds) }}
+                <template v-if="selectedPlayTime.last_played">
+                  <span class="last-played"> · 最近游玩 {{ formatDate(selectedPlayTime.last_played) }}</span>
+                </template>
+              </div>
+            </n-gi>
             <n-gi v-if="selected.hltb_main_story || selected.hltb_main_extra || selected.hltb_completionist">
               <div class="meta-label">通关时长参考</div>
               <div class="meta-value">
@@ -937,20 +1067,98 @@ onMounted(async () => {
             </div>
           </div>
 
-          <!-- 评价 -->
+          <!-- 评价：默认阅读态，点「编辑」才切输入框 -->
           <div class="detail-section">
-            <div class="section-title">我的评价</div>
-            <n-input
-              v-model:value="reviewText"
-              type="textarea"
-              :rows="5"
-              placeholder="写下你对这款游戏的评价…"
-            />
-            <div class="review-save-row">
-              <n-button size="small" type="primary" :loading="savingReview" @click="saveReviewText">
-                保存评价
-              </n-button>
+            <div class="section-title">
+              我的评价
+              <div v-if="!reviewEditing" class="section-title-right">
+                <span v-if="reviewCharCount > 0" class="section-count">{{ reviewCharCount }} 字</span>
+                <!-- 阅读态看不到下面的保存状态行，落库回执挪到标题右，免得「点完成到底存没存」靠猜 -->
+                <span
+                  v-if="reviewSaveState === 'saved' && reviewSavedAtText"
+                  class="section-count saved"
+                >
+                  已保存 · {{ reviewSavedAtText }}
+                </span>
+                <n-button text size="tiny" type="primary" @click="startReviewEdit">
+                  <template #icon>
+                    <n-icon :component="CreateOutline" />
+                  </template>
+                  编辑
+                </n-button>
+              </div>
             </div>
+
+            <template v-if="!reviewEditing">
+              <!-- 空评价：给个顺手的入口，而不是一个空文本框 -->
+              <button v-if="reviewBlocks.length === 0" class="review-empty" @click="startReviewEdit">
+                还没写评价，点此开始写
+              </button>
+              <template v-else>
+                <div
+                  class="review-body"
+                  :class="{ 'review-body--collapsed': reviewShouldCollapse && !reviewExpanded }"
+                >
+                  <template v-for="(block, bi) in reviewBlocks" :key="bi">
+                    <ul v-if="block.type === 'list'" class="review-list">
+                      <li v-for="(item, ii) in block.items" :key="ii">
+                        <template v-for="(seg, si) in item" :key="si">
+                          <strong v-if="seg.bold">{{ seg.text }}</strong>
+                          <span v-else>{{ seg.text }}</span>
+                        </template>
+                      </li>
+                    </ul>
+                    <p v-else class="review-para">
+                      <template v-for="(seg, si) in block.inlines" :key="si">
+                        <strong v-if="seg.bold">{{ seg.text }}</strong>
+                        <span v-else>{{ seg.text }}</span>
+                      </template>
+                    </p>
+                  </template>
+                </div>
+                <button
+                  v-if="reviewShouldCollapse"
+                  class="review-toggle"
+                  @click="reviewExpanded = !reviewExpanded"
+                >
+                  {{ reviewExpanded ? "收起" : "展开全文" }}
+                </button>
+              </template>
+            </template>
+
+            <template v-else>
+              <n-input
+                ref="reviewInputRef"
+                v-model:value="reviewText"
+                type="textarea"
+                :autosize="REVIEW_AUTOSIZE"
+                placeholder="写下你对这款游戏的评价…（空行分段、行首 - 列表、**加粗**）"
+                @keydown.ctrl.enter.prevent="finishReviewEdit"
+                @keydown.meta.enter.prevent="finishReviewEdit"
+              />
+              <div class="review-save-row">
+                <span class="save-hint muted">{{ reviewCharCount }} 字</span>
+                <div class="review-save-status">
+                  <span
+                    v-if="reviewSaveState === 'error'"
+                    class="save-hint error"
+                    :title="reviewSaveError ?? ''"
+                  >
+                    保存失败
+                    <n-button text size="tiny" type="primary" @click="saveReviewNow()">
+                      重试
+                    </n-button>
+                  </span>
+                  <span v-else-if="reviewSaveState === 'saving'" class="save-hint">保存中…</span>
+                  <span v-else-if="reviewSaveState === 'pending'" class="save-hint">待保存…</span>
+                  <span v-else-if="reviewSaveState === 'saved'" class="save-hint saved">
+                    已保存<template v-if="reviewSavedAtText"> · {{ reviewSavedAtText }}</template>
+                  </span>
+                  <span v-else class="save-hint muted">修改后自动保存</span>
+                  <n-button size="tiny" type="primary" @click="finishReviewEdit">完成</n-button>
+                </div>
+              </div>
+            </template>
           </div>
 
           <!-- 截图库 -->
@@ -1219,17 +1427,6 @@ onMounted(async () => {
   font-weight: 700;
 }
 
-.status-corner {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  color: #fff;
-  font-size: 11px;
-  font-weight: 600;
-}
-
 .card-name {
   margin-top: 6px;
   font-size: 13px;
@@ -1242,6 +1439,22 @@ onMounted(async () => {
 
 .empty-state {
   margin-top: 80px;
+}
+
+/* 评价摘要：固定 2 行，无评价不渲染，让卡片高度差得最少 */
+.card-summary {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.45;
+  text-align: center;
+  color: var(--text-color, rgba(255, 255, 255, 0.85));
+  opacity: 0.5;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  word-break: break-word;
 }
 
 /* ==================== 添加弹窗 ==================== */
@@ -1322,11 +1535,6 @@ onMounted(async () => {
   font-style: italic;
 }
 
-.status-segmented {
-  width: 100%;
-  margin-bottom: 16px;
-}
-
 .detail-meta {
   margin-bottom: 16px;
   padding: 12px;
@@ -1342,6 +1550,12 @@ onMounted(async () => {
 
 .meta-value {
   font-size: 13px;
+}
+
+/* 「最近游玩」日期跟在时长后面，弱化一档不抢主值 */
+.last-played {
+  font-size: 12px;
+  opacity: 0.65;
 }
 
 /* 可就地编辑的元数据值（中文名 / 英文名）：悬停浮现笔形图标，点击进入编辑态。
@@ -1460,10 +1674,139 @@ onMounted(async () => {
   font-weight: 700;
 }
 
+/* ==================== 评价：阅读态 ==================== */
+.section-title-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 400;
+}
+
+.section-count {
+  font-size: 12px;
+  opacity: 0.45;
+}
+
+.section-count.saved {
+  color: #36ad6a;
+  opacity: 1;
+}
+
+.review-body {
+  font-size: 13px;
+  line-height: 1.75;
+  /* 跟随 naive-ui 抽屉文字色，亮暗主题都不用改 */
+  color: inherit;
+  word-break: break-word;
+}
+
+/* 折叠：8 行高度（13px × 1.75 ≈ 22.75px）后渐隐，按钮把选择权交回用户 */
+.review-body--collapsed {
+  max-height: 182px;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 62%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 62%, transparent 100%);
+}
+
+.review-para {
+  margin: 0 0 10px;
+  /* 段内单换行原样保留，不必往 DOM 里插 <br> */
+  white-space: pre-wrap;
+}
+
+.review-para:last-child {
+  margin-bottom: 0;
+}
+
+.review-list {
+  margin: 0 0 10px;
+  padding-left: 18px;
+}
+
+.review-list:last-child {
+  margin-bottom: 0;
+}
+
+.review-list li {
+  white-space: pre-wrap;
+  margin-bottom: 2px;
+}
+
+.review-list li::marker {
+  color: var(--accent-color, #6366f1);
+}
+
+.review-body strong {
+  font-weight: 600;
+}
+
+.review-toggle,
+.review-empty {
+  border: none;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.review-toggle {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--accent-color, #6366f1);
+}
+
+.review-toggle:hover {
+  text-decoration: underline;
+}
+
+.review-empty {
+  font-size: 13px;
+  line-height: 1.6;
+  opacity: 0.5;
+  text-align: left;
+}
+
+.review-empty:hover {
+  opacity: 0.8;
+}
+
+/* ==================== 评价：编辑态 ==================== */
 .review-save-row {
   margin-top: 8px;
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  /* 固定高度：状态文字在「待保存 / 保存中 / 已保存」之间切换时不抖动 */
+  min-height: 24px;
+}
+
+.review-save-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.save-hint {
+  font-size: 12px;
+  color: #8a8f98;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.save-hint.saved {
+  color: #36ad6a;
+}
+
+.save-hint.error {
+  color: #e88080;
+}
+
+.save-hint.muted {
+  opacity: 0.55;
 }
 
 /* ==================== 截图库 ==================== */

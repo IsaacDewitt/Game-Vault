@@ -123,16 +123,19 @@ pub struct CoverOption {
     pub style: String,
 }
 
-/// 游戏筛选条件
+/// 游戏列表的排序条件。
+///
+/// **筛选不在这里做**。搜索 / 状态 / 类型三个维度的事实口径归前端
+/// `src/lib/gameFilter.ts` 独家所有（内存筛选：切换即时、不走 IPC、
+/// 与手账 `filteredReviews` 同一套写法）。
+///
+/// 这里原先还有 `search` / `favorites_only` / `status` / `genre` 四个字段，
+/// 但除测试外**没有任何调用方传过**（前端只传排序，其余八处调用全是
+/// `GameFilter::default()`），留着只会让后来者误以为后端也参与筛选，
+/// 进而把口径分裂成两套。2026-10-17 删除。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GameFilter {
-    pub search: Option<String>,
-    pub favorites_only: bool,
-    /// 按状态筛选: "unplayed", "playing", "completed", "abandoned"
-    pub status: Option<String>,
-    /// 按类型标签筛选（模糊匹配 genres JSON 字段）
-    pub genre: Option<String>,
     pub sort_by: String,       // "name", "last_played", "play_time", "added_at"
     pub sort_order: String,    // "asc" or "desc"
 }
@@ -140,10 +143,6 @@ pub struct GameFilter {
 impl Default for GameFilter {
     fn default() -> Self {
         Self {
-            search: None,
-            favorites_only: false,
-            status: None,
-            genre: None,
             sort_by: "last_played".to_string(),
             sort_order: "desc".to_string(),
         }

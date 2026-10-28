@@ -4,6 +4,7 @@ use reqwest::Client;
 use crate::models::*;
 use crate::models::CoverOption;
 use crate::utils::constants::*;
+use crate::utils::net::{budget_timeout, fetch_bytes_with_retry};
 
 /// 封面图获取器（异步版本）
 pub struct CoverFetcher {
@@ -33,7 +34,17 @@ fn pick_search_term<'a>(name: &'a str, name_en: Option<&'a str>) -> &'a str {
 }
 
 /// SteamGridDB 图源域名白名单（子域一并放行）
-const TRUSTED_COVER_HOSTS: &[&str] = &["steamgriddb.com"];
+///
+/// `steamstatic.com` 是 Valve 官方图床（走 Akamai 边缘）。把它纳入白名单是
+/// 2026-10-18 那轮改动的一部分：Steam 游戏的封面优先从官方图床按 appid 直取，
+/// 彻底绕开 SteamGridDB 所在的 Cloudflare 链路 —— 实测官方图床 5/5 连通、
+/// 单张 0.8 秒，而 Cloudflare 那条路有约 20% 的 TLS 握手卡死。
+/// 这里的 URL 全部由 `steam_library_cover_url` 用**纯数字 appid** 拼出，
+/// 不接受外部输入，故放行无 SSRF 风险。
+const TRUSTED_COVER_HOSTS: &[&str] = &["steamgriddb.com", "steamstatic.com"];
+
+/// Steam 官方图床主机（Akamai 边缘，2026-10-18 实测 5/5 连通、TLS 握手 ~450ms）
+const STEAM_CDN_HOST: &str = "cdn.cloudflare.steamstatic.com";
 
 /// URL 是否落在受信任的图源域名下（含子域，大小写不敏感）
 fn is_trusted_cover_host(url: &reqwest::Url) -> bool {
@@ -45,6 +56,143 @@ fn is_trusted_cover_host(url: &reqwest::Url) -> bool {
                 .any(|t| h == *t || h.ends_with(&format!(".{t}")))
         })
         .unwrap_or(false)
+}
+
+/// 由 Steam appid 拼出官方竖版库封面地址（600×900，比例与网格卡一致）。
+///
+/// 只接受**纯数字** appid：这个值会拼进 URL 路径，放行任何非数字字符
+/// 都等于把路径控制权交给数据源。超过 12 位也拒绝（Steam appid 是 u32）。
+fn steam_library_cover_url(appid: &str) -> Option<String> {
+    let appid = appid.trim();
+    if appid.is_empty() || appid.len() > 12 || !appid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!(
+        "https://{STEAM_CDN_HOST}/steam/apps/{appid}/library_600x900.jpg"
+    ))
+}
+
+/// 该游戏能否走 Steam 官方图床
+///
+/// 两条来源：
+/// - Steam 平台条目：直接用 `platform_id`（就是 appid）；
+/// - 本地/repack 条目：从安装目录的 appid 线索文件反查（见 `detect_local_steam_appid`）。
+///
+/// 后者是 2026-10-18 加的：老爷库里 32 个本地条目有 12 个带 `steam_emu.ini` /
+/// `steam_appid.txt`，值都是真 appid（对马岛 2215430、战神诸神黄昏 2322010…）。
+/// 认出来就能走 Akamai 官方图床，一次 SGDB 都不用打。
+pub(crate) fn steam_cover_url_for(game: &Game) -> Option<String> {
+    if game.platform.eq_ignore_ascii_case("steam") {
+        return steam_library_cover_url(game.platform_id.as_deref()?);
+    }
+    let install_path = game.install_path.as_deref()?;
+    steam_library_cover_url(&detect_local_steam_appid(install_path)?)
+}
+
+/// 可能藏着 appid 的文件名（按可信度排序，先找到先用）
+const APPID_HINT_FILES: &[&str] = &[
+    "steam_appid.txt",
+    // Goldberg 新版布局把配置收进 steam_settings/ 子目录：
+    // 老爷的《使命召唤：现代战争》appid=2000950 就只在这里，根目录没有
+    "steam_settings/steam_appid.txt",
+    "steam_emu.ini",
+    "codex.ini",
+    "flt.ini",
+    "coldclientloader.ini",
+];
+
+/// Spacewar：各类模拟器模板的默认占位 appid。认它会给出**错误**封面
+/// （满库游戏都变成同一张测试图），比认不出来更糟。
+const PLACEHOLDER_APPID: u32 = 480;
+
+/// 从安装目录反查 Steam appid（本地/repack 条目专用）
+fn detect_local_steam_appid(install_path: &str) -> Option<String> {
+    let dir = Path::new(install_path);
+    if !dir.is_dir() {
+        return None;
+    }
+    for name in APPID_HINT_FILES {
+        let path = dir.join(name);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        // 只读小文件：这类 ini 都是几百字节，遇到异常大文件直接跳过
+        if !meta.is_file() || meta.len() > 64 * 1024 {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+
+        let found = if name.to_ascii_lowercase().ends_with(".txt") {
+            // 这类 .txt 的唯一用途就是放一个裸 appid
+            parse_appid(text.lines().next().unwrap_or(""))
+        } else {
+            // ini 形式：找 `AppId = <数字>`（大小写不敏感）
+            text.lines().find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                if key.trim().eq_ignore_ascii_case("appid") {
+                    parse_appid(value.trim())
+                } else {
+                    None
+                }
+            })
+        };
+
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// 校验并规范化一个 appid：纯数字、非 0、非占位值
+fn parse_appid(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > 10 || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u32 = raw.parse().ok()?;
+    if n == 0 || n == PLACEHOLDER_APPID {
+        return None;
+    }
+    Some(n.to_string())
+}
+
+/// 一次 SteamGridDB 检索的结果。
+///
+/// 刻意不是 `Option`：旧实现把「网络失败」「限流」「没收录」全部揉成一个
+/// `Ok(None)`，上层只能统一报「游戏名可能不在 SteamGridDB 中」——
+/// 把网络故障说成"库里没有"，是排查时最大的误导（2026-10-18 老爷报
+/// 「拉图片老有问题」时，日志里只留下这一句，真正的原因一个字节都没留下）。
+enum SgdbSearch {
+    /// 命中：按优先级排好的候选图片 URL（最多 `COVER_DOWNLOAD_CANDIDATES` 个）
+    Hit(Vec<String>),
+    /// 确定未收录（搜索或 grids 返回空数组）
+    NotFound,
+    /// 失败。`fatal` 表示换检索词也没用（API Key 无效）
+    Failed { reason: String, fatal: bool },
+}
+
+/// 传输层失败的标记包装。
+///
+/// `download_image` 靠它区分「值得重试」（建连失败、读体断流）与
+/// 「重试也没用」（404、非图片、超限、写盘失败）。用标记类型而非错误字符串
+/// 判断，是因为文案随时会改，而类型不会说谎。
+#[derive(Debug)]
+struct TransportFailure(anyhow::Error);
+
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for TransportFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
 }
 
 /// 为目标文件生成一个**唯一命名**的同目录临时路径。
@@ -66,10 +214,32 @@ impl CoverFetcher {
         // 确保缓存目录存在
         std::fs::create_dir_all(&cache_dir).ok();
 
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(COVER_FETCH_TIMEOUT_SECS))
-            .build()
-            .context("无法创建 HTTP 客户端")?;
+        // 系统代理：reqwest 只认环境变量，不认 WinINET —— Clash 开着系统代理时
+        // 本应用却仍在直连那条被干扰的链路（2026-10-18 实测确认）。这里补上。
+        // `system_proxy_url` 已确认「开关为 1 且端口真能连上」，否则返回 None。
+        let proxy = crate::utils::net::system_proxy_url();
+        if let Some(ref p) = proxy {
+            tracing::info!("封面抓取走系统代理: {p}");
+        }
+        let proxy_of = || -> Option<reqwest::Proxy> {
+            let p = proxy.as_ref()?;
+            match reqwest::Proxy::all(p) {
+                Ok(px) => Some(px),
+                Err(e) => {
+                    tracing::warn!("系统代理地址不可用（{p}）: {e}，改用直连");
+                    None
+                }
+            }
+        };
+
+        let mut api_builder = Client::builder()
+            // 三个超时各管一段，缺一不可（2026-10-18）：
+            //   connect_timeout 管 TCP+TLS 握手卡死 —— 快速失败才能尽快重试；
+            //   read_timeout    管"两次收数据之间"的最长停顿 —— 慢但不断的响应不被误杀；
+            //   timeout         管整次请求的兜底上限。
+            .connect_timeout(std::time::Duration::from_secs(COVER_CONNECT_TIMEOUT_SECS))
+            .read_timeout(std::time::Duration::from_secs(COVER_READ_TIMEOUT_SECS))
+            .timeout(std::time::Duration::from_secs(COVER_FETCH_TIMEOUT_SECS));
 
         // 下载客户端单独一份。图源 URL 有两个来源：SteamGridDB 的**第三方响应**，
         // 以及用户在设置页**手动粘贴**的地址 —— 都不是本应用能控制的内容。
@@ -77,9 +247,19 @@ impl CoverFetcher {
         // 内网/本机端点，就是一次 SSRF。这里收紧到 3 跳（正常图床 0~1 跳），
         // 并配合 `download_image` 的 scheme 校验、域名白名单与体积上限三层防线。
         // API 客户端保持默认策略：SteamGridDB 的 API 端点可能合法依赖重定向。
-        let download_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(COVER_FETCH_TIMEOUT_SECS))
-            .redirect(reqwest::redirect::Policy::limited(3))
+        let mut dl_builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(COVER_CONNECT_TIMEOUT_SECS))
+            .read_timeout(std::time::Duration::from_secs(COVER_READ_TIMEOUT_SECS))
+            .timeout(std::time::Duration::from_secs(COVER_DOWNLOAD_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::limited(3));
+
+        if let Some(px) = proxy_of() {
+            api_builder = api_builder.proxy(px.clone());
+            dl_builder = dl_builder.proxy(px);
+        }
+
+        let client = api_builder.build().context("无法创建 HTTP 客户端")?;
+        let download_client = dl_builder
             .build()
             .context("无法创建图片下载 HTTP 客户端")?;
 
@@ -93,6 +273,11 @@ impl CoverFetcher {
 
     /// 获取游戏封面（异步）
     pub async fn fetch_cover(&self, game: &Game) -> Result<Option<String>> {
+        // 整次抓取的硬预算：所有请求的 timeout 都会被压到「剩余预算」以内，
+        // 保证不会出现"点了刷新一直转圈"（2026-10-18 实测 3.5 分钟那次）。
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(COVER_TOTAL_BUDGET_SECS);
+
         // 1. 检查缓存（需要验证文件有效性，兼容 jpg/png/webp 扩展名）
         if let Some(cache_path) = self.find_cached_cover(&game.id) {
             return Ok(Some(cache_path.to_string_lossy().to_string()));
@@ -116,81 +301,128 @@ impl CoverFetcher {
             }
         }
 
-        // 3. 尝试 SteamGridDB（优先官方英文名，其次游戏名，最后文件夹名）
-        if !self.steamgriddb_api_key.is_empty() {
+        // 3. Steam 官方图床（按 appid 精确直取，无需 API Key）
+        //
+        //    这是 2026-10-18 "治本"改动的核心：本机到 SteamGridDB 所在的
+        //    Cloudflare 边缘有约 20% 的 TLS 握手卡死，而 Valve 官方图床走
+        //    Akamai（实测 15 个 Steam 条目命中 14 个、每张 600~800ms）。
+        //    能绕开那条烂路就绕开 —— 顺带还消灭了"autocomplete 取第一条搜错游戏"
+        //    这个老问题（appid 是精确标识，不会认错）。
+        //    注：老爷库里 Steam 条目约 28%（15/53），其余 local/Epic 仍要走 SGDB，
+        //    故这条是分流，不是万能药。
+        if let Some(url) = steam_cover_url_for(game) {
             let cache_path = self.get_cache_path(&game.id);
-            // 首选检索词：中文等非 ASCII 名走 name_en（无英文名则退回原名）
-            let primary = pick_search_term(&game.name, game.name_en.as_deref());
-            match self.search_steamgriddb(primary).await {
-                Ok(Some(cover_url)) => {
-                    if let Ok(actual_path) = self.download_image(&cover_url, &cache_path, true).await {
-                        return Ok(Some(actual_path.to_string_lossy().to_string()));
-                    }
+            match self.download_image(&url, &cache_path, true, deadline).await {
+                Ok(actual_path) => {
+                    tracing::info!("使用 Steam 官方封面: {}", game.name);
+                    return Ok(Some(actual_path.to_string_lossy().to_string()));
                 }
-                Err(e) => return Err(e), // API Key 错误等，直接上抛
-                _ => {}
+                // 官方图床没有这张图（老游戏/DLC/工具类常见 404）就走下面
+                Err(e) => tracing::warn!("Steam 官方封面不可用（{url}）: {e}，回退 SteamGridDB"),
             }
+        }
 
-            // 备用搜索词 1：游戏名本身（仅在首选不是它时才有意义）
-            if primary != game.name {
-                tracing::info!("尝试用游戏名搜索封面: {}", game.name);
-                match self.search_steamgriddb(&game.name).await {
-                    Ok(Some(cover_url)) => {
-                        if let Ok(actual_path) = self.download_image(&cover_url, &cache_path, true).await {
-                            return Ok(Some(actual_path.to_string_lossy().to_string()));
-                        }
-                    }
-                    Err(e) => return Err(e),
-                    _ => {}
-                }
+        // 4. SteamGridDB：英文名 → 游戏名 → 文件夹名，先命中先返回
+        if self.steamgriddb_api_key.is_empty() {
+            return Ok(None);
+        }
+
+        let cache_path = self.get_cache_path(&game.id);
+        let mut terms: Vec<String> = vec![
+            pick_search_term(&game.name, game.name_en.as_deref()).to_string(),
+        ];
+        if game.name != terms[0] {
+            terms.push(game.name.clone());
+        }
+        // 备用检索词：文件夹名（许多 repack 用官方英文名做目录名，仍值得一试）
+        if let Some(folder) = game
+            .install_path
+            .as_deref()
+            .and_then(|p| Path::new(p).file_name())
+            .map(|n| n.to_string_lossy().to_string())
+        {
+            if !terms.contains(&folder) {
+                terms.push(folder);
             }
+        }
 
-            // 备用搜索词 2：文件夹名（许多 repack 用官方英文名做目录名，仍值得一试）
-            if let Some(ref install_path) = game.install_path {
-                let folder_name = std::path::Path::new(install_path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string());
+        // 「至少有一次检索给了我明确答复（收录/未收录）」——用来区分
+        // 「库里真没有」与「网全挂了」。前者返回 None（走默认封面），
+        // 后者返回 Err（让用户知道是网络问题，而不是名字写错了）。
+        let mut heard_back = false;
+        let mut failures: Vec<String> = Vec::new();
 
-                if let Some(ref folder) = folder_name {
-                    if *folder != game.name {
-                        tracing::info!("尝试用文件夹名搜索封面: {}", folder);
-                        match self.search_steamgriddb(folder).await {
-                            Ok(Some(cover_url)) => {
-                                if let Ok(actual_path) = self.download_image(&cover_url, &cache_path, true).await {
-                                    return Ok(Some(actual_path.to_string_lossy().to_string()));
-                                }
+        for term in &terms {
+            match self.search_steamgriddb(term, deadline).await {
+                SgdbSearch::Hit(urls) => {
+                    heard_back = true;
+                    for url in &urls {
+                        match self.download_image(url, &cache_path, true, deadline).await {
+                            Ok(actual_path) => {
+                                return Ok(Some(actual_path.to_string_lossy().to_string()));
                             }
-                            Err(e) => return Err(e),
-                            _ => {}
+                            Err(e) => {
+                                // 旧实现在这里用 `if let Ok` 把错误整个丢掉，
+                                // 日志零痕迹 —— 这正是"拉图老有问题"却查不出原因的直接原因。
+                                tracing::warn!("封面下载失败（{url}）: {e}");
+                                failures.push(format!("封面下载失败: {e}"));
+                            }
                         }
+                    }
+                }
+                SgdbSearch::NotFound => {
+                    heard_back = true;
+                    tracing::info!("SteamGridDB 未收录: {term}");
+                }
+                SgdbSearch::Failed { reason, fatal } => {
+                    tracing::warn!("SteamGridDB 检索失败（{term}）: {reason}");
+                    failures.push(reason);
+                    if fatal {
+                        // API Key 无效 / 限流：换检索词毫无意义，立刻止损
+                        break;
                     }
                 }
             }
         }
 
-        // 4. 返回 None（使用默认封面）
-        Ok(None)
+        // 5. 收尾：有明确答复 = 确实没有封面；全程失败 = 如实报网络错误
+        if heard_back || failures.is_empty() {
+            Ok(None)
+        } else {
+            Err(anyhow::anyhow!("{}", failures.join("；")))
+        }
     }
 
     /// 获取封面（供鉴赏等无安装路径的条目使用）
     /// 流程：检查缓存 → SteamGridDB 按名字搜索 → 下载，不涉及本地游戏目录
     pub async fn fetch_cover_for_id(&self, id: &str, name: &str) -> Result<Option<String>> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(COVER_TOTAL_BUDGET_SECS);
+
         // 1. 检查缓存（与游戏封面共用 covers 目录，id 为 uuid 无冲突）
         if let Some(cache_path) = self.find_cached_cover(id) {
             return Ok(Some(cache_path.to_string_lossy().to_string()));
         }
 
-        // 2. 尝试 SteamGridDB（按名字搜索）
+        // 2. 尝试 SteamGridDB（按名字搜索；候选图依次尝试）
         if !self.steamgriddb_api_key.is_empty() {
             let cache_path = self.get_cache_path(id);
-            match self.search_steamgriddb(name).await {
-                Ok(Some(cover_url)) => {
-                    if let Ok(actual_path) = self.download_image(&cover_url, &cache_path, true).await {
-                        return Ok(Some(actual_path.to_string_lossy().to_string()));
+            match self.search_steamgriddb(name, deadline).await {
+                SgdbSearch::Hit(urls) => {
+                    for url in &urls {
+                        match self.download_image(url, &cache_path, true, deadline).await {
+                            Ok(actual_path) => {
+                                return Ok(Some(actual_path.to_string_lossy().to_string()));
+                            }
+                            Err(e) => tracing::warn!("封面下载失败（{url}）: {e}"),
+                        }
                     }
                 }
-                Err(e) => return Err(e),
-                _ => {}
+                SgdbSearch::NotFound => tracing::info!("SteamGridDB 未收录: {name}"),
+                SgdbSearch::Failed { reason, .. } => {
+                    tracing::warn!("SteamGridDB 检索失败（{name}）: {reason}");
+                    return Err(anyhow::anyhow!(reason));
+                }
             }
         }
 
@@ -263,7 +495,14 @@ impl CoverFetcher {
     }
 
     /// 搜索 SteamGridDB（异步）
-    async fn search_steamgriddb(&self, game_name: &str) -> Result<Option<String>> {
+    ///
+    /// 返回 `SgdbSearch` 而非 `Option`：把「未收录」「限流」「网络失败」三种结局
+    /// 分开，上层才能给用户说实话（见 `SgdbSearch` 的注释）。
+    async fn search_steamgriddb(
+        &self,
+        game_name: &str,
+        deadline: std::time::Instant,
+    ) -> SgdbSearch {
         // 搜索游戏（URL 编码游戏名，支持中文等非 ASCII 字符）
         let encoded_name = urlencoding::encode(game_name);
         let search_url = format!(
@@ -271,85 +510,140 @@ impl CoverFetcher {
             encoded_name
         );
 
-        let response = self.client
-            .get(&search_url)
-            .header("Authorization", format!("Bearer {}", self.steamgriddb_api_key))
-            .send()
-            .await?;
+        let (status, body) = match fetch_bytes_with_retry("SteamGridDB 搜索", deadline, || {
+            self.client
+                .get(&search_url)
+                .timeout(budget_timeout(
+                    deadline,
+                    std::time::Duration::from_secs(COVER_FETCH_TIMEOUT_SECS),
+                ))
+                .header("Authorization", format!("Bearer {}", self.steamgriddb_api_key))
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => return SgdbSearch::Failed { reason: format!("搜索请求失败: {e}"), fatal: true },
+        };
 
-        if !response.status().is_success() {
-            let status = response.status();
+        if !status.is_success() {
             tracing::warn!("SteamGridDB 搜索失败: {} (状态码: {})", game_name, status);
-            // 401/403 表示 API Key 无效，返回明确错误
-            if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-                anyhow::bail!("SteamGridDB API Key 无效，请在设置中检查");
-            }
-            // 429 表示限流（免费层约 1 req/s），提示用户稍后重试而非误报"未找到"
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                anyhow::bail!("SteamGridDB 请求过于频繁（429），请稍后重试");
-            }
-            return Ok(None);
+            return match status {
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => SgdbSearch::Failed {
+                    reason: "SteamGridDB API Key 无效，请在设置中检查".to_string(),
+                    fatal: true,
+                },
+                // 429 限流（免费层约 1 req/s）：换检索词只会加深限流，直接止损
+                reqwest::StatusCode::TOO_MANY_REQUESTS => SgdbSearch::Failed {
+                    reason: "SteamGridDB 请求过于频繁（429），请稍后重试".to_string(),
+                    fatal: true,
+                },
+                other => SgdbSearch::Failed {
+                    reason: format!("搜索接口返回 HTTP {other}"),
+                    fatal: false,
+                },
+            };
         }
 
-        let data: serde_json::Value = response.json().await?;
-        let games = data["data"].as_array();
+        let data: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => return SgdbSearch::Failed { reason: format!("搜索响应解析失败: {e}"), fatal: false },
+        };
 
-        if let Some(games) = games {
-            if let Some(first_game) = games.first() {
-                tracing::info!("SteamGridDB 搜索到游戏: {} (ID: {})", game_name, first_game["id"]);
-                let game_id = first_game["id"].as_i64().unwrap_or(0);
+        let Some(games) = data["data"].as_array() else {
+            tracing::warn!("SteamGridDB 响应格式异常: {}", game_name);
+            return SgdbSearch::Failed { reason: "搜索响应格式异常".to_string(), fatal: false };
+        };
+        let Some(first_game) = games.first() else {
+            return SgdbSearch::NotFound;
+        };
 
-                // 获取封面
-                let grids_url = format!(
-                    "https://www.steamgriddb.com/api/v2/grids/game/{}",
-                    game_id
-                );
+        tracing::info!("SteamGridDB 搜索到游戏: {} (ID: {})", game_name, first_game["id"]);
+        let game_id = first_game["id"].as_i64().unwrap_or(0);
+        if game_id <= 0 {
+            return SgdbSearch::NotFound;
+        }
 
-                let grids_response = self.client
-                    .get(&grids_url)
-                    .header("Authorization", format!("Bearer {}", self.steamgriddb_api_key))
-                    .send()
-                    .await?;
+        let grids_url = format!("https://www.steamgriddb.com/api/v2/grids/game/{game_id}");
+        let (g_status, g_body) = match fetch_bytes_with_retry("SteamGridDB grids", deadline, || {
+            self.client
+                .get(&grids_url)
+                .timeout(budget_timeout(
+                    deadline,
+                    std::time::Duration::from_secs(COVER_FETCH_TIMEOUT_SECS),
+                ))
+                .header("Authorization", format!("Bearer {}", self.steamgriddb_api_key))
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => return SgdbSearch::Failed { reason: format!("封面列表请求失败: {e}"), fatal: false },
+        };
 
-                if grids_response.status().is_success() {
-                    let grids_data: serde_json::Value = grids_response.json().await?;
-                    if let Some(grids) = grids_data["data"].as_array() {
-                        if let Some(first_grid) = grids.first() {
-                            // 优先使用原图 url，回退到缩略图 thumb
-                            let url = first_grid["url"].as_str().filter(|s| !s.is_empty())
-                                .or_else(|| first_grid["thumb"].as_str().filter(|s| !s.is_empty()));
-                            if let Some(url) = url {
-                                return Ok(Some(url.to_string()));
-                            }
-                        }
+        // 这里曾经是「静默 Ok(None)」：grids 返回任何非 2xx 都当作"没有封面"，
+        // 于是 429/5xx 最终被说成"游戏名可能不在 SteamGridDB 中"。
+        if !g_status.is_success() {
+            return SgdbSearch::Failed {
+                reason: format!("封面列表接口返回 HTTP {g_status}"),
+                fatal: g_status == reqwest::StatusCode::TOO_MANY_REQUESTS,
+            };
+        }
+
+        let grids_data: serde_json::Value = match serde_json::from_slice(&g_body) {
+            Ok(v) => v,
+            Err(e) => return SgdbSearch::Failed { reason: format!("封面列表解析失败: {e}"), fatal: false },
+        };
+        let Some(grids) = grids_data["data"].as_array() else {
+            return SgdbSearch::NotFound;
+        };
+
+        // 取前 N 张做候选：旧实现只认 `grids.first()`，第一张下载失败就整体失败。
+        // 优先原图 url，回退缩略图 thumb（thumb 更小、在慢网下更容易成功）。
+        let mut urls: Vec<String> = Vec::with_capacity(COVER_DOWNLOAD_CANDIDATES);
+        for grid in grids {
+            for key in ["url", "thumb"] {
+                if let Some(u) = grid[key].as_str() {
+                    if !u.is_empty() && !urls.iter().any(|existing| existing == u) {
+                        urls.push(u.to_string());
+                        break;
                     }
                 }
-            } else {
-                tracing::warn!("SteamGridDB 未搜索到游戏: {}", game_name);
             }
-        } else {
-            tracing::warn!("SteamGridDB 响应格式异常: {}", game_name);
+            if urls.len() >= COVER_DOWNLOAD_CANDIDATES {
+                break;
+            }
         }
 
-        Ok(None)
+        if urls.is_empty() {
+            SgdbSearch::NotFound
+        } else {
+            SgdbSearch::Hit(urls)
+        }
     }
 
     /// 获取游戏的所有可选封面（异步）
     /// 检索词顺序：官方英文名（非 ASCII 名时）→ 游戏名 → 文件夹名，先命中先返回
+    /// 命中则返回该游戏在 SteamGridDB 上的全部 grids（供「更换封面」弹窗选图）。
+    ///
+    /// 注意：**这里不掺 Steam 官方封面**。菜单上「Steam 官方」是独立入口
+    /// （`set_game_cover_from_steam`），混进来会让用户分不清自己点的是哪一家。
     pub async fn fetch_cover_options(
         &self,
         game_name: &str,
         name_en: Option<&str>,
         install_path: Option<&str>,
     ) -> Result<Vec<CoverOption>> {
+        // 弹窗里用户在等，预算比后台抓取更紧
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(COVER_OPTIONS_BUDGET_SECS);
+
         // 首选：官方英文名 / 游戏名（见 pick_search_term）
         let primary = pick_search_term(game_name, name_en);
-        let mut grids = self.search_grids_for_game(primary).await?;
+        let mut grids = self.search_grids_for_game(primary, deadline).await?;
 
         // 备用 1：游戏名本身
         if grids.is_empty() && primary != game_name {
             tracing::info!("尝试用游戏名搜索封面选项: {}", game_name);
-            grids = self.search_grids_for_game(game_name).await?;
+            grids = self.search_grids_for_game(game_name, deadline).await?;
         }
 
         // 备用 2：文件夹名
@@ -361,7 +655,7 @@ impl CoverFetcher {
                 if let Some(ref folder) = folder_name {
                     if *folder != game_name && folder != primary {
                         tracing::info!("尝试用文件夹名搜索封面选项: {}", folder);
-                        grids = self.search_grids_for_game(folder).await?;
+                        grids = self.search_grids_for_game(folder, deadline).await?;
                     }
                 }
             }
@@ -371,31 +665,39 @@ impl CoverFetcher {
     }
 
     /// 搜索 SteamGridDB 获取游戏的所有 grids（内部方法）
-    async fn search_grids_for_game(&self, game_name: &str) -> Result<Vec<CoverOption>> {
+    async fn search_grids_for_game(
+        &self,
+        game_name: &str,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<CoverOption>> {
         let encoded_name = urlencoding::encode(game_name);
         let search_url = format!(
             "https://www.steamgriddb.com/api/v2/search/autocomplete/{}",
             encoded_name
         );
 
-        let response = self.client
-            .get(&search_url)
-            .header("Authorization", format!("Bearer {}", self.steamgriddb_api_key))
-            .send()
-            .await?;
+        let (status, body) = fetch_bytes_with_retry("SteamGridDB 搜索（封面选项）", deadline, || {
+            self.client
+                .get(&search_url)
+                .timeout(budget_timeout(
+                    deadline,
+                    std::time::Duration::from_secs(COVER_FETCH_TIMEOUT_SECS),
+                ))
+                .header("Authorization", format!("Bearer {}", self.steamgriddb_api_key))
+        })
+        .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
                 anyhow::bail!("SteamGridDB API Key 无效，请在设置中检查");
             }
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 anyhow::bail!("SteamGridDB 请求过于频繁（429），请稍后重试");
             }
-            return Ok(Vec::new());
+            anyhow::bail!("SteamGridDB 搜索接口返回 HTTP {status}");
         }
 
-        let data: serde_json::Value = response.json().await?;
+        let data: serde_json::Value = serde_json::from_slice(&body)?;
         let games = match data["data"].as_array() {
             Some(arr) => arr,
             None => return Ok(Vec::new()),
@@ -412,17 +714,25 @@ impl CoverFetcher {
             game_id
         );
 
-        let grids_response = self.client
-            .get(&grids_url)
-            .header("Authorization", format!("Bearer {}", self.steamgriddb_api_key))
-            .send()
-            .await?;
+        let (g_status, g_body) = fetch_bytes_with_retry("SteamGridDB 封面选项列表", deadline, || {
+            self.client
+                .get(&grids_url)
+                .timeout(budget_timeout(
+                    deadline,
+                    std::time::Duration::from_secs(COVER_FETCH_TIMEOUT_SECS),
+                ))
+                .header("Authorization", format!("Bearer {}", self.steamgriddb_api_key))
+        })
+        .await?;
 
-        if !grids_response.status().is_success() {
-            return Ok(Vec::new());
+        if !g_status.is_success() {
+            // 旧实现静默返回空列表 —— 用户只能看到"这个游戏没有封面"，
+            // 而真相可能是限流或服务端 5xx。手动选图是用户主动发起的，
+            // 如实报错比给个空列表有用。
+            anyhow::bail!("SteamGridDB 封面列表接口返回 HTTP {g_status}");
         }
 
-        let grids_data: serde_json::Value = grids_response.json().await?;
+        let grids_data: serde_json::Value = serde_json::from_slice(&g_body)?;
         let grids = match grids_data["data"].as_array() {
             Some(arr) => arr,
             None => return Ok(Vec::new()),
@@ -455,7 +765,9 @@ impl CoverFetcher {
     /// 但仍受 scheme 校验、重定向跳数限制（3 跳）与体积上限（20MB）约束。
     /// 返回实际写入的文件路径（按图片内容决定扩展名）。
     pub async fn download_from_url(&self, url: &str, save_path: &Path) -> Result<PathBuf> {
-        self.download_image(url, save_path, false).await
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(COVER_TOTAL_BUDGET_SECS);
+        self.download_image(url, save_path, false, deadline).await
     }
 
     /// 根据文件头魔数检测图片格式，返回扩展名（jpg/png/webp）
@@ -475,7 +787,7 @@ impl CoverFetcher {
         }
     }
 
-    /// 下载图片（异步）
+    /// 下载图片
     ///
     /// `enforce_trusted_host`：是否要求 URL（含重定向后的最终 URL）落在 SteamGridDB
     /// 域名下。SteamGridDB 返回的图源属**第三方响应**，必须校验；用户在设置页手动
@@ -484,13 +796,52 @@ impl CoverFetcher {
     /// 三道防线：① 仅允许 http(s) 协议；② 体积硬上限，在流式读取中截断
     /// （只预检 `Content-Length` 不够——服务端可以省略或谎报）；③ 可选域名白名单。
     ///
-    /// 校验内容魔数并按实际格式保存（避免 .jpg 扩展名存 PNG 导致 MIME 误判），
-    /// 返回实际写入的文件路径。
+    /// **整段重下**而非续传：断流后字节位置不可靠，且封面只有几百 KB。
+    /// 只有传输层失败（建连、读体中段断流）才重试；404 / 非图片 / 超限这类
+    /// 业务性拒绝重试无意义，只会白等。
     async fn download_image(
         &self,
         url: &str,
         save_path: &Path,
         enforce_trusted_host: bool,
+        deadline: std::time::Instant,
+    ) -> Result<PathBuf> {
+        let mut last: Option<anyhow::Error> = None;
+        for attempt in 1..=COVER_RETRY_ATTEMPTS {
+            // 预算耗尽就不再开新一轮下载 —— 这是"不无限转圈"的最后一道闸
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("封面下载超出时间预算，放弃: {url}");
+                break;
+            }
+            match self
+                .download_image_once(url, save_path, enforce_trusted_host, deadline)
+                .await
+            {
+                Ok(path) => return Ok(path),
+                Err(e) => {
+                    let transport = e.downcast_ref::<TransportFailure>().is_some();
+                    tracing::warn!(
+                        "封面下载失败（第 {attempt}/{COVER_RETRY_ATTEMPTS} 次，{url}）: {e}"
+                    );
+                    let give_up = !transport || attempt == COVER_RETRY_ATTEMPTS;
+                    last = Some(e);
+                    if give_up {
+                        break;
+                    }
+                    crate::utils::net::sleep_ms(COVER_RETRY_BACKOFF_MS * attempt as u64).await;
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("封面下载失败: {url}")))
+    }
+
+    /// 单次下载尝试（不含重试）
+    async fn download_image_once(
+        &self,
+        url: &str,
+        save_path: &Path,
+        enforce_trusted_host: bool,
+        deadline: std::time::Instant,
     ) -> Result<PathBuf> {
         // ① 协议校验：reqwest 本身只支持 http(s)，显式拒绝是为了让日志给出确切原因
         let parsed =
@@ -502,7 +853,20 @@ impl CoverFetcher {
             anyhow::bail!("拒绝下载非 SteamGridDB 域名的图源: {url}");
         }
 
-        let mut response = self.download_client.get(url).send().await?;
+        // 建连与读体的错误一律打上 `TransportFailure` 标记 —— `download_image`
+        // 靠它区分「值得重试」和「重试也没用」。
+        let mut response = self
+            .download_client
+            .get(url)
+            // 超时压到「剩余预算」以内，绝不拖动整次抓取
+            .timeout(budget_timeout(
+                deadline,
+                std::time::Duration::from_secs(COVER_DOWNLOAD_TIMEOUT_SECS),
+            ))
+            .send()
+            .await
+            .map_err(|e| anyhow::Error::new(TransportFailure(e.into())))
+            .with_context(|| format!("下载请求失败: {url}"))?;
 
         if !response.status().is_success() {
             anyhow::bail!("下载失败: HTTP {}", response.status());
@@ -524,7 +888,13 @@ impl CoverFetcher {
             }
         }
         let mut bytes: Vec<u8> = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
+        loop {
+            // 读体中段断流（`error decoding response body` 就是这一层）同样标记为可重试
+            let chunk = response
+                .chunk()
+                .await
+                .map_err(|e| anyhow::Error::new(TransportFailure(e.into())))?;
+            let Some(chunk) = chunk else { break };
             if bytes.len() as u64 + chunk.len() as u64 > COVER_MAX_FILE_SIZE {
                 anyhow::bail!(
                     "下载失败: 响应内容超过上限 {} 字节，已中断",
@@ -590,7 +960,10 @@ impl CoverFetcher {
 
 #[cfg(test)]
 mod tests {
-    use super::pick_search_term;
+    use super::{
+        detect_local_steam_appid, is_trusted_cover_host, parse_appid, pick_search_term,
+        steam_library_cover_url, CoverFetcher, TransportFailure,
+    };
 
     /// 中文名 + 有官方英文名 → 用英文名搜（SteamGridDB 只收录英文名，
     /// 2026-10-03 实测「全面战争：三国」0 命中、「Total War: Three Kingdoms」命中）
@@ -629,5 +1002,144 @@ mod tests {
             pick_search_term("尼尔：机械纪元", Some("NieR:Automata")),
             "NieR:Automata"
         );
+    }
+
+    // ==================== Steam 官方图床 ====================
+
+    /// 正常 appid → 拼出官方竖版封面地址
+    #[test]
+    fn steam_cover_url_built_from_numeric_appid() {
+        assert_eq!(
+            steam_library_cover_url("550").as_deref(),
+            Some("https://cdn.cloudflare.steamstatic.com/steam/apps/550/library_600x900.jpg")
+        );
+        // 前后空白容忍（平台导入的数据偶尔带空格）
+        assert_eq!(
+            steam_library_cover_url(" 730 ").as_deref(),
+            Some("https://cdn.cloudflare.steamstatic.com/steam/apps/730/library_600x900.jpg")
+        );
+    }
+
+    /// 非数字 / 超长 / 空 → 一律拒绝。
+    /// appid 会拼进 URL 路径，放行任意字符等于把路径控制权交给数据源。
+    #[test]
+    fn steam_cover_url_rejects_non_numeric_appid() {
+        assert_eq!(steam_library_cover_url(""), None);
+        assert_eq!(steam_library_cover_url("   "), None);
+        assert_eq!(steam_library_cover_url("../etc/passwd"), None);
+        assert_eq!(steam_library_cover_url("550?x=1"), None);
+        assert_eq!(steam_library_cover_url("550/../1"), None);
+        assert_eq!(steam_library_cover_url("1234567890123"), None); // 13 位超长
+        assert_eq!(steam_library_cover_url("٥٥٠"), None); // 阿拉伯-印度数字不是 ASCII
+    }
+
+    /// 白名单必须覆盖 Valve 官方图床，否则 `download_image` 会把自己的 URL 拒了
+    #[test]
+    fn steam_cdn_is_trusted() {
+        let url = reqwest::Url::parse("https://cdn.cloudflare.steamstatic.com/x.jpg").unwrap();
+        assert!(is_trusted_cover_host(&url));
+        let sgdb = reqwest::Url::parse("https://cdn2.steamgriddb.com/grid/a.png").unwrap();
+        assert!(is_trusted_cover_host(&sgdb));
+        let evil = reqwest::Url::parse("https://evil.com/steamstatic.com").unwrap();
+        assert!(!is_trusted_cover_host(&evil));
+    }
+
+    // ==================== 重试判定 ====================
+
+    /// 关键前提：加了 `.with_context()` 之后，`downcast_ref::<TransportFailure>()`
+    /// 必须仍然认得出传输失败 —— 否则读体断流永远不进重试分支，
+    /// 这个 bug 会以「明明打了重试日志却不重试」的形式再犯一次。
+    #[test]
+    fn transport_failure_survives_context() {
+        // `anyhow::Error::context` 是固有方法，不需要引入 Context trait
+        let err = anyhow::Error::new(TransportFailure(anyhow::anyhow!("tls stall")))
+            .context("下载请求失败: https://example.com/a.jpg");
+        assert!(err.downcast_ref::<TransportFailure>().is_some());
+        // 业务性错误（没有标记）不该被误判成可重试
+        let rejected = anyhow::anyhow!("下载失败: HTTP 404");
+        assert!(rejected.downcast_ref::<TransportFailure>().is_none());
+    }
+
+    // ==================== 本地 repack 的 appid 反查 ====================
+
+    #[test]
+    fn parse_appid_accepts_only_plausible_ids() {
+        assert_eq!(parse_appid("2215430").as_deref(), Some("2215430"));
+        assert_eq!(parse_appid("  620\n").as_deref(), Some("620"));
+        // 占位值：认了会让满库游戏共用同一张 Spacewar 封面
+        assert_eq!(parse_appid("480"), None);
+        assert_eq!(parse_appid("0"), None);
+        assert_eq!(parse_appid(""), None);
+        assert_eq!(parse_appid("abc"), None);
+        assert_eq!(parse_appid("-1"), None);
+        assert_eq!(parse_appid("12345678901"), None); // 11 位超长
+    }
+
+    /// 临时目录里造一个 repack，验证 ini / txt 两条读取路径
+    #[test]
+    fn detect_appid_from_install_dir() {
+        let dir = std::env::temp_dir().join(format!("gv-appid-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().to_string();
+
+        // 1) 什么都没有 → None
+        assert_eq!(detect_local_steam_appid(&path), None);
+
+        // 2) steam_emu.ini 里写 AppId（Goldberg/RUNE 的常见写法）
+        std::fs::write(
+            dir.join("steam_emu.ini"),
+            "[Settings]\nAppId=2215430\nUserName=test\n",
+        )
+        .unwrap();
+        assert_eq!(detect_local_steam_appid(&path).as_deref(), Some("2215430"));
+
+        // 3) 只有占位值 480 → 不认
+        std::fs::write(dir.join("steam_emu.ini"), "[Settings]\nAppId=480\n").unwrap();
+        assert_eq!(detect_local_steam_appid(&path), None);
+
+        // 4) steam_appid.txt 优先于 ini
+        std::fs::write(dir.join("steam_appid.txt"), "620").unwrap();
+        assert_eq!(detect_local_steam_appid(&path).as_deref(), Some("620"));
+
+        // 5) 目录不存在 → None（不 panic）
+        assert_eq!(detect_local_steam_appid("Z:\\no\\such\\dir"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 联网冒烟测试（**默认忽略**，手动执行）：
+    /// `cargo test --ignored steam_cdn_download_smoke`
+    ///
+    /// 验证的是「白名单 → 下载 → 魔数校验 → 落盘」整条真实链路，
+    /// 而不只是 URL 拼接。2026-10-18 排查「拉图老有问题」时用来分诊：
+    /// 若这条过了、SGDB 那条不过，就说明病灶在网络路径而非代码。
+    #[test]
+    #[ignore = "联网冒烟测试，需手动执行"]
+    fn steam_cdn_download_smoke() {
+        let dir = std::env::temp_dir().join(format!("gv-smoke-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fetcher = CoverFetcher::new(dir.clone(), String::new()).unwrap();
+
+        let url =
+            "https://cdn.cloudflare.steamstatic.com/steam/apps/620/library_600x900.jpg";
+        let saved = tauri::async_runtime::block_on(
+            fetcher.download_image(
+                url,
+                &dir.join("smoke.jpg"),
+                true,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            ),
+        )
+        .expect("Steam 官方图床下载失败");
+
+        let size = std::fs::metadata(&saved).unwrap().len();
+        assert!(size > 10_000, "封面体积异常: {size} bytes");
+        assert_eq!(
+            saved.extension().and_then(|e| e.to_str()),
+            Some("jpg"),
+            "魔数校验应把扩展名定为 jpg"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

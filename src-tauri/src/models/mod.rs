@@ -6,8 +6,8 @@ pub mod review;
 pub mod cover;
 
 pub use game::{Game, GameFilter, CoverOption};
-pub use review::{Review, ReviewFilter};
+pub use review::{Review, ReviewFilter, PlayTimeCandidate, ReviewPlayTime};
 pub use cover::{CoverIndexRow, CoverSet, KIND_MAIN, KIND_THUMB};
-pub use play_session::{ActiveSession, DailyStats, GamePlayStats, GenreStats, HeatmapDay, HourlyStats, StatusStats, PlaySessionDetail};
+pub use play_session::{ActiveSession, HangWatch, DailyStats, GamePlayStats, GenreStats, HeatmapDay, HourlyStats, StatusStats, PlaySessionDetail};
 pub use achievement::{AchievementDef, AchievementUnlock, GlobalAchievementStatus, GameAchievementStatus, GameAchievements, AchievementSummary, UnlockEvent, AchievementGlobalStats, PerGameStats};
 // Settings 和 PlaySession 通过 settings::* 和 play_session::* 按需导入

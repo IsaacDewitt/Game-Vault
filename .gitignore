@@ -33,5 +33,8 @@ dist-ssr
 # 工作空间内临时目录（诊断脚本、数据库快照等，不进版本库）
 tmp/
 
+# 隔离测试编译目录（CARGO_TARGET_DIR 相对工作区根，勿覆盖交付产物）
+target-tests/
+
 # hook-dll（injection 分支的注入实验工程，master 不收录）
 src-tauri/hook-dll/

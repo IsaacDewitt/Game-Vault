@@ -146,7 +146,7 @@ impl Database {
                 hltb_completionist INTEGER,
                 rating INTEGER,
                 review TEXT,
-                status TEXT DEFAULT 'wishlist',
+                status TEXT DEFAULT 'completed',
                 added_at TEXT NOT NULL,
                 updated_at TEXT,
                 screenshot_dir TEXT
@@ -810,34 +810,11 @@ impl Database {
         Ok(())
     }
 
-    /// 获取所有游戏
+    /// 获取所有游戏（只负责排序，筛选在前端 `lib/gameFilter.ts` 完成）
+    ///
+    /// 排序字段走**白名单**而非直接拼 `filter.sort_by`：一旦允许透传，
+    /// 就是一个 SQL 注入面（`ORDER BY` 不能参数化）。
     pub fn get_games(&self, filter: &GameFilter) -> Result<Vec<Game>> {
-        let mut sql = format!("SELECT {} FROM games WHERE 1=1", Self::GAME_COLUMNS);
-
-        let mut bind_values: Vec<String> = Vec::new();
-
-        if let Some(ref search) = filter.search {
-            sql.push_str(&format!(" AND name LIKE ?{} ESCAPE '\\'", bind_values.len() + 1));
-            bind_values.push(format!("%{}%", escape_like(search)));
-        }
-        if filter.favorites_only {
-            sql.push_str(" AND is_favorite = 1");
-        }
-        if let Some(ref status) = filter.status {
-            if !status.is_empty() {
-                sql.push_str(&format!(" AND status = ?{}", bind_values.len() + 1));
-                bind_values.push(status.clone());
-            }
-        }
-        if let Some(ref genre) = filter.genre {
-            if !genre.is_empty() {
-                // JSON 数组元素匹配：模式带引号 `"genre`，避免 "RPG" 误匹配 "JRPG"
-                sql.push_str(&format!(" AND genres LIKE ?{} ESCAPE '\\'", bind_values.len() + 1));
-                bind_values.push(format!("%\"{}%", escape_like(genre)));
-            }
-        }
-
-        // 排序（白名单校验防止注入）
         let sort_column = match filter.sort_by.as_str() {
             "name" => "name",
             "last_played" => "last_played",
@@ -849,21 +826,18 @@ impl Database {
             "asc" => "ASC",
             _ => "DESC",
         };
-        sql.push_str(&format!(" ORDER BY {} {}", sort_column, sort_order));
+
+        let sql = format!(
+            "SELECT {} FROM games ORDER BY {} {}",
+            Self::GAME_COLUMNS,
+            sort_column,
+            sort_order
+        );
 
         let mut stmt = self.conn.prepare(&sql)?;
-
-        let games = if bind_values.is_empty() {
-            stmt.query_map([], Self::row_to_game)?
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            let params: Vec<&dyn rusqlite::types::ToSql> = bind_values
-                .iter()
-                .map(|v| v as &dyn rusqlite::types::ToSql)
-                .collect();
-            stmt.query_map(params.as_slice(), Self::row_to_game)?
-                .collect::<Result<Vec<_>, _>>()?
-        };
+        let games = stmt
+            .query_map([], Self::row_to_game)?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(games)
     }
@@ -1458,12 +1432,6 @@ impl Database {
             bind_values.push(like.clone());
             bind_values.push(like);
         }
-        if let Some(ref status) = filter.status {
-            if !status.is_empty() {
-                sql.push_str(&format!(" AND status = ?{}", bind_values.len() + 1));
-                bind_values.push(status.clone());
-            }
-        }
         if let Some(ref genre) = filter.genre {
             if !genre.is_empty() {
                 // JSON 数组元素匹配：模式带引号 `"genre`，避免 "RPG" 误匹配 "JRPG"
@@ -1776,6 +1744,40 @@ impl Database {
         })?.collect::<Result<Vec<_>, _>>()?;
 
         Ok(stats)
+    }
+
+    /// 游玩时长候选行（手账「我的游玩时长」按名匹配游戏库用）。
+    ///
+    /// 两路来源与 `get_play_stats` 同口径：在库游戏取 `games.play_time_seconds` 卡片累计；
+    /// 已删游戏取 `play_stats_daily` 孤儿历史汇总、墓碑还原名字（墓碑不存 name_en，故恒 None）。
+    /// 零时长不返回——手账只在真有游玩历史时才显示这一栏。
+    pub fn get_play_time_candidates(&self) -> Result<Vec<PlayTimeCandidate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, name_en, play_time_seconds, last_played
+             FROM games
+             WHERE play_time_seconds > 0
+
+             UNION ALL
+
+             SELECT COALESCE(t.name, ''), NULL,
+                    COALESCE(SUM(d.total_seconds), 0), MAX(d.last_end)
+             FROM play_stats_daily d
+             LEFT JOIN game_tombstones t ON t.id = d.game_id
+             WHERE NOT EXISTS (SELECT 1 FROM games g WHERE g.id = d.game_id)
+             GROUP BY d.game_id
+             HAVING COALESCE(SUM(d.total_seconds), 0) > 0"
+        )?;
+
+        let candidates = stmt.query_map([], |row| {
+            Ok(PlayTimeCandidate {
+                name: row.get(0)?,
+                name_en: row.get(1)?,
+                play_time_seconds: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                last_played: row.get(3)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+
+        Ok(candidates)
     }
 
     /// 获取每日游玩统计（补零：无游玩记录的日期也返回 total_seconds=0，保证折线图连续）

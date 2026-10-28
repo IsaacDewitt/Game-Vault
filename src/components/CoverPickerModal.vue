@@ -168,7 +168,7 @@ function setFilter(f: "portrait" | "landscape" | "all") {
       <!-- 加载中 -->
       <div v-if="loading" class="loading-state">
         <n-spin size="large" />
-        <p>正在从 SteamGridDB 获取封面列表...</p>
+        <p>正在获取封面列表...</p>
       </div>
 
       <!-- 无结果 -->

@@ -179,6 +179,21 @@ const genreSelectOptions = computed(() => [
   ...store.allGenres.map((g) => ({ label: g, value: g })),
 ]);
 
+// 排序选项：与手账（ReviewsView）同款两段式——排序字段 + 升降序。
+// 排序在前端内存里做（lib/gameFilter.ts），切排序不重新拉库，即时生效。
+// 「最近游玩」+ 降序 = 旧行为的默认值，故升级后首屏顺序不变。
+const sortOptions = [
+  { label: "最近游玩", value: "last_played" },
+  { label: "游玩时长", value: "play_time" },
+  { label: "添加时间", value: "added_at" },
+  { label: "名称", value: "name" },
+];
+
+const sortOrderOptions = [
+  { label: "降序", value: "desc" },
+  { label: "升序", value: "asc" },
+];
+
 // 「刷新」合并下拉菜单：把刷新封面 / 刷新游戏信息 / 检查存档三项收进一个按钮
 const refreshMenuOptions: DropdownOption[] = [
   {
@@ -648,6 +663,20 @@ function handleDeleteGame(gameId: string) {
             placeholder="游戏类型"
             clearable
             style="width: 150px"
+            size="small"
+          />
+
+          <!-- 排序：字段 + 升降序（内存排序，切换即时生效，不重新拉库） -->
+          <n-select
+            v-model:value="store.sortBy"
+            :options="sortOptions"
+            style="width: 118px"
+            size="small"
+          />
+          <n-select
+            v-model:value="store.sortOrder"
+            :options="sortOrderOptions"
+            style="width: 84px"
             size="small"
           />
         </n-space>

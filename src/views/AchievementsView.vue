@@ -1,22 +1,59 @@
 <script setup lang="ts">
-import { ref, computed, onActivated } from "vue";
-import { NSpin, NEmpty, NSelect, useMessage } from "naive-ui";
+import { ref, computed, onActivated, onDeactivated } from "vue";
+import {
+  NSpin,
+  NEmpty,
+  NSelect,
+  NInput,
+  NButton,
+  NButtonGroup,
+  NIcon,
+  useMessage,
+} from "naive-ui";
+import { SearchOutline } from "@vicons/ionicons5";
 import * as api from "../lib/tauri";
-import type { AchievementSummary, GlobalAchievementStatus, GameAchievementStatus } from "../lib/tauri";
-import { formatPlayTime, formatDate } from "../lib/format";
+import type { AchievementSummary, Game, GameAchievements } from "../lib/tauri";
+import { displayName, useGamesStore } from "../stores/games";
+import {
+  CATEGORY_META,
+  categoryColor,
+  computeGameAchievementProgress,
+  formatAchievementProgress,
+  groupAchievements,
+  groupProgress,
+  type AchievementGroup,
+  type GameAchievementProgress,
+} from "../lib/achievements";
+import AchievementGameCard from "../components/AchievementGameCard.vue";
+import GameAchievementsDrawer from "../components/GameAchievementsDrawer.vue";
+import { formatDate } from "../lib/format";
 
 const message = useMessage();
+const store = useGamesStore();
 const summary = ref<AchievementSummary | null>(null);
 const loading = ref(true);
-const selectedGameId = ref<string | null>(null);
 const activeCategory = ref<string | null>(null);
 
-const CATEGORY_META: Record<string, { label: string; color: string }> = {
-  progress: { label: "进度", color: "#4da3ff" },
-  collect: { label: "收集", color: "#a78bfa" },
-  fun: { label: "趣味", color: "#fbbf24" },
-  challenge: { label: "挑战", color: "#f87171" },
-};
+// 单游戏成就区：搜索 / 筛选 / 排序 / 抽屉
+const searchQuery = ref("");
+type StatusFilter = "all" | "in_progress" | "completed" | "not_started";
+const statusFilter = ref<StatusFilter>("all");
+type SortKey = "progress" | "unlocked" | "name";
+const sortKey = ref<SortKey>("progress");
+const selectedGameId = ref<string | null>(null);
+
+const statusOptions: { value: StatusFilter; label: string }[] = [
+  { value: "all", label: "全部" },
+  { value: "in_progress", label: "进行中" },
+  { value: "completed", label: "已全成就" },
+  { value: "not_started", label: "未解锁" },
+];
+
+const sortOptions: { value: SortKey; label: string }[] = [
+  { value: "progress", label: "完成度（高→低）" },
+  { value: "unlocked", label: "已解锁数（多→少）" },
+  { value: "name", label: "名称" },
+];
 
 // 分类筛选（仅作用于全局成就区）
 const categoryTabs = [
@@ -41,42 +78,19 @@ async function load() {
 // 用 onActivated 替代 onMounted：组件被 keep-alive 缓存后，每次切回成就页都会重新拉取数据
 onActivated(load);
 
-// 全局成就按基础 ID 分组（多级成就合并展示）
-interface AchievementGroup {
-  name: string;
-  icon: string;
-  desc: string;
-  category: string;
-  items: GlobalAchievementStatus[];
-  unlockedCount: number;
-  lastUnlockedAt: string | null;
-}
+// 离开页面时收起抽屉：keep-alive 会保留组件状态，否则切回来时抽屉还开着
+onDeactivated(() => {
+  selectedGameId.value = null;
+});
 
+/** 全局成就分组（多级成就合并），未解锁的排前面、解锁多的靠前 */
 const globalGroups = computed<AchievementGroup[]>(() => {
   if (!summary.value) return [];
-  const map = new Map<string, GlobalAchievementStatus[]>();
-  for (const item of summary.value.global) {
-    const arr = map.get(item.def.base_id) ?? [];
-    arr.push(item);
-    map.set(item.def.base_id, arr);
-  }
-  const groups: AchievementGroup[] = [...map.values()]
-    .filter((items) => !activeCategory.value || items[0].def.category === activeCategory.value)
-    .map((items) => {
-      const unlockedItems = items.filter((i) => i.unlocked);
-      return {
-        name: items[0].def.name,
-        icon: items[0].def.icon,
-        desc: items[0].def.desc,
-        category: items[0].def.category,
-        items,
-        unlockedCount: unlockedItems.length,
-        lastUnlockedAt: unlockedItems.length
-          ? unlockedItems[unlockedItems.length - 1].unlocked_at
-          : null,
-      };
-    });
-  // 排序：未解锁的排前面，解锁多的排前面
+  const groups = groupAchievements(
+    activeCategory.value
+      ? summary.value.global.filter((i) => i.def.category === activeCategory.value)
+      : summary.value.global
+  );
   return groups.sort((a, b) => {
     const aDone = a.unlockedCount === a.items.length ? 1 : 0;
     const bDone = b.unlockedCount === b.items.length ? 1 : 0;
@@ -85,109 +99,113 @@ const globalGroups = computed<AchievementGroup[]>(() => {
   });
 });
 
-// 单游戏成就分组
-const gameGroups = computed<AchievementGroup[]>(() => {
-  if (!summary.value) return [];
-  const game = summary.value.per_game.find((g) => g.game_id === selectedGameId.value);
-  if (!game) return [];
-  const map = new Map<string, GameAchievementStatus[]>();
-  for (const item of game.achievements) {
-    const arr = map.get(item.def.base_id) ?? [];
-    arr.push(item);
-    map.set(item.def.base_id, arr);
-  }
-  return [...map.values()].map((items) => {
-    const unlockedItems = items.filter((i) => i.unlocked);
-    return {
-      name: items[0].def.name,
-      icon: items[0].def.icon,
-      desc: items[0].def.desc,
-      category: items[0].def.category,
-      items,
-      unlockedCount: unlockedItems.length,
-      lastUnlockedAt: unlockedItems.length
-        ? unlockedItems[unlockedItems.length - 1].unlocked_at
-        : null,
-    };
-  });
-});
-
 // 概览统计
 const stats = computed(() => {
-  if (!summary.value) return { unlocked: 0, total: 0, percent: 0, gamesWithProgress: 0 };
+  if (!summary.value) {
+    return { unlocked: 0, total: 0, percent: 0, gamesWithProgress: 0, gamesPlayable: 0 };
+  }
   const { unlocked_count, total_count, per_game } = summary.value;
   const gamesWithProgress = per_game.filter((g) =>
     g.achievements.some((a) => a.unlocked)
   ).length;
+  // 「可解锁游戏」只数在库条目：已删除的留档条目不再参与结算，算进去会虚高
+  const gamesPlayable = per_game.filter((g) => !g.removed).length;
   const percent = total_count > 0 ? Math.round((unlocked_count / total_count) * 100) : 0;
-  return { unlocked: unlocked_count, total: total_count, percent, gamesWithProgress };
+  return { unlocked: unlocked_count, total: total_count, percent, gamesWithProgress, gamesPlayable };
 });
 
-// 格式化进度文本
-function formatProgress(item: { progress: number; target: number }): string {
-  const { progress, target } = item;
-  if (target <= 1) return progress >= 1 ? "已完成" : "未完成";
-  if (target >= 3600) return `${formatPlayTime(progress)} / ${formatPlayTime(target)}`;
-  if (target >= 60) {
-    const pm = Math.floor(progress / 60);
-    const tm = Math.floor(target / 60);
-    return `${pm} 分钟 / ${tm} 分钟`;
-  }
-  return `${progress} / ${target}`;
+const gameMap = computed(() => {
+  const map = new Map<string, Game>();
+  for (const g of store.games) map.set(g.id, g);
+  return map;
+});
+
+interface GameCardVM {
+  entry: GameAchievements;
+  name: string;
+  progress: GameAchievementProgress;
 }
 
-function groupProgress(group: AchievementGroup): { progress: number; target: number } {
-  // 进度取当前最高已解锁等级的下一个目标；未解锁任何等级则取第一级目标
-  const unlockedTiers = group.items.filter((i) => i.unlocked).length;
-  if (unlockedTiers === 0) {
-    return { progress: group.items[0]?.progress ?? 0, target: group.items[0]?.target ?? 0 };
-  }
-  const lastUnlocked = group.items[unlockedTiers - 1];
-  const next = group.items[unlockedTiers];
-  if (next) return { progress: lastUnlocked.progress, target: next.target };
-  return { progress: lastUnlocked.progress, target: lastUnlocked.target };
+/** 卡片展示名与游戏库同口径：库内条目英文名优先，已删除条目退回汇总里的名字 */
+function entryName(entry: GameAchievements): string {
+  const game = gameMap.value.get(entry.game_id);
+  return game ? displayName(game) : entry.game_name;
 }
 
-// 当前选中的是否为「已删除留档」条目
-const selectedGameRemoved = computed(() =>
-  (summary.value?.per_game ?? []).some(
-    (g) => g.game_id === selectedGameId.value && g.removed
-  )
-);
+const allCards = computed<GameCardVM[]>(() => {
+  if (!summary.value) return [];
+  return summary.value.per_game
+    .filter((entry) => entry.achievements.length > 0)
+    .map((entry) => ({
+      entry,
+      name: entryName(entry),
+      progress: computeGameAchievementProgress(entry.achievements),
+    }));
+});
 
-// 游戏选择器选项
-//
-// 后端按 game_id（UUID）字典序返回，那是**无意义顺序**——42 款游戏的下拉里根本找不着人。
-// 这里重排成人看得懂的顺序（2026-09-24 修「已删除条目在下拉里找不到」）：
-//   ① 已获成就的排前面（最可能是想看的）；
-//   ② 再按已解锁数量多的靠前；
-//   ③ 同分按名字（用 localeCompare 让中文按拼音、英文按字母）；
-//   ④ **已删除留档条目沉到最底**并带「已删除」后缀——它们不在库中，不该混在在库游戏里，
-//      但要能在列表末尾找得到（成就记录按设计保留）。
-const gameOptions = computed(() => {
-  const list = [...(summary.value?.per_game ?? [])];
-  list.sort((a, b) => {
-    if (a.removed !== b.removed) return a.removed ? 1 : -1;
-    const ua = a.achievements.filter((x) => x.unlocked).length;
-    const ub = b.achievements.filter((x) => x.unlocked).length;
-    if (ua !== ub) return ub - ua;
-    return a.game_name.localeCompare(b.game_name, "zh-Hans-CN");
+function matchesSearch(card: GameCardVM): boolean {
+  const query = searchQuery.value.trim().toLowerCase();
+  if (!query) return true;
+  const game = gameMap.value.get(card.entry.game_id);
+  const haystack = [card.name, card.entry.game_name, game?.name, game?.name_en]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return haystack.includes(query);
+}
+
+function matchesStatus(card: GameCardVM): boolean {
+  const { unlocked, completed } = card.progress;
+  switch (statusFilter.value) {
+    case "in_progress":
+      return unlocked > 0 && !completed;
+    case "completed":
+      return completed;
+    case "not_started":
+      return unlocked === 0;
+    default:
+      return true;
+  }
+}
+
+function sortCards(list: GameCardVM[]): GameCardVM[] {
+  const sorted = [...list];
+  sorted.sort((a, b) => {
+    if (sortKey.value === "name") {
+      return a.name.localeCompare(b.name, "zh-Hans-CN");
+    }
+    if (sortKey.value === "unlocked") {
+      if (b.progress.unlocked !== a.progress.unlocked) {
+        return b.progress.unlocked - a.progress.unlocked;
+      }
+      return a.name.localeCompare(b.name, "zh-Hans-CN");
+    }
+    if (b.progress.percent !== a.progress.percent) {
+      return b.progress.percent - a.progress.percent;
+    }
+    if (b.progress.unlocked !== a.progress.unlocked) {
+      return b.progress.unlocked - a.progress.unlocked;
+    }
+    return a.name.localeCompare(b.name, "zh-Hans-CN");
   });
-  return list.map((g) => ({
-    label: g.removed ? `${g.game_name}（已删除）` : g.game_name,
-    value: g.game_id,
-  }));
-});
+  return sorted;
+}
 
-// 已删除留档条目在选项里的子集（给「沉底找不到」补一条显式入口）
-const removedOptions = computed(() =>
-  gameOptions.value.filter((o) => o.label.endsWith("（已删除）"))
+const visibleCards = computed(() =>
+  allCards.value.filter((card) => matchesSearch(card) && matchesStatus(card))
 );
 
-// 分类徽章颜色
-function categoryColor(cat: string): string {
-  return CATEGORY_META[cat]?.color ?? "#888";
-}
+// 在库游戏与已删除留档分开展示：后者沉在页面最底，但一直可见，不靠下拉里翻找
+const liveCards = computed(() =>
+  sortCards(visibleCards.value.filter((card) => !card.entry.removed))
+);
+const removedCards = computed(() =>
+  sortCards(visibleCards.value.filter((card) => card.entry.removed))
+);
+
+const selectedEntry = computed(
+  () => summary.value?.per_game.find((g) => g.game_id === selectedGameId.value) ?? null
+);
 </script>
 
 <template>
@@ -220,7 +238,7 @@ function categoryColor(cat: string): string {
               <span class="side-label">全局成就</span>
             </div>
             <div class="side-item">
-              <span class="side-num">{{ summary.per_game.length }}</span>
+              <span class="side-num">{{ stats.gamesPlayable }}</span>
               <span class="side-label">可解锁游戏</span>
             </div>
             <div class="side-item">
@@ -285,7 +303,7 @@ function categoryColor(cat: string): string {
 
               <div class="card-foot">
                 <span class="progress-text">
-                  {{ formatProgress(groupProgress(group)) }}
+                  {{ formatAchievementProgress(groupProgress(group)) }}
                 </span>
                 <span v-if="group.lastUnlockedAt" class="unlock-time">
                   {{ formatDate(group.lastUnlockedAt) }}解锁
@@ -296,88 +314,90 @@ function categoryColor(cat: string): string {
           <n-empty v-else description="该分类下暂无成就" style="padding: 40px 0" />
         </div>
 
-        <!-- 单游戏成就 -->
+        <!-- 单游戏成就：卡片网格 + 点击进抽屉（与游戏库同一种浏览方式） -->
         <div class="section">
           <div class="section-header">
-            <h2>🎮 单游戏成就</h2>
-            <n-select
-              v-model:value="selectedGameId"
-              :options="gameOptions"
-              placeholder="选择一款游戏查看其成就（可输入搜索）"
-              style="width: 280px"
-              filterable
-              clearable
+            <h2>🎮 游戏成就</h2>
+            <div class="game-toolbar">
+              <n-input
+                v-model:value="searchQuery"
+                placeholder="搜索游戏..."
+                clearable
+                size="small"
+                style="width: 220px"
+              >
+                <template #prefix>
+                  <n-icon :component="SearchOutline" />
+                </template>
+              </n-input>
+              <n-select
+                v-model:value="sortKey"
+                :options="sortOptions"
+                size="small"
+                style="width: 165px"
+              />
+            </div>
+          </div>
+
+          <div class="filter-row">
+            <n-button-group>
+              <n-button
+                v-for="opt in statusOptions"
+                :key="opt.value"
+                :type="statusFilter === opt.value ? 'primary' : 'default'"
+                size="small"
+                @click="statusFilter = opt.value"
+              >
+                {{ opt.label }}
+              </n-button>
+            </n-button-group>
+            <span class="result-count">
+              共 {{ liveCards.length }} 款{{ removedCards.length ? ` + ${removedCards.length} 款留档` : "" }}
+            </span>
+          </div>
+
+          <div v-if="liveCards.length" class="game-grid">
+            <AchievementGameCard
+              v-for="card in liveCards"
+              :key="card.entry.game_id"
+              :entry="card.entry"
+              @click="selectedGameId = card.entry.game_id"
             />
           </div>
+          <n-empty
+            v-else
+            :description="allCards.length ? '没有符合条件的游戏' : '库中还没有可结算成就的游戏'"
+            style="padding: 40px 0"
+          />
 
-          <!-- 已删除留档条目提示：它们沉在列表末尾，不点出来用户根本不知道有这几个 -->
-          <div v-if="removedOptions.length" class="removed-hint">
-            已删除的游戏（{{ removedOptions.length }} 款）的成就记录仍保留，列在列表末尾：
-            <button
-              v-for="o in removedOptions"
-              :key="o.value"
-              class="removed-link"
-              @click="selectedGameId = o.value"
-            >
-              {{ o.label }}
-            </button>
-          </div>
-
-          <template v-if="selectedGameId">
-            <!-- 已删除条目的说明：解锁记录按设计留档，但它已不在库中 -->
-            <div v-if="selectedGameRemoved" class="removed-note">
-              该游戏已从库中删除，此处展示的是其历史解锁记录——成就记录不随删除消失。
+          <!-- 已删除留档：独立分区，灰度卡片，始终可见 -->
+          <div v-if="removedCards.length" class="removed-block">
+            <div class="removed-title">
+              🗑️ 已删除的游戏
+              <span class="removed-count">{{ removedCards.length }}</span>
             </div>
-            <div v-if="gameGroups.length" class="achv-grid">
-              <div
-                v-for="group in gameGroups"
-                :key="group.name"
-                class="achv-card"
-                :class="{ unlocked: group.unlockedCount === group.items.length }"
-              >
-                <div class="card-top">
-                  <span class="achv-icon" :style="{ background: categoryColor(group.category) + '22' }">
-                    {{ group.icon }}
-                  </span>
-                  <div class="card-title">
-                    <div class="name-row">
-                      <span class="achv-name">{{ group.name }}</span>
-                      <span v-if="group.items.length > 1" class="tier-badge">
-                        {{ group.unlockedCount }}/{{ group.items.length }}
-                      </span>
-                    </div>
-                    <span class="cat-badge" :style="{ color: categoryColor(group.category), background: categoryColor(group.category) + '1a' }">
-                      {{ CATEGORY_META[group.category]?.label ?? group.category }}
-                    </span>
-                  </div>
-                </div>
-                <p class="achv-desc">{{ group.desc }}</p>
-                <div v-if="group.items.length > 1" class="tier-row">
-                  <span
-                    v-for="item in group.items"
-                    :key="item.def.id"
-                    class="tier-dot"
-                    :class="{ on: item.unlocked }"
-                  ></span>
-                </div>
-                <div class="card-foot">
-                  <span class="progress-text">
-                    {{ formatProgress(groupProgress(group)) }}
-                  </span>
-                  <span v-if="group.lastUnlockedAt" class="unlock-time">
-                    {{ formatDate(group.lastUnlockedAt) }}解锁
-                  </span>
-                </div>
-              </div>
+            <p class="removed-desc">
+              这些游戏已从库中删除，成就解锁记录按设计留档，点击仍可查看。
+            </p>
+            <div class="game-grid">
+              <AchievementGameCard
+                v-for="card in removedCards"
+                :key="card.entry.game_id"
+                :entry="card.entry"
+                @click="selectedGameId = card.entry.game_id"
+              />
             </div>
-            <n-empty v-else description="该游戏暂无成就数据" style="padding: 40px 0" />
-          </template>
-          <div v-else class="select-hint">
-            从上方选择一款游戏，查看它独立结算的成就进度 —— 每款游戏的成就是单独计算的。
           </div>
         </div>
       </template>
     </n-spin>
+
+    <!-- 单游戏成就详情抽屉 -->
+    <GameAchievementsDrawer
+      v-if="selectedEntry"
+      :entry="selectedEntry"
+      @close="selectedGameId = null"
+    />
   </div>
 </template>
 
@@ -544,46 +564,64 @@ function categoryColor(cat: string): string {
   gap: 12px;
 }
 
-/* 已删除留档条目的说明条 */
-.removed-note {
-  margin-bottom: 14px;
-  padding: 10px 16px;
-  border-radius: 10px;
-  font-size: 13px;
-  line-height: 1.6;
-  color: var(--text-secondary, #9aa4b2);
-  background: var(--panel, #161b24);
-  border: 1px dashed var(--border, #262d3d);
-}
-
-/* 下拉前的已删除条目快捷入口（它们沉在列表末尾，这里给一条明路） */
-.removed-hint {
+/* 单游戏区工具条 */
+.game-toolbar {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
   gap: 8px;
+}
+
+.filter-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
   margin-bottom: 14px;
-  padding: 8px 14px;
-  border-radius: 10px;
-  font-size: 13px;
+}
+
+.result-count {
+  font-size: 12.5px;
+  color: var(--text-dim, #9aa4b8);
+}
+
+/* 游戏卡片网格：列数算法与游戏库一致（HomeView .game-grid），
+   卡片宽度上限在 AchievementGameCard 的 max-width（220px）上 */
+.game-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 16px;
+}
+
+/* 已删除留档分区 */
+.removed-block {
+  margin-top: 26px;
+  padding-top: 18px;
+  border-top: 1px dashed var(--border, #262d3d);
+}
+
+.removed-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 700;
   color: var(--text-secondary, #9aa4b2);
 }
 
-.removed-link {
-  padding: 2px 10px;
+.removed-count {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 8px;
   border-radius: 999px;
-  font-size: 12px;
-  font-family: inherit;
-  cursor: pointer;
-  color: var(--text-secondary, #9aa4b2);
-  background: var(--panel, #161b24);
-  border: 1px dashed var(--border, #262d3d);
-  transition: color 0.15s, border-color 0.15s;
+  color: var(--text-dim, #9aa4b8);
+  background: var(--panel-2, #1b2130);
 }
 
-.removed-link:hover {
-  color: var(--accent-color, #6366f1);
-  border-color: var(--accent-color, #6366f1);
+.removed-desc {
+  margin: 6px 0 14px;
+  font-size: 12.5px;
+  color: var(--text-dim, #9aa4b8);
 }
 
 .achv-card {
@@ -711,15 +749,5 @@ function categoryColor(cat: string): string {
   font-size: 11px;
   color: #fbbf24;
   flex-shrink: 0;
-}
-
-.select-hint {
-  padding: 36px;
-  text-align: center;
-  color: var(--text-dim, #9aa4b8);
-  font-size: 13px;
-  border: 1px dashed var(--border, #262d3d);
-  border-radius: 12px;
-  background: var(--panel, #161b24);
 }
 </style>

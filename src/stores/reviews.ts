@@ -3,20 +3,15 @@ import { ref, computed } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { Review } from "../lib/tauri";
 import * as api from "../lib/tauri";
+import { displayName } from "../lib/format";
 
 /**
  * 界面展示名：英文名优先（中英文名都搜，展示纯英文策略）。
  *
- * 只在 `name_en` 为**纯 ASCII** 时优先 —— 历史脏数据里存在中文被误写进 `name_en`
- * 的条目（LLM 早期未校验），若直接优先会把卡片名显示成中文。此时退回 `name`
- * （中文名），至少语义正确（2026-10-05 修复）。
+ * 实现与游戏库共用 `lib/format.ts` 的 `displayName`（原先两处各写一份，2026-10-17 合并）；
+ * 此处 re-export 保持 `ReviewsView.vue` 等既有导入路径不变。
  */
-export function displayName(r: { name: string; name_en?: string | null }): string {
-  const en = r.name_en?.trim();
-  // eslint-disable-next-line no-control-regex
-  if (en && /^[\x00-\x7F]+$/.test(en)) return en;
-  return r.name;
-}
+export { displayName };
 
 export const useReviewsStore = defineStore("reviews", () => {
   // 状态
@@ -28,9 +23,10 @@ export const useReviewsStore = defineStore("reviews", () => {
   const refreshingIds = ref<Set<string>>(new Set());
   // 封面路径映射（键 `review:<id>`），含封面行的 updated_at 供破缓存用
   const coverPaths = ref<Record<string, api.CoverSet>>({});
+  // 游玩时长映射（键 review id）：按名匹配游戏库得来，含已删游戏的历史（2026-10-24）
+  const playTimes = ref<Record<string, api.ReviewPlayTime>>({});
   // 筛选与排序状态
   const searchQuery = ref("");
-  const statusFilter = ref("");
   const genreFilter = ref("");
   const sortBy = ref("added_at");
   const sortOrder = ref("desc");
@@ -39,19 +35,16 @@ export const useReviewsStore = defineStore("reviews", () => {
   const filteredReviews = computed(() => {
     let result = [...reviews.value];
 
-    // 搜索（中英文名都匹配）
+    // 搜索（中英文名 + 评价正文，三处都匹配）
     if (searchQuery.value) {
       const query = searchQuery.value.toLowerCase();
       result = result.filter(
         (r) =>
           r.name.toLowerCase().includes(query) ||
-          (r.name_en || "").toLowerCase().includes(query)
+          (r.name_en || "").toLowerCase().includes(query) ||
+          // 评价写得越长越难靠回忆找条目，正文一并纳入检索（2026-10-24）
+          (r.review || "").toLowerCase().includes(query)
       );
-    }
-
-    // 状态筛选
-    if (statusFilter.value) {
-      result = result.filter((r) => r.status === statusFilter.value);
     }
 
     // 类型筛选
@@ -79,6 +72,15 @@ export const useReviewsStore = defineStore("reviews", () => {
           if (b.rating == null) return -1;
           return (a.rating - b.rating) * order;
         });
+        break;
+      case "play_time":
+        // 无游玩历史按 0 算，与游戏库 play_time 排序同口径（gameFilter.ts）
+        result.sort(
+          (a, b) =>
+            ((playTimes.value[a.id]?.play_time_seconds ?? 0) -
+              (playTimes.value[b.id]?.play_time_seconds ?? 0)) *
+            order
+        );
         break;
       case "updated_at":
         result.sort((a, b) =>
@@ -123,6 +125,18 @@ export const useReviewsStore = defineStore("reviews", () => {
     }
   }
 
+  /**
+   * 拉取游玩时长映射（按名匹配游戏库，含已删游戏历史）。
+   * 匹配口径是名字，故改名/导入后必须重拉；失败不影响列表展示，只是这一栏缺失。
+   */
+  async function loadPlayTimes() {
+    try {
+      playTimes.value = await api.getReviewPlayTimes();
+    } catch (e) {
+      console.error("加载游玩时长失败:", e);
+    }
+  }
+
   // 加载列表
   let loadLock = false;
   let pendingRefresh = false;
@@ -137,6 +151,7 @@ export const useReviewsStore = defineStore("reviews", () => {
     try {
       reviews.value = await api.getReviews();
       await loadAllCovers();
+      await loadPlayTimes();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       error.value = `加载手账列表失败: ${msg}`;
@@ -155,6 +170,8 @@ export const useReviewsStore = defineStore("reviews", () => {
   async function addReview(name: string) {
     const review = await api.addReview(name);
     reviews.value.unshift(review);
+    // 新名字可能直接对上游戏库的时长，补拉一次
+    loadPlayTimes().catch(() => {});
     // 自动刷新信息（LLM + 封面），失败不阻断添加
     refreshReviewInfo(review.id).catch(() => {});
     return review;
@@ -169,6 +186,8 @@ export const useReviewsStore = defineStore("reviews", () => {
   async function importFromGame(gameId: string) {
     const review = await api.importReviewFromGame(gameId);
     reviews.value.unshift(review);
+    // 新条目按名即可匹配上游游戏的时长，补拉一次
+    loadPlayTimes().catch(() => {});
     return review;
   }
 
@@ -190,6 +209,10 @@ export const useReviewsStore = defineStore("reviews", () => {
   async function updateMeta(reviewId: string, meta: api.ReviewMetaInput) {
     const updated = await api.updateReviewMeta(reviewId, meta);
     updateReviewInStore(reviewId, updated);
+    // 改名会改变按名匹配的结果，重拉时长映射（懒惰点只影响这一栏，无所谓空跑）
+    if (meta.name !== undefined || meta.name_en !== undefined) {
+      loadPlayTimes().catch(() => {});
+    }
     return updated;
   }
 
@@ -203,13 +226,6 @@ export const useReviewsStore = defineStore("reviews", () => {
   /** 设置评价 */
   async function setReview(reviewId: string, reviewText: string | null) {
     const updated = await api.setReviewReview(reviewId, reviewText);
-    updateReviewInStore(reviewId, updated);
-    return updated;
-  }
-
-  /** 设置状态 */
-  async function setStatus(reviewId: string, status: string) {
-    const updated = await api.setReviewStatus(reviewId, status);
     updateReviewInStore(reviewId, updated);
     return updated;
   }
@@ -270,14 +286,15 @@ export const useReviewsStore = defineStore("reviews", () => {
     selectedReview,
     refreshingIds,
     searchQuery,
-    statusFilter,
     genreFilter,
     sortBy,
     sortOrder,
     filteredReviews,
     coverSrc,
     coverPaths,
+    playTimes,
     loadAllCovers,
+    loadPlayTimes,
     loadReviews,
     addReview,
     importFromGame,
@@ -285,7 +302,6 @@ export const useReviewsStore = defineStore("reviews", () => {
     updateMeta,
     setRating,
     setReview,
-    setStatus,
     setScreenshotDir,
     removeReview,
     fetchCoverOptions,

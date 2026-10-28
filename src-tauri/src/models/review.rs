@@ -25,7 +25,10 @@ pub struct Review {
     pub rating: Option<u32>,
     /// 我的评价
     pub review: Option<String>,
-    /// 状态: "wishlist"(想玩) | "playing"(游玩中) | "completed"(已通关) | "abandoned"(已弃坑)
+    /// 状态字段（2026-10-28 起停用）：手账只记玩过的游戏，四态分类已从界面移除。
+    ///
+    /// 列与字段保留是为了不多做一次 DB 迁移，新条目一律写 "completed"，
+    /// 前端不再读写。日后若要恢复分类，只需在 UI 侧重新接线即可。
     pub status: String,
     pub added_at: String,
     pub updated_at: Option<String>,
@@ -57,7 +60,8 @@ impl Review {
             hltb_completionist: None,
             rating: None,
             review: None,
-            status: "wishlist".to_string(),
+            // 手账记的都是玩过的游戏，故新条目直接记为已通关（不再有想玩/游玩中/弃坑）
+            status: "completed".to_string(),
             added_at: chrono::Utc::now().to_rfc3339(),
             updated_at: None,
             screenshot_dir: None,
@@ -70,19 +74,37 @@ impl Review {
 #[serde(default)]
 pub struct ReviewFilter {
     pub search: Option<String>,
-    /// 按状态筛选: "wishlist", "playing", "completed", "abandoned"
-    pub status: Option<String>,
     /// 按类型标签筛选（模糊匹配 genres JSON 字段）
     pub genre: Option<String>,
     pub sort_by: String,       // "name", "rating", "added_at", "updated_at"
     pub sort_order: String,    // "asc" or "desc"
 }
 
+/// 游玩时长候选行（手账「我的游玩时长」按名匹配游戏库用）。
+///
+/// 两路来源与 `get_play_stats` 同口径：在库游戏取 `games` 卡片累计；
+/// 已删游戏取 `play_stats_daily` 孤儿历史（墓碑还原名字）。墓碑只留 name，
+/// 故已删条目的 `name_en` 恒为 None。
+#[derive(Debug, Clone)]
+pub struct PlayTimeCandidate {
+    pub name: String,
+    pub name_en: Option<String>,
+    pub play_time_seconds: u64,
+    pub last_played: Option<String>,
+}
+
+/// 手账详情「我的游玩时长」展示数据（按名匹配游戏库得来，含已删游戏历史）。
+/// 只在有游玩历史时返回——纯库内条目、零时长的不进结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewPlayTime {
+    pub play_time_seconds: u64,
+    pub last_played: Option<String>,
+}
+
 impl Default for ReviewFilter {
     fn default() -> Self {
         Self {
             search: None,
-            status: None,
             genre: None,
             sort_by: "added_at".to_string(),
             sort_order: "desc".to_string(),

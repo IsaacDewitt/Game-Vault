@@ -1,4 +1,5 @@
 use tauri::State;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use crate::core::Database;
 use crate::core::cover_fetcher::CoverFetcher;
@@ -376,29 +377,6 @@ pub fn set_review_review(
     Ok(review)
 }
 
-/// 设置手账状态: "wishlist" | "playing" | "completed" | "abandoned"
-#[tauri::command(async)]
-pub fn set_review_status(
-    db: State<'_, Arc<Mutex<Database>>>,
-    review_id: String,
-    status: String,
-) -> Result<Review, String> {
-    const VALID_STATUS: [&str; 4] = ["wishlist", "playing", "completed", "abandoned"];
-    if !VALID_STATUS.contains(&status.as_str()) {
-        return Err(format!("无效的状态: {}", status));
-    }
-
-    let db = lock_or_recover(&db);
-    let mut review = db.get_review_by_id(&review_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "手账条目不存在".to_string())?;
-
-    review.status = status;
-    review.updated_at = Some(chrono::Utc::now().to_rfc3339());
-    db.update_review(&review).map_err(|e| e.to_string())?;
-    Ok(review)
-}
-
 /// 设置手账条目的截图目录（相对截图根目录的单层文件夹名；null/空串表示清除，回到自动推断）
 ///
 /// 手账自持该字段后，删不删游戏、改不改名都不再影响手账的截图库（2026-09-12）。
@@ -483,6 +461,7 @@ pub async fn fetch_review_cover_options(
     let cache_dir = utils::path::get_app_data_dir().join("covers");
     let fetcher = CoverFetcher::new(cache_dir, api_key).map_err(|e| e.to_string())?;
 
+    // 手账条目没有平台信息（也无安装目录），故不给 Steam 官方图，只走 SteamGridDB
     fetcher.fetch_cover_options(search_name, None, None)
         .await
         .map_err(|e| e.to_string())
@@ -611,6 +590,66 @@ pub fn import_review_from_game(
         review.cover_url = saved.cover_url;
     }
     Ok(review)
+}
+
+/// 游玩时长按名匹配（手账 × 游戏库）。
+///
+/// 手账与游戏库完全隔离（无外键），沿用「按名字认领」的既有口径
+/// （同 `find_review_id_by_game_name` / 墓碑认领）：手账的 `name`/`name_en`
+/// 与游戏的 `name`/`name_en` 2×2 交叉比对，trim + 小写归一后任一相等即视为
+/// 同一款游戏。多条命中（同名重复入库等）取游玩时长最大的一条。
+///
+/// 空名字不参与匹配——已删游戏的孤儿历史（无墓碑）名字还原为空串，
+/// 绝不能凭「两边都空」误命中到任意手账条目。
+fn pick_play_time(
+    review_name: &str,
+    review_name_en: Option<&str>,
+    candidates: &[PlayTimeCandidate],
+) -> Option<ReviewPlayTime> {
+    let keys: Vec<String> = [Some(review_name), review_name_en]
+        .into_iter()
+        .flatten()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+
+    candidates
+        .iter()
+        .filter(|c| {
+            [Some(c.name.as_str()), c.name_en.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .any(|k| keys.iter().any(|x| x == &k))
+        })
+        .max_by_key(|c| c.play_time_seconds)
+        .map(|c| ReviewPlayTime {
+            play_time_seconds: c.play_time_seconds,
+            last_played: c.last_played.clone(),
+        })
+}
+
+/// 手账「我的游玩时长」批量查询：按名字把手账条目对上游戏库（含已删游戏的
+/// play_stats_daily 历史），返回 review_id → 时长/最近游玩。无历史的条目不在 map 中。
+#[tauri::command(async)]
+pub fn get_review_play_times(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<HashMap<String, ReviewPlayTime>, String> {
+    let db = lock_or_recover(&db);
+    let reviews = db.get_reviews(&ReviewFilter::default()).map_err(|e| e.to_string())?;
+    let candidates = db.get_play_time_candidates().map_err(|e| e.to_string())?;
+
+    let mut map = HashMap::new();
+    for r in reviews {
+        if let Some(pt) = pick_play_time(&r.name, r.name_en.as_deref(), &candidates) {
+            map.insert(r.id, pt);
+        }
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -821,5 +860,76 @@ mod tests {
         assert_eq!(r.name, "Hollow Knight");
         // normalize 先按 ASCII 名填了同名，补全分支不覆盖（name_en 已非 None）
         assert_eq!(r.name_en.as_deref(), Some("Hollow Knight"));
+    }
+
+    // ==================== pick_play_time（手账 × 游戏库按名匹配时长） ====================
+
+    fn cand(name: &str, name_en: Option<&str>, secs: u64) -> PlayTimeCandidate {
+        PlayTimeCandidate {
+            name: name.to_string(),
+            name_en: name_en.map(|s| s.to_string()),
+            play_time_seconds: secs,
+            last_played: None,
+        }
+    }
+
+    /// 中文名对中文名命中，大小写/首尾空格不敏感
+    #[test]
+    fn 时长匹配同名命中() {
+        let c = vec![cand("空洞骑士", Some("Hollow Knight"), 3600)];
+        let hit = pick_play_time("空洞骑士", None, &c).unwrap();
+        assert_eq!(hit.play_time_seconds, 3600);
+
+        // 空格与大小写归一（英文名交叉）
+        let c2 = vec![cand("  HOLLOW KNIGHT ", None, 7200)];
+        let hit2 = pick_play_time("hollow knight", None, &c2).unwrap();
+        assert_eq!(hit2.play_time_seconds, 7200);
+    }
+
+    /// 2×2 交叉：手账 name_en 能对上游戏 name，手账 name 也能对上游戏 name_en
+    #[test]
+    fn 时长匹配英文名交叉命中() {
+        // 手账只有英文名（name 是中文、name_en 是英文）对上纯英文游戏名
+        let c = vec![cand("Hollow Knight", None, 3600)];
+        let hit = pick_play_time("空洞骑士", Some("Hollow Knight"), &c).unwrap();
+        assert_eq!(hit.play_time_seconds, 3600);
+
+        // 反向：手账 name（英文）对上游戏的 name_en
+        let c2 = vec![cand("空洞骑士", Some("Hollow Knight"), 3600)];
+        let hit2 = pick_play_time("Hollow Knight", None, &c2).unwrap();
+        assert_eq!(hit2.play_time_seconds, 3600);
+    }
+
+    /// 同名重复入库（多条命中）取游玩时长最大的一条
+    #[test]
+    fn 时长匹配多条命中取最大() {
+        let c = vec![
+            cand("空洞骑士", None, 600),
+            cand("空洞骑士", Some("Hollow Knight"), 9999),
+            cand("Hollow Knight", None, 3000),
+        ];
+        let hit = pick_play_time("空洞骑士", Some("Hollow Knight"), &c).unwrap();
+        assert_eq!(hit.play_time_seconds, 9999);
+    }
+
+    /// 没有游玩历史/完全对不上 → 不返回（详情页这一栏静默不显示）
+    #[test]
+    fn 时长匹配无命中返回空() {
+        let c = vec![cand("空洞骑士", Some("Hollow Knight"), 3600)];
+        assert!(pick_play_time("只狼", Some("Sekiro"), &c).is_none());
+        assert!(pick_play_time("", None, &c).is_none());
+    }
+
+    /// 空名字不得互相「匹配」——已删游戏的孤儿历史（无墓碑）名字还原为空串，
+    /// 若空串算相等，任何手账条目都会被误挂上孤儿时长
+    #[test]
+    fn 时长匹配空名不误命中() {
+        let c = vec![
+            cand("", None, 88888),
+            cand("", Some(""), 99999),
+        ];
+        assert!(pick_play_time("空洞骑士", None, &c).is_none());
+        assert!(pick_play_time("", None, &c).is_none());
+        assert!(pick_play_time("", Some(""), &c).is_none());
     }
 }

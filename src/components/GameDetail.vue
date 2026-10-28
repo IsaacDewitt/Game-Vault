@@ -347,17 +347,33 @@ async function handleChangeCover() {
   }
 }
 
-// 封面来源下拉菜单
+// 封面来源下拉菜单（三源并列，互不合并）
 const coverDropdownOptions = [
   { label: "从本地选择", key: "local" },
+  { label: "使用 Steam 官方封面", key: "steam" },
   { label: "从 SteamGridDB 选择", key: "steamgriddb" },
 ];
 
-function handleCoverDropdown(key: string) {
+async function handleCoverDropdown(key: string) {
   if (key === "local") {
     handleChangeCover();
+  } else if (key === "steam") {
+    await useSteamCover();
   } else if (key === "steamgriddb") {
     showCoverPicker.value = true;
+  }
+}
+
+/** Steam 官方封面：按 appid 直取 Valve 图床，不经 SteamGridDB */
+async function useSteamCover() {
+  const tip = message.loading("正在获取 Steam 官方封面…", { duration: 0 });
+  try {
+    await store.setCoverFromSteam(props.game.id);
+    message.success("已使用 Steam 官方封面");
+  } catch (e) {
+    message.error(e?.toString() || "设置 Steam 官方封面失败");
+  } finally {
+    tip.destroy();
   }
 }
 

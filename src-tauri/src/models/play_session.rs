@@ -30,6 +30,27 @@ pub struct ActiveSession {
     /// 一旦「点查说死、全表说活」，就说明该会话的点查不可信，在冷却期内不再理会
     /// 点查结果，避免在这种会话上每拍都做一次全表刷新（退化成旧行为）。
     pub poll_cooldown_until: Option<std::time::Instant>,
+    /// 挂死观察器（P1，2026-10-20）：进程树还在但 CPU 时间不再增长时兜底结算
+    pub hang: HangWatch,
+    /// 诊断日志去重键：同一状态只打一次日志，避免「全表说活」的会话每轮刷屏
+    pub last_note: Option<String>,
+}
+
+/// 挂死观察器状态（见 `constants::HANG_CPU_IDLE_SECS`）
+///
+/// 只观察**进程树是否还有 CPU 活动**，不看占用率高低：
+/// - 挂死/假活的进程树，采样窗内毫无活动（占用恒 0）；
+/// - 正常游玩的进程树（哪怕挂在暂停菜单、最小化在后台）必然有活动。
+///
+/// 采样读不到 CPU（受保护进程）时**不据此判死**——读不到不等于没在跑，这一侧必须保守。
+#[derive(Debug, Clone, Default)]
+pub struct HangWatch {
+    /// 下一次采样时刻（None = 本轮就该采）
+    pub next_sample_at: Option<std::time::Instant>,
+    /// 上一次采样到的进程树 CPU 占用合计（sysinfo 口径，仅用于日志留证）
+    pub last_usage: f32,
+    /// 合计值开始「毫无活动」的时刻（None = 未进入静默观察）
+    pub idle_since: Option<std::time::Instant>,
 }
 
 /// 每日游玩统计

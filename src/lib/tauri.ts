@@ -49,11 +49,13 @@ export interface Game {
   launch_args: string | null;
 }
 
+/**
+ * 游戏列表排序条件。
+ *
+ * 筛选（搜索 / 状态 / 类型 / 收藏）不在后端做，口径归 `lib/gameFilter.ts` 独家所有，
+ * 故这里没有对应字段——2026-10-17 与后端 `GameFilter` 同步瘦身。
+ */
 export interface GameFilter {
-  search?: string;
-  favorites_only?: boolean;
-  status?: string;
-  genre?: string;
   sort_by?: string;
   sort_order?: string;
 }
@@ -315,6 +317,11 @@ export async function fetchCoverOptions(gameId: string): Promise<CoverOption[]> 
 
 export async function setGameCoverFromUrl(gameId: string, url: string): Promise<void> {
   return invoke("set_game_cover_from_url", { gameId, url });
+}
+
+/** 用 Steam 官方封面（按 appid 直取 Valve 图床，不经过 SteamGridDB） */
+export async function setGameCoverFromSteam(gameId: string): Promise<void> {
+  return invoke("set_game_cover_from_steam", { gameId });
 }
 
 
@@ -658,7 +665,10 @@ export interface Review {
   rating: number | null;
   /** 我的评价 */
   review: string | null;
-  /** 状态: "wishlist" | "playing" | "completed" | "abandoned" */
+  /**
+   * 状态字段已停用（2026-10-28）：手账只记玩过的游戏，故四态分类从界面移除。
+   * 后端与 DB 列仍在（迁移代价大于收益），新条目一律写 "completed"，前端不读不写。
+   */
   status: string;
   added_at: string;
   updated_at: string | null;
@@ -671,7 +681,6 @@ export interface Review {
 
 export interface ReviewFilter {
   search?: string;
-  status?: string;
   genre?: string;
   sort_by?: string;
   sort_order?: string;
@@ -720,8 +729,15 @@ export async function setReviewReview(reviewId: string, reviewText: string | nul
   return invoke("set_review_review", { reviewId, reviewText });
 }
 
-export async function setReviewStatus(reviewId: string, status: string): Promise<Review> {
-  return invoke("set_review_status", { reviewId, status });
+/** 手账「我的游玩时长」：按名匹配游戏库得来（含已删游戏历史），无历史的条目不在 map 中 */
+export interface ReviewPlayTime {
+  play_time_seconds: number;
+  last_played: string | null;
+}
+
+/** 批量查全部手账条目的游玩时长映射（review_id → 时长） */
+export async function getReviewPlayTimes(): Promise<Record<string, ReviewPlayTime>> {
+  return invoke("get_review_play_times");
 }
 
 /** 指定手账的截图目录（截图根目录下的单层文件夹名；传 null 清除，回到自动推断） */

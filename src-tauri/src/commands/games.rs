@@ -10,7 +10,7 @@ use crate::core::llm_fetcher::{LlmFetcher, LlmConfig, LlmProtocol, LlmGameMeta};
 use crate::models::*;
 use crate::models::settings::Settings;
 use crate::utils;
-use crate::utils::constants::COVER_MIN_FILE_SIZE;
+use crate::utils::constants::{COVER_BATCH_INTERVAL_MS, COVER_MIN_FILE_SIZE};
 use super::lock_or_recover;
 
 /// 获取游戏列表
@@ -596,6 +596,12 @@ pub async fn fetch_missing_covers(
             "game_name": game.name,
         }));
 
+        // 批量抓取时给 SteamGridDB 留出间隔：免费层限流约 1 req/s，而每个游戏
+        // 要打 2 次 API + 1 次图床，连发很容易叠出 429（2026-10-18 加）。
+        if index > 0 {
+            crate::utils::net::sleep_ms(COVER_BATCH_INTERVAL_MS).await;
+        }
+
         match fetcher.fetch_cover(game).await {
             Ok(Some(cover_path)) => {
                 // 第三阶段：封面入库。解码/编码在网络请求之后的**无锁段**完成，
@@ -621,12 +627,25 @@ pub async fn fetch_missing_covers(
                 }
             }
             Ok(None) => {
-                tracing::warn!("未找到封面: {} (游戏名可能不在 SteamGridDB 中)", game.name);
-                errors.push(format!("{}: 未在 SteamGridDB 中找到封面，请检查游戏名称或手动设置", game.name));
+                // 走到这里说明 SteamGridDB 给了**明确答复**（未收录），
+                // 网络失败会走下面的 Err 分支——两种结局不再混在一句话里。
+                tracing::warn!("未找到封面: {} (SteamGridDB 未收录该游戏)", game.name);
+                errors.push(format!("{}: SteamGridDB 未收录，请检查游戏名称或手动设置封面", game.name));
             }
             Err(e) => {
                 tracing::warn!("获取封面失败 {}: {}", game.name, e);
                 errors.push(format!("{}: {}", game.name, e));
+                // `fetch_cover` 只在「一次明确答复都没拿到」时返回 Err（网络/接口全灭），
+                // 后面的游戏大概率同样失败 —— 直接收工，别让用户对着转圈等半小时。
+                let remaining = total_missing.saturating_sub(index as u32 + 1);
+                if remaining > 0 {
+                    tracing::warn!("网络异常，中止批量抓取，剩余 {} 个未尝试", remaining);
+                    errors.push(format!(
+                        "网络异常，已中止：剩余 {} 个游戏未尝试，请检查网络或代理后重试",
+                        remaining
+                    ));
+                }
+                break;
             }
         }
     }
@@ -638,7 +657,7 @@ pub async fn fetch_missing_covers(
     }))
 }
 
-/// 获取游戏的所有可选封面（从 SteamGridDB）
+/// 获取游戏的所有可选封面（仅 SteamGridDB；Steam 官方封面走独立命令）
 #[tauri::command]
 pub async fn fetch_cover_options(
     db: State<'_, Arc<Mutex<Database>>>,
@@ -662,9 +681,65 @@ pub async fn fetch_cover_options(
     let cache_dir = utils::path::get_app_data_dir().join("covers");
     let fetcher = CoverFetcher::new(cache_dir, api_key).map_err(|e| e.to_string())?;
 
-    fetcher.fetch_cover_options(&game_name, name_en.as_deref(), install_path.as_deref())
+    fetcher
+        .fetch_cover_options(&game_name, name_en.as_deref(), install_path.as_deref())
         .await
         .map_err(|e| e.to_string())
+}
+
+/// 把已下载到 covers 目录的中间文件入库（下载 → 入库 → 清理中间文件）
+///
+/// 抽出来给「从 URL 设封面」与「用 Steam 官方封面」共用：两条路的差别只在
+/// 下载来源，入库规则（引用计数、去重、清理）必须完全一致。
+fn ingest_downloaded_cover(
+    db: &State<'_, Arc<Mutex<Database>>>,
+    game_id: &str,
+    actual_path: &std::path::Path,
+) -> Result<(), String> {
+    // 拆锁（2026-09-12）：解码/编码在无锁段完成，只有写索引时短暂持锁
+    let prepared =
+        cover_store::prepare_path(OWNER_GAME, game_id, actual_path).map_err(|e| e.to_string())?;
+    let db_guard = lock_or_recover(db);
+    let set = cover_store::commit_prepared(&db_guard, OWNER_GAME, game_id, prepared)
+        .map_err(|e| e.to_string())?;
+    // 中间文件入库成功后清理（共享/原地替换的保护规则在函数内）
+    let _ = cover_store::cleanup_ingest_source(&db_guard, actual_path, &set, true);
+    Ok(())
+}
+
+/// 使用 Steam 官方封面（按 appid 直取 Valve 图床，不经过 SteamGridDB）
+#[tauri::command]
+pub async fn set_game_cover_from_steam(
+    db: State<'_, Arc<Mutex<Database>>>,
+    game_id: String,
+) -> Result<(), String> {
+    let (steam_url, api_key) = {
+        let db_guard = lock_or_recover(&db);
+        let game = db_guard.get_game_by_id(&game_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "游戏不存在".to_string())?;
+        let steam_url = crate::core::cover_fetcher::steam_cover_url_for(&game).ok_or_else(|| {
+            "未能识别 Steam AppID：该条目不是 Steam 游戏，安装目录里也没有 appid 线索文件"
+                .to_string()
+        })?;
+        // 下载客户端要 API Key 只是为了构造，Steam 图床不需要它
+        let api_key = db_guard.get_setting("steamgriddb_api_key")
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        (steam_url, api_key)
+    };
+
+    let covers_dir = utils::path::get_covers_dir();
+    utils::path::ensure_dir_exists(&covers_dir).map_err(|e| e.to_string())?;
+    let save_path = covers_dir.join(format!(".{}.steam", game_id));
+
+    let fetcher = CoverFetcher::new(covers_dir.clone(), api_key).map_err(|e| e.to_string())?;
+    let actual_path = fetcher
+        .download_from_url(&steam_url, &save_path)
+        .await
+        .map_err(|e| format!("下载 Steam 官方封面失败: {e}"))?;
+
+    ingest_downloaded_cover(&db, &game_id, &actual_path)
 }
 
 /// 从 URL 下载封面图片并设置为游戏封面
@@ -696,15 +771,7 @@ pub async fn set_game_cover_from_url(
         .await
         .map_err(|e| format!("下载封面失败: {}", e))?;
 
-    // 同样拆锁（2026-09-12）：解码/编码在无锁段完成，只有写索引时短暂持锁
-    let prepared = cover_store::prepare_path(OWNER_GAME, &game_id, &actual_path)
-        .map_err(|e| e.to_string())?;
-    let db_guard = lock_or_recover(&db);
-    let set = cover_store::commit_prepared(&db_guard, OWNER_GAME, &game_id, prepared)
-        .map_err(|e| e.to_string())?;
-    // 中间文件入库成功后清理（共享/原地替换的保护规则在函数内）
-    let _ = cover_store::cleanup_ingest_source(&db_guard, &actual_path, &set, true);
-    Ok(())
+    ingest_downloaded_cover(&db, &game_id, &actual_path)
 }
 
 /// 将 LLM 返回的元数据合并到游戏对象（只更新非空字段，保留用户已有数据）

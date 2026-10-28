@@ -4,19 +4,16 @@ import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { Game } from "../lib/tauri";
 import * as api from "../lib/tauri";
+import { filterAndSortGames } from "../lib/gameFilter";
 
 /**
- * 卡片展示名：英文名优先（与手账 `reviews.ts` 的 `displayName` 同口径）。
+ * 卡片展示名：英文名优先（与手账 `reviews.ts` 同口径）。
  *
- * 仅在 `name_en` 为**纯 ASCII** 时优先——历史脏数据里存在中文被误写进 `name_en`
- * 的条目，直接优先会把卡片名显示成中文。此时退回 `name`（2026-10-05 修复）。
+ * 实现已下沉到 `lib/format.ts`——`lib/gameFilter.ts` 的排序要用它，
+ * 若留在这里会形成 store ↔ lib 的循环依赖。此处只做 re-export，
+ * 保持 `GameCard.vue` 等既有导入路径不变。
  */
-export function displayName(g: { name: string; name_en?: string | null }): string {
-  const en = g.name_en?.trim();
-  // eslint-disable-next-line no-control-regex
-  if (en && /^[\x00-\x7F]+$/.test(en)) return en;
-  return g.name;
-}
+export { displayName } from "../lib/format";
 
 export const useGamesStore = defineStore("games", () => {
   // 状态
@@ -36,6 +33,9 @@ export const useGamesStore = defineStore("games", () => {
   const statusFilter = ref("");
   const genreFilter = ref("");
   const allGenres = ref<string[]>([]);
+  // 排序状态（默认与旧行为一致：最近游玩优先）
+  const sortBy = ref("last_played");
+  const sortOrder = ref("desc");
   // 存档路径检查结果 (game_id -> 是否存在)
   const savePathStatus = ref<Record<string, boolean>>({});
   const checkingSavePaths = ref(false);
@@ -103,51 +103,20 @@ export const useGamesStore = defineStore("games", () => {
     }
   }
 
-  // 计算属性
-  const filteredGames = computed(() => {
-    let result = games.value;
-
-    // 搜索筛选：中英文名都匹配（2026-10-06）。
-    // 卡片展示的是 displayName（英文名优先），若这里只匹配 name，用户照着卡片上的
-    // 英文名一搜就是 0 命中 —— 手账库（stores/reviews.ts）一直是中英文都匹配，此处对齐。
-    if (searchQuery.value) {
-      const query = searchQuery.value.toLowerCase();
-      result = result.filter(
-        (g) =>
-          g.name.toLowerCase().includes(query) ||
-          (g.name_en ?? "").toLowerCase().includes(query)
-      );
-    }
-
-    // 状态筛选（与后端 get_status_stats 的智能推导保持一致：
-    // 是否「玩过」看 play_time_seconds、是否「通关」看 status=completed）
-    if (statusFilter.value) {
-      if (statusFilter.value === "favorites") {
-        result = result.filter((g) => g.is_favorite);
-      } else if (statusFilter.value === "unplayed") {
-        // 未游玩 = 从未启动（无游玩时长）且未通关
-        result = result.filter((g) => g.status !== "completed" && g.play_time_seconds === 0);
-      } else if (statusFilter.value === "played") {
-        // 已游玩 = 启动过（有游玩时长）且未通关
-        result = result.filter((g) => g.status !== "completed" && g.play_time_seconds > 0);
-      } else if (statusFilter.value === "completed") {
-        // 已通关 = 用户手动标记
-        result = result.filter((g) => g.status === "completed");
-      } else {
-        result = result.filter((g) => g.status === statusFilter.value);
-      }
-    }
-
-    // 类型筛选
-    if (genreFilter.value) {
-      const genre = genreFilter.value.toLowerCase();
-      result = result.filter((g) =>
-        g.genres.some((gr) => gr.toLowerCase().includes(genre))
-      );
-    }
-
-    return result;
-  });
+  // 计算属性：筛选 + 排序统一走 lib/gameFilter.ts（纯函数，有单测守护）
+  // 三态口径：已通关 = status === "completed"（用户手动标记）；
+  // 已游玩 / 未游玩 = 由 play_time_seconds 派生，与后端 get_status_stats 的 CASE 同口径。
+  // 原实现在这里内联了一份同义逻辑，且末尾留着一个 UI 值域下永远走不到的
+  // 「按原始 status 精确匹配」分支——2026-10-17 随抽离一并清理。
+  const filteredGames = computed(() =>
+    filterAndSortGames(games.value, {
+      search: searchQuery.value,
+      status: statusFilter.value,
+      genre: genreFilter.value,
+      sortBy: sortBy.value,
+      sortOrder: sortOrder.value,
+    })
+  );
 
   // 方法
   let loadGamesLock = false;
@@ -384,6 +353,18 @@ export const useGamesStore = defineStore("games", () => {
     }
   }
 
+  /** 用 Steam 官方封面（appid 直取 Valve 图床；识别不到 appid 会抛错） */
+  async function setCoverFromSteam(gameId: string) {
+    try {
+      await api.setGameCoverFromSteam(gameId);
+      await loadGames();
+      checkAchievementsQuietly();
+    } catch (e) {
+      console.error("设置 Steam 官方封面失败:", e);
+      throw e;
+    }
+  }
+
   async function launch(gameId: string) {
     try {
       await api.launchGame(gameId);
@@ -540,6 +521,8 @@ export const useGamesStore = defineStore("games", () => {
     gameInfoFetchProgress,
     statusFilter,
     genreFilter,
+    sortBy,
+    sortOrder,
     allGenres,
     savePathStatus,
     checkingSavePaths,
@@ -556,6 +539,7 @@ export const useGamesStore = defineStore("games", () => {
     setCover,
     fetchCoverOptions,
     setCoverFromUrl,
+    setCoverFromSteam,
     launch,
     toggleFav,
     removeGame,

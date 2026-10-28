@@ -50,7 +50,9 @@ fn tone_path_str(p: ToneMapPath) -> &'static str {
     match p {
         ToneMapPath::DirectSrgb => "direct_srgb",
         ToneMapPath::DivideWhiteLevel => "divide_white_level",
-        ToneMapPath::Reinhard => "reinhard",
+        // 2026-10-24 起扩展范围走 Khronos PBR Neutral 压缩，不再是 Reinhard。
+        // 该字符串只进日志与前端字段（前端未消费），改名不影响契约。
+        ToneMapPath::ExtendedRange => "extended_range",
     }
 }
 

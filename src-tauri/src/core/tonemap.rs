@@ -8,15 +8,24 @@
 //! 三者共识与本模块的对应实现：
 //! 1. **白电平必须参数化**：scRGB 帧里 SDR 白 = 系统滑块 nits/80（80~480），
 //!    由 `sdr_white` 模块查询传入，绝不硬编码（OBS 的 sdr_white_level 滑块同款）。
-//! 2. **SDR 内容零损失**：亮度 ≤ SDR 白的部分恒等直通——截图与视频不同，
+//! 2. **SDR 内容尽量零损失**：亮度低于 SDR 白的部分恒等直通——截图与视频不同，
 //!    视频可把 SDR 白压到中灰（BT.2408 reference white），截图观感必须
 //!    "原样"，只有真正的 HDR 高光需要处理。原裸 Reinhard L/(1+L) 会把
 //!    SDR 白压到 0.5、中灰压暗一成，正是被推翻的旧实现。
-//! 3. **高光走 knee 肩部压缩**：libplacebo 默认的 spline/BT.2390 均为
-//!    "低区恒等 + 肩部 roll-off"结构；本模块实现其线性域简化版
-//!    （smoothstep 肩部），并把肩部最亮点压至 1-0.35 而非硬裁剪。
-//!    OBS/hdrfix 用的 extended Reinhard 属同类单 knee 曲线，但会把
-//!    SDR 白也压暗，不适合截图语义，故取其结构弃其曲线。
+//! 3. **高光走单调压缩**（2026-10-24 重做，来源见下）：改用 Khronos PBR Neutral
+//!    的压缩支（略去 F90 toe 以保黑位）。归一化到 SDR 白 = 1.0 后，0.76 以下
+//!    逐字节恒等；0.76 以上按 max(R,G,B) 单调压向 1.0，越亮越向白去饱和。
+//!    保色相、C¹ 连续、无硬裁剪、解析可逆（Blender 4.2 / three.js / Filament 同款）。
+//!
+//!    【血案，勿回退】此前的实现是「恒等段 + 反向下压的肩部」：
+//!    `scale = (1 - 0.35*h)/n` ⇒ 输出亮度 = `1 - 0.35*h`，而 h 随 n 单调递增，
+//!    于是帧内越亮输出越暗：360nit→255、480nit→251、640nit→238、1000nit→211。
+//!    那不是 tone curve，是高光倒挂 —— SDR 白与峰值之间的像素全被压到比白墙更闷。
+//!    由 `test_extended_range_is_monotonic` 钉死，改前先跑它。
+//!
+//!    【有意的代价】含 HDR 高光的帧里，SDR 白从 255 让到 241（线性 0.88），
+//!    腾出的 14 个码阶给高光分层。8bit 只有 256 格，"完美锁 SDR"与"高光有层次"
+//!    数学上互斥；纯 SDR 帧（max ≤ SDR 白）不进这条路径，仍逐字节不变。
 //! 4. **越界色保亮度收敛**：宽色域（Rec.2020/P3）内容在 scRGB 中会出现
 //!    负分量；超白高光会出现 >1 分量。按 libplacebo 的 desaturate 模式
 //!    （保 CIE 亮度向灰轴收敛）单步精确求解收缩系数。
@@ -28,9 +37,13 @@ use std::sync::OnceLock;
 
 use half::f16;
 
-/// 肩部最大下压深度：最强高光被压到 1-0.35=0.65 线性亮度（sRGB 约 211/255）。
-/// 取值权衡：过小则高光无层次（近似硬裁剪），过大则高光发灰。
-const SHOULDER_DEPTH: f32 = 0.35;
+/// PBR Neutral 压缩起点（官方 Ks − F90 = 0.8 − 0.04）。
+/// 归一化到「SDR 白 = 1.0」之后，线性亮度低于此值的像素逐字节恒等。
+const PBR_START: f32 = 0.8 - 0.04;
+
+/// PBR Neutral 去饱和速度（官方 Kd）：峰值处按此速度向白收敛，
+/// 让"更亮"在高光段仍有可感知的方向，而不是靠裁剪。
+const PBR_DESAT: f32 = 0.15;
 
 /// 三级判定结果，决定走哪条编码路径
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,8 +52,8 @@ pub enum ToneMapPath {
     DirectSrgb,
     /// SDR 内容整体随系统 SDR 白电平线性缩放，除回白电平系数即无损还原
     DivideWhiteLevel,
-    /// 存在 HDR 高光（> SDR 白），恒等段 + 肩部压缩
-    Reinhard,
+    /// 存在超过 SDR 白的内容（HDR / AutoHDR 扩展范围），走 PBR Neutral 单调压缩
+    ExtendedRange,
 }
 
 /// 一帧 HDR 数据的亮度统计（第一遍扫描得到）
@@ -48,18 +61,24 @@ pub enum ToneMapPath {
 struct LuminanceStats {
     /// 最大线性亮度
     max: f32,
+    /// 亮度超过 SDR 白的像素数（诊断用：区分"整帧真 HDR"与"个别高光点"）
+    over_white: usize,
 }
 
 impl LuminanceStats {
-    fn from_frame(rgba: &[f32]) -> Self {
+    fn from_frame(rgba: &[f32], ws: f32) -> Self {
         let mut max = 0.0f32;
+        let mut over_white = 0usize;
         for px in rgba.chunks_exact(4) {
             let l = luminance(px[0], px[1], px[2]);
             if l > max {
                 max = l;
             }
+            if l > ws {
+                over_white += 1;
+            }
         }
-        Self { max }
+        Self { max, over_white }
     }
 }
 
@@ -120,9 +139,32 @@ fn encode_alpha(a: f32) -> u8 {
     (a.clamp(0.0, 1.0) * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
+/// Khronos PBR Neutral 压缩支（略去 F90 toe，保黑位）。
+///
+/// 输入已归一化到「SDR 白 = 1.0」。低于 `PBR_START` 原样返回；以上按
+/// `max(R,G,B)` 单调压向 1.0，并按 `PBR_DESAT` 向白去饱和。三个通道同乘一个
+/// 标量（再向白插值），故色相不偏；曲线一阶导在拐点连续，不会出色带。
+///
+/// 数学性质（Khronos 规范）：非负输入必得 [0,1] 输出，且解析可逆。
+#[inline]
+fn compress_extended(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let peak = r.max(g).max(b);
+    if peak < PBR_START {
+        return (r, g, b);
+    }
+    let d = 1.0 - PBR_START;
+    // 单调递增、渐近于 1.0：peak = PBR_START 时等于 PBR_START，peak → ∞ 时 → 1
+    let new_peak = 1.0 - d * d / (peak + d - PBR_START);
+    let scale = new_peak / peak;
+    // 去饱和权重：峰值与压缩后白点差得越多越向白靠（官方 Kd 公式）
+    let keep = 1.0 / (PBR_DESAT * (peak - new_peak) + 1.0);
+    let f = |c: f32| new_peak + (c * scale - new_peak) * keep;
+    (f(r), f(g), f(b))
+}
+
 /// 单像素核心：路径分派 → 越界色收敛 → sRGB 编码。返回该像素的 RGBA8 四字节。
 #[inline]
-fn tonemap_pixel(px: &[f32], path: ToneMapPath, ws: f32, shoulder_w: f32) -> [u8; 4] {
+fn tonemap_pixel(px: &[f32], path: ToneMapPath, ws: f32) -> [u8; 4] {
     let (mut r, mut g, mut b) = (px[0], px[1], px[2]);
 
     match path {
@@ -135,22 +177,13 @@ fn tonemap_pixel(px: &[f32], path: ToneMapPath, ws: f32, shoulder_w: f32) -> [u8
             g /= ws;
             b /= ws;
         }
-        ToneMapPath::Reinhard => {
-            // 归一化到 SDR 白 = 1.0
-            r /= ws;
-            g /= ws;
-            b /= ws;
-            // 恒等段 + 肩部：亮度 ≤ 1（SDR 内容）完全不动；
-            // (1, W] 的 HDR 高光经 smoothstep 肩部平滑压入 (1-d, 1]。
-            let n = luminance(r, g, b);
-            if n > 1.0 {
-                let t = ((n - 1.0) / (shoulder_w - 1.0)).clamp(0.0, 1.0);
-                let h = 3.0 * t * t - 2.0 * t * t * t;
-                let scale = (1.0 - SHOULDER_DEPTH * h) / n;
-                r *= scale;
-                g *= scale;
-                b *= scale;
-            }
+        ToneMapPath::ExtendedRange => {
+            // 归一化到 SDR 白 = 1.0，再走单调压缩：
+            // 0.76 以下（SDR 内容主体）逐字节恒等，以上按亮度分层
+            let (cr, cg, cb) = compress_extended(r / ws, g / ws, b / ws);
+            r = cr;
+            g = cg;
+            b = cb;
         }
     }
 
@@ -234,9 +267,8 @@ pub fn tonemap_rgba16f_to_srgb(
     let parsed_pixels = linear.len() / 4;
 
     // 第一遍统计亮度（用原始线性值判定）
-    let stats = LuminanceStats::from_frame(&linear);
-
     let ws = if white_level_scale > 0.0 { white_level_scale } else { 1.0 };
+    let stats = LuminanceStats::from_frame(&linear, ws);
 
     // 三级判定：ws 是帧内 SDR 白的真实线性值
     let path = if stats.max <= ws {
@@ -246,14 +278,26 @@ pub fn tonemap_rgba16f_to_srgb(
             ToneMapPath::DivideWhiteLevel
         }
     } else {
-        ToneMapPath::Reinhard
+        ToneMapPath::ExtendedRange
     };
 
-    // 肩部白点：帧内最亮像素（归一化到 SDR 白=1.0 的域）。
-    // 取 max 而非 p999：截图语义下高光占比小（太阳/灯光常 <1% 像素），
-    // p999 抓不到会把肩部预算浪费在 [1,1] 区间、高光全压到肩底发灰；
-    // 取 max 则肩部覆盖全部高光范围，个别超界坏点由 clamp 兜底。
-    let shoulder_w = (stats.max / ws).max(1.0 + 1e-6);
+    // 诊断：扩展范围帧打出 max/ws 与超白像素占比。
+    // 【为什么要有这两项】2026-10-23 排查"地铁 2033 截图过曝"时，日志里只有
+    // tonemap 路径名，无法区分"整帧真 HDR""AutoHDR 抬亮"还是"一两个热点击穿"，
+    // 白白多花了一轮取证。有这两个数就能一眼定位。
+    if path == ToneMapPath::ExtendedRange {
+        let total = parsed_pixels.max(1);
+        tracing::info!(
+            "[tonemap] 扩展范围帧：max={:.3}（≈{:.0} nit），SDR 白={:.3}（≈{:.0} nit），\
+             max/ws={:.2}，超白像素 {:.3}%",
+            stats.max,
+            stats.max * 80.0,
+            ws,
+            ws * 80.0,
+            stats.max / ws,
+            stats.over_white as f64 / total as f64 * 100.0
+        );
+    }
 
     // 第二遍：逐像素映射 + 编码（见 `tonemap_pixel`：数学与重构前逐字一致，
     // 唯一变化是 sRGB 编码改走 65536 项查找表，替掉每像素 3 次 powf）。
@@ -262,7 +306,7 @@ pub fn tonemap_rgba16f_to_srgb(
     // 任何"一边处理一边定路径"的融合优化都会改变输出，不可做。
     let mut out: Vec<u8> = vec![0u8; parsed_pixels * 4];
     for (dst, px) in out.chunks_exact_mut(4).zip(linear.chunks_exact(4)) {
-        dst.copy_from_slice(&tonemap_pixel(px, path, ws, shoulder_w));
+        dst.copy_from_slice(&tonemap_pixel(px, path, ws));
     }
 
     (out, path)
@@ -344,10 +388,13 @@ mod tests {
         assert_eq!(out[4], 188);
     }
 
-    /// 核心恒等性：混合帧中亮度 ≤ SDR 白的像素，输出必须与纯 SDR 帧逐字节一致
-    /// （旧裸 Reinhard 会把中灰压暗一成、SDR 白压半，此测试防回归）
+    /// SDR 主体在扩展范围帧中仍逐字节恒等：亮度低于压缩起点（0.76×ws）的像素一律不动
+    /// —— 这是"截图要原样"的底线（旧裸 Reinhard 会把中灰压暗一成，此测试防回归）。
+    ///
+    /// 同时钉住那笔**有意的代价**：SDR 白（1.0）在含高光的帧里让到 241，
+    /// 腾出的码阶给高光分层；纯 SDR 帧仍是 255。
     #[test]
-    fn test_reinhard_keeps_sdr_pixels_identical() {
+    fn test_extended_range_keeps_sub_knee_identical() {
         let mixed = fp16_frame(&[
             [0.18, 0.18, 0.18, 1.0],
             [0.5, 0.5, 0.5, 1.0],
@@ -362,37 +409,88 @@ mod tests {
         ]);
         let (out_mixed, path_mixed) = tonemap_rgba16f_to_srgb(&mixed, 4, 1, 1.0);
         let (out_sdr, _) = tonemap_rgba16f_to_srgb(&sdr_only, 4, 1, 1.0);
-        assert_eq!(path_mixed, ToneMapPath::Reinhard);
-        // 前 3 像素（0.18/0.5/1.0）逐字节相等
-        for i in 0..3 {
+        assert_eq!(path_mixed, ToneMapPath::ExtendedRange);
+        // 压缩起点以下（0.18 / 0.5）逐字节相等
+        for i in 0..2 {
             assert_eq!(
                 &out_mixed[i * 4..i * 4 + 4],
                 &out_sdr[i * 4..i * 4 + 4],
                 "像素 {i} 在 HDR 混合帧中被意外改动"
             );
         }
-        // 高光像素被压缩但不裁剪成死白
-        assert!(out_mixed[12] < 255, "高光不应顶格死白");
-        assert!(out_mixed[12] > 150, "高光不应被压到过暗，实际 {}", out_mixed[12]);
+        // SDR 白：混帧让到 241，纯 SDR 帧保持 255
+        assert_eq!(out_mixed[8], 241, "SDR 白应让到 241");
+        assert_eq!(out_sdr[8], 255, "纯 SDR 帧不得被压");
+        // 3.0 线性（240nit）：单调地高于 SDR 白，且未顶格
+        assert!(
+            out_mixed[12] > 241 && out_mixed[12] < 255,
+            "高光应落在 SDR 白之上且留余量，实际 {}",
+            out_mixed[12]
+        );
     }
 
-    /// 肩部压缩落点：单强高光（10.0 线性 = 800nits）应压到肩底
-    /// 1-0.35=0.65 线性 ≈ sRGB 211，而非裁剪 255 或旧裸 Reinhard 的 118
+    /// 【血案防线，2026-10-24】扩展范围路径必须**单调不减**：帧内越亮，输出越亮。
+    ///
+    /// 旧肩部 `scale = (1 - 0.35h)/n` 使输出亮度 = `1 - 0.35h`、随 n 递减，
+    /// 实测 360nit→255、480nit→251、640nit→238、1000nit→211 —— 高光倒挂。
+    /// 这条测试是这个 bug 的唯一防线：旧测试只用单像素帧，永远踩在曲线终点。
     #[test]
-    fn test_reinhard_shoulder_compresses_peak() {
+    fn test_extended_range_is_monotonic() {
+        let ws = 4.5; // 老爷机器上的真实 SDR 白（360nits）
+        let ladder: [f32; 10] = [3.0, 4.5, 4.6, 5.0, 6.0, 8.0, 12.5, 20.0, 25.0, 50.0];
+        let pixels: Vec<[f32; 4]> = ladder.iter().map(|v| [*v, *v, *v, 1.0]).collect();
+        let src = fp16_frame(&pixels);
+        let (out, path) = tonemap_rgba16f_to_srgb(&src, ladder.len() as u32, 1, ws);
+        assert_eq!(path, ToneMapPath::ExtendedRange);
+
+        let codes: Vec<u8> = (0..ladder.len()).map(|i| out[i * 4]).collect();
+        for (i, w) in codes.windows(2).enumerate() {
+            assert!(
+                w[1] >= w[0],
+                "亮度阶梯在 {:.2}→{:.2} 线性处倒挂：sRGB {}→{}（全梯 {:?}）",
+                ladder[i],
+                ladder[i + 1],
+                w[0],
+                w[1],
+                codes
+            );
+        }
+        // 峰值必须比 SDR 白落点更亮 —— 否则就是倒挂又回来了
+        let peak = *codes.last().unwrap();
+        assert!(peak > 241, "峰值应高于 SDR 白（241），实际 {peak}");
+    }
+
+    /// 扩展范围峰值应逼近白点：10.0 线性（800nit）落在 250~255，
+    /// 而非旧实现的 211（肩底）或裁剪成死白。
+    #[test]
+    fn test_extended_range_peak_approaches_white() {
         let src = fp16_frame(&[[10.0, 10.0, 10.0, 1.0]]);
         let (out, path) = tonemap_rgba16f_to_srgb(&src, 1, 1, 1.0);
-        assert_eq!(path, ToneMapPath::Reinhard);
+        assert_eq!(path, ToneMapPath::ExtendedRange);
         assert_eq!(out.len(), 4, "1x1 帧应输出 4 字节 RGBA");
-        // 0.65 线性 → sRGB(0.65) ≈ 0.827 → 211；留容差防精度漂移
         assert!(
-            (195..=225).contains(&out[0]),
-            "肩底落点应在 195~225，实际 {}",
+            (250..=255).contains(&out[0]),
+            "峰值应逼近白点，实际 {}",
             out[0]
         );
     }
 
-    /// 原生 HDR 极值（4000nits = 50.0 线性）：中灰恒等 + 高光有层次不 NaN
+    /// 高饱和高光保色相：单通道超白不得被裁成偏色死块。
+    /// 线性 (0.5, 3.0, 20.0) 是霓虹蓝，直接裁 255 会得到死蓝 (62,118,255)；
+    /// PBR Neutral 按 max 通道等比缩放 + 向白插值，暗通道会被抬起来。
+    #[test]
+    fn test_extended_range_preserves_hue() {
+        let src = fp16_frame(&[[0.5, 3.0, 20.0, 1.0]]);
+        let (out, _) = tonemap_rgba16f_to_srgb(&src, 1, 1, 1.0);
+        assert!(
+            out[2] > out[1] && out[1] > out[0],
+            "通道序应保持 B>G>R，实际 {out:?}"
+        );
+        assert!(out[2] >= 250, "主通道应接近白，实际 {out:?}");
+        assert!(out[0] > 62, "暗通道应被去饱和抬起（硬裁会得到 62），实际 {out:?}");
+    }
+
+    /// 原生 HDR 极值（4000nits = 50.0 线性）：中灰恒等 + 峰值贴白不 NaN
     #[test]
     fn test_high_peak_4000nits() {
         let src = fp16_frame(&[[0.18, 0.18, 0.18, 1.0], [50.0, 50.0, 50.0, 1.0]]);
@@ -401,8 +499,12 @@ mod tests {
         let (out_sdr, _) = tonemap_rgba16f_to_srgb(&sdr, 2, 1, 1.0);
         // 中灰在 4000nits 高光旁保持零损失
         assert_eq!(out_hdr[0], out_sdr[0], "中灰不应被极端高光拖动");
-        // 高光压入肩部区间
-        assert!((150..=254).contains(&out_hdr[4]), "高光落点异常: {}", out_hdr[4]);
+        // 4000nit 峰值贴到白点（254），不得被压到中灰
+        assert!(
+            (253..=255).contains(&out_hdr[4]),
+            "峰值落点异常: {}",
+            out_hdr[4]
+        );
     }
 
     /// 宽色域负分量（Rec.2020 高饱和色在 scRGB 中 R<0）：保亮度精确收敛

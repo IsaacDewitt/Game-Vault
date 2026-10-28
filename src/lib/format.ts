@@ -24,6 +24,22 @@ export function formatPlayTime(seconds: number): string {
 }
 
 /**
+ * 卡片展示名：英文名优先。
+ *
+ * 仅在 `name_en` 为**纯 ASCII** 时优先——历史脏数据里存在中文被误写进 `name_en`
+ * 的条目（LLM 早期未校验），直接优先会把卡片名显示成中文，此时退回 `name`。
+ *
+ * 游戏库与手账共用同一口径，放在这里是为了让 `lib/gameFilter.ts` 的排序
+ * 能直接复用，而不必反向依赖 store（那会形成循环依赖）。
+ */
+export function displayName(x: { name: string; name_en?: string | null }): string {
+  const en = x.name_en?.trim();
+  // eslint-disable-next-line no-control-regex
+  if (en && /^[\x00-\x7F]+$/.test(en)) return en;
+  return x.name;
+}
+
+/**
  * 格式化日期
  */
 export function formatDate(dateStr: string | null): string {

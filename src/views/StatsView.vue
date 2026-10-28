@@ -82,6 +82,9 @@ const overview = ref<{
   today_play_time: 0,
 });
 const playStats = ref<PlayStats[]>([]);
+// 时长排行一次取全：库里玩过的条目（含已移除但留有历史）通常几十条。
+// 上界与后端 STATS_MAX_LIMIT（1000）对齐——多传也没用，命令层会钳位。
+const PLAY_STATS_LIMIT = 1000;
 const dailyStats = ref<DailyStats[]>([]);
 const genreStats = ref<GenreStats[]>([]);
 const heatmapStats = ref<HeatmapDay[]>([]);
@@ -441,9 +444,10 @@ const genreBarOption = computed(() => {
   };
 });
 
-// 游戏时长排行数据（前 10，正序排列用于展示）
-const top10 = computed(() => {
-  return playStats.value.slice(0, 10).map((s) => ({
+// 游戏时长排行数据（全量，后端已按累计时长降序）
+// 展示容器限高滚动，不再截断——榜单保留完整排名，卡片高度与原来前十时一致
+const rankedStats = computed(() => {
+  return playStats.value.map((s) => ({
     ...s,
     hours: Number((s.total_seconds / 3600).toFixed(1)),
   }));
@@ -451,7 +455,7 @@ const top10 = computed(() => {
 
 // bar 宽度百分比（相对最大值）
 function barWidth(hours: number): string {
-  const maxHours = top10.value.length > 0 ? top10.value[0].hours : 1;
+  const maxHours = rankedStats.value.length > 0 ? rankedStats.value[0].hours : 1;
   return Math.max((hours / maxHours) * 100, 2) + "%";
 }
 
@@ -861,7 +865,7 @@ async function loadStats() {
   try {
     const [ov, ps, ds, gs, hs, hls, ss] = await Promise.all([
       api.getOverviewStats(),
-      api.getPlayStats(20),
+      api.getPlayStats(PLAY_STATS_LIMIT),
       api.getDailyStats(30),
       api.getGenreStats(),
       api.getHeatmapStats(365),
@@ -962,7 +966,7 @@ onUnmounted(() => {
               <n-card title="时长排行">
                 <div class="custom-bar-chart">
                   <div
-                    v-for="(game, index) in top10"
+                    v-for="(game, index) in rankedStats"
                     :key="game.game_id"
                     class="bar-row"
                   >
@@ -973,6 +977,8 @@ onUnmounted(() => {
                         :src="gamesStore.coverSrc(game.game_id)!"
                         :alt="game.game_name"
                         class="bar-icon-img"
+                        loading="lazy"
+                        decoding="async"
                       />
                       <div v-else class="bar-icon-fallback">🎮</div>
                     </div>
@@ -1348,11 +1354,34 @@ onUnmounted(() => {
 }
 
 /* 自定义条形图 */
+/* 榜单限高滚动：10 行（40px 行高 + 8px 间距）加内边距正好 480px，
+   与原先只显示前 10 时卡片高度一致；再多就靠滚轮下翻，卡片不随条目数长高 */
 .custom-bar-chart {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 4px 0;
+  max-height: 480px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.custom-bar-chart::-webkit-scrollbar {
+  width: 6px;
+}
+
+.custom-bar-chart::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-bar-chart::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 3px;
+}
+
+.custom-bar-chart::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.32);
 }
 
 .bar-row {
@@ -1360,6 +1389,8 @@ onUnmounted(() => {
   align-items: center;
   gap: 10px;
   height: 40px;
+  /* 列向 flex 容器溢出时子项默认会被压缩，必须锁死行高才能滚动而非挤扁 */
+  flex-shrink: 0;
 }
 
 .bar-rank {

@@ -5,7 +5,7 @@
 基于 **Tauri 2.0** + **Rust** + **Vue 3** 构建，本机运行，数据完全离线。
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.6-6366f1" alt="version">
+  <img src="https://img.shields.io/badge/version-0.8.7-6366f1" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2B-blue" alt="platform">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
 </p>
@@ -65,7 +65,8 @@
 
 | 功能 | 说明 |
 |------|------|
-| 独立手账库 | 与游戏库平行的存档簿：题名、评分（满分自定）、评语、状态、封面、类型等 |
+| 独立手账库 | 与游戏库平行的存档簿：题名、评分（满分自定）、评语、封面、类型等（手账只记玩过的游戏，不设状态分类） |
+| 评语排版 | 长评默认按正文阅读（空行分段、行首「- 」成列表、星号夹住即加粗），超过 8 行折叠；点「编辑」才回到输入框 |
 | 手账截图库 | 每款游戏独立截图目录，自持解析（游戏删除后依旧可用） |
 | 灵活补充 | 手动补录未入库的老游戏、已卸载的游戏，历史不受游戏库变动影响 |
 
