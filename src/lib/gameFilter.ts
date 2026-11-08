@@ -99,10 +99,13 @@ export function filterGames<T extends FilterableGame>(
 /**
  * 排序（不改原数组）。
  *
- * - `last_played`：从未玩过（null）**恒排最后**，不受升降序影响
- *   （与手账 `rating` 为 null 的处理一致——空值堆在末尾比混在中间更好读）。
+ * - `last_played`（界面名「最近互动」）：排序键 = 有游玩记录取 `last_played`，
+ *   从未玩过则退回 `added_at`——即「最近一次互动（玩过或入库）」。
+ *   2026-11-08 由「NULL 恒排最后」改成这个样子：旧口径下新加的游戏必然沉到列表末尾，
+ *   加完还得一路往下翻才看得见（老爷原话）。改成入库时间兜底后，新游戏自然落在最前面。
  * - `name`：按展示名排序（英文优先），中文用 `zh-Hans-CN` 排序规则。
- * - 时间字段是 RFC3339 字符串，同源同格式下字典序等价于时间序。
+ * - 时间字段是 RFC3339 字符串，同为 UTC（`chrono::Utc::now().to_rfc3339()`），
+ *   字典序等价于时间序，故 `last_played` 与 `added_at` 可以放在同一根轴上比较。
  */
 export function sortGames<T extends FilterableGame>(
   games: readonly T[],
@@ -125,8 +128,9 @@ export function sortGames<T extends FilterableGame>(
 
       case "last_played":
       default: {
-        const av = a.last_played ?? "";
-        const bv = b.last_played ?? "";
+        // 排序键：游过的看游玩时间，没游过的看入库时间（新加的游戏才不会沉底）
+        const av = a.last_played ?? a.added_at ?? "";
+        const bv = b.last_played ?? b.added_at ?? "";
         if (!av && !bv) return 0;
         if (!av) return 1;
         if (!bv) return -1;

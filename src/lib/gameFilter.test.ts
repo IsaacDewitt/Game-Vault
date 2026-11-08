@@ -112,29 +112,44 @@ describe("filterGames", () => {
 });
 
 describe("sortGames", () => {
-  it("最近游玩：降序按时间倒序，从未玩过的恒排最后", () => {
+  it("最近互动：有游玩记录看游玩时间，从未玩过看入库时间（降序）", () => {
     const lib = [
-      g({ name: "never" }),
-      g({ name: "old", last_played: "2026-01-01T00:00:00+00:00" }),
-      g({ name: "new", last_played: "2026-06-01T00:00:00+00:00" }),
+      g({ name: "old", last_played: "2026-01-01T00:00:00+00:00", added_at: "2025-01-01T00:00:00+00:00" }),
+      g({ name: "new", last_played: "2026-06-01T00:00:00+00:00", added_at: "2024-01-01T00:00:00+00:00" }),
+      // 刚添加、还没玩过 → 排序键取 added_at，理应排在游玩记录之上
+      g({ name: "刚添加", added_at: "2026-11-08T10:00:00+00:00" }),
+      // 很久以前就入库且一直没玩 → 沉到最底下
+      g({ name: "陈年未玩", added_at: "2023-01-01T00:00:00+00:00" }),
     ];
     expect(sortGames(lib, "last_played", "desc").map((x) => x.name)).toEqual([
+      "刚添加",
       "new",
       "old",
-      "never",
+      "陈年未玩",
     ]);
   });
 
-  it("最近游玩：升序时 null 仍排最后（不受方向影响）", () => {
+  it("最近互动：升序就是反向（最久没互动的在前）", () => {
     const lib = [
-      g({ name: "never" }),
-      g({ name: "old", last_played: "2026-01-01T00:00:00+00:00" }),
-      g({ name: "new", last_played: "2026-06-01T00:00:00+00:00" }),
+      g({ name: "old", last_played: "2026-01-01T00:00:00+00:00", added_at: "2025-01-01T00:00:00+00:00" }),
+      g({ name: "new", last_played: "2026-06-01T00:00:00+00:00", added_at: "2024-01-01T00:00:00+00:00" }),
+      g({ name: "刚添加", added_at: "2026-11-08T10:00:00+00:00" }),
     ];
     expect(sortGames(lib, "last_played", "asc").map((x) => x.name)).toEqual([
       "old",
       "new",
-      "never",
+      "刚添加",
+    ]);
+  });
+
+  it("最近互动：两个时间字段都缺的脏数据沉底，不会冒到前面", () => {
+    const lib = [
+      g({ name: "脏数据", added_at: "" }),
+      g({ name: "刚添加", added_at: "2026-11-08T10:00:00+00:00" }),
+    ];
+    expect(sortGames(lib, "last_played", "desc").map((x) => x.name)).toEqual([
+      "刚添加",
+      "脏数据",
     ]);
   });
 
@@ -166,9 +181,9 @@ describe("sortGames", () => {
     expect(sortGames(lib, "added_at", "asc").map((x) => x.name)).toEqual(["a", "b"]);
   });
 
-  it("未知排序字段退回最近游玩（与后端白名单兜底一致）", () => {
+  it("未知排序字段退回最近互动（与后端白名单兜底一致）", () => {
     const lib = [
-      g({ name: "never" }),
+      g({ name: "never", added_at: "2025-01-01T00:00:00+00:00" }),
       g({ name: "played", last_played: "2026-01-01T00:00:00+00:00" }),
     ];
     expect(sortGames(lib, "drop table", "desc").map((x) => x.name)).toEqual(["played", "never"]);
@@ -183,9 +198,9 @@ describe("sortGames", () => {
 });
 
 describe("filterAndSortGames：组合后仍守同一口径", () => {
-  it("先筛后排，且默认排序等价于旧行为（最近游玩降序）", () => {
+  it("先筛后排，且默认排序等价于旧行为（最近互动降序）", () => {
     const lib = [
-      g({ name: "未玩", last_played: null }),
+      g({ name: "未玩", last_played: null, added_at: "2025-06-01T00:00:00+00:00" }),
       g({
         name: "已玩旧",
         play_time_seconds: 60,
@@ -203,5 +218,13 @@ describe("filterAndSortGames：组合后仍守同一口径", () => {
       "已玩新",
       "已玩旧",
     ]);
+  });
+
+  it("默认排序下，刚添加的游戏出现在第一位（免去往下翻）", () => {
+    const lib = [
+      g({ name: "老游戏", play_time_seconds: 7200, last_played: "2026-10-01T00:00:00+00:00" }),
+      g({ name: "刚添加", added_at: "2026-11-08T12:00:00+00:00" }),
+    ];
+    expect(filterAndSortGames(lib).map((x) => x.name)).toEqual(["刚添加", "老游戏"]);
   });
 });

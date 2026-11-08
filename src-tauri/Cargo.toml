@@ -1,6 +1,6 @@
 [package]
 name = "game-vault"
-version = "0.8.8"
+version = "0.8.9"
 description = "Game Vault - 轻量级游戏管理器"
 authors = ["Isaac"]
 edition = "2021"

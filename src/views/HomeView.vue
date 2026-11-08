@@ -156,9 +156,10 @@ function toggleGenre(genre: string) {
 
 // 排序选项：与手账（ReviewsView）同款两段式——排序字段 + 升降序。
 // 排序在前端内存里做（lib/gameFilter.ts），切排序不重新拉库，即时生效。
-// 「最近游玩」+ 降序 = 旧行为的默认值，故升级后首屏顺序不变。
+// 「最近互动」= 序键为「玩过就按游玩时间，没玩过按入库时间」，故刚添加的游戏必定在最前
+// （原先叫「最近游玩」，NULL 排序键会把新游戏钉在列表末尾，2026-11-08 按老爷要求改口径）。
 const sortOptions = [
-  { label: "最近游玩", value: "last_played" },
+  { label: "最近互动", value: "last_played" },
   { label: "游玩时长", value: "play_time" },
   { label: "添加时间", value: "added_at" },
   { label: "名称", value: "name" },

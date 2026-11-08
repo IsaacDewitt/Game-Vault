@@ -19,6 +19,13 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "0.8.9",
+    date: "2026-11-08",
+    changes: [
+      "游戏库默认排序改称「最近互动」：玩过的按最近游玩时间排，没玩过的按入库时间排 —— 刚添加的游戏直接出现在第一位，不必再往下翻（以前没玩过的游戏一律沉在列表末尾）",
+    ],
+  },
+  {
     version: "0.8.8",
     date: "2026-11-08",
     changes: [
