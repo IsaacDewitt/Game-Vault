@@ -3,6 +3,7 @@ import { computed, ref, toRef } from "vue";
 import { NIcon, NEllipsis } from "naive-ui";
 import { HeartOutline, Heart, PlayOutline, FolderOutline, ImagesOutline } from "@vicons/ionicons5";
 import type { Game } from "../lib/tauri";
+import type { LaunchState } from "../lib/launchState";
 import { formatPlayTime } from "../lib/format";
 import { useCoverImage } from "../lib/useCoverImage";
 import { displayName } from "../stores/games";
@@ -12,6 +13,8 @@ import type { ContextMenuItem } from "./ContextMenu.vue";
 const props = defineProps<{
   game: Game;
   isActive?: boolean;
+  /** 启动三态（后端真相源）：playing / launching / updating；旧调用方可只传 isActive */
+  launchState?: LaunchState | null;
   /** 存档路径检查结果：true=存在, false=不存在, undefined=未检查 */
   savePathExists?: boolean;
 }>();
@@ -34,10 +37,18 @@ const showContextMenu = ref(false);
 const contextMenuX = ref(0);
 const contextMenuY = ref(0);
 
-const { coverImage, imgFailed, handleImageError } = useCoverImage(toRef(props, "game"));
+const { coverImage, showPlaceholder, handleImageError } = useCoverImage(toRef(props, "game"));
 
 /** 卡片展示名：英文名优先，但 `name_en` 为中文脏数据时退回中文名（见 stores/games.ts） */
 const cardName = computed(() => displayName(props.game));
+
+/** 三态角标：只有后端确认进程现身才是「游玩中」 */
+const state = computed<LaunchState | null>(
+  () => props.launchState ?? (props.isActive ? "playing" : null),
+);
+const stateLabel = computed(() =>
+  state.value === "playing" ? "游玩中" : state.value === "updating" ? "更新中" : "启动中",
+);
 
 const contextMenuItems = computed<ContextMenuItem[]>(() => {
   const items: ContextMenuItem[] = [
@@ -115,14 +126,14 @@ function handleContextMenu(e: MouseEvent) {
 <template>
   <div
     class="game-card"
-    :class="{ active: isActive }"
+    :class="{ active: state === 'playing' }"
     @click="emit('click')"
     @contextmenu="handleContextMenu"
   >
     <!-- 封面图 -->
     <div class="cover">
       <img
-        v-if="coverImage && !imgFailed"
+        v-if="!showPlaceholder && coverImage"
         :src="coverImage"
         :alt="game.name"
         loading="lazy"
@@ -163,9 +174,10 @@ function handleContextMenu(e: MouseEvent) {
         {{ game.platform === "steam" ? "Steam" : "Epic" }}
       </div>
 
-      <!-- 正在游玩 -->
-      <div v-if="isActive" class="playing-badge">
-        <span class="pulse"></span> 游玩中
+      <!-- 正在游玩 / 启动中 / 客户端更新中（后两者都不计时） -->
+      <div v-if="state" class="playing-badge" :class="{ 'is-waiting': state !== 'playing' }">
+        <span class="pulse" :class="{ 'is-waiting': state !== 'playing' }"></span>
+        {{ stateLabel }}
       </div>
 
       <!-- 已通关 -->
@@ -353,6 +365,15 @@ function handleContextMenu(e: MouseEvent) {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+/* 启动中 / 更新中：灰底 + 不闪，明确区别于「已经在计时」 */
+.playing-badge.is-waiting {
+  background: rgba(96, 102, 116, 0.92);
+}
+.pulse.is-waiting {
+  animation: none;
+  opacity: 0.65;
 }
 
 .completed-badge {

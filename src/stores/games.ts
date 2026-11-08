@@ -5,6 +5,12 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import type { Game } from "../lib/tauri";
 import * as api from "../lib/tauri";
 import { filterAndSortGames } from "../lib/gameFilter";
+import {
+  reduceLaunchStates,
+  stateOf,
+  type LaunchEvent,
+  type LaunchState,
+} from "../lib/launchState";
 
 /**
  * 卡片展示名：英文名优先（与手账 `reviews.ts` 同口径）。
@@ -22,7 +28,29 @@ export const useGamesStore = defineStore("games", () => {
   const error = ref<string | null>(null);
   const searchQuery = ref("");
   const selectedGame = ref<Game | null>(null);
-  const activeGames = ref<string[]>([]);
+
+  // 启动三态（2026-11-04）：后端是唯一真相源，前端不再「点完就当在玩」。
+  // 所有变更只走 `lib/launchState.ts` 的纯 reducer，便于测试与复盘。
+  const gameStates = ref<Record<string, LaunchState>>({});
+  /** 兼容既有模板：仅「正式计时中」的游戏 */
+  const activeGames = computed(() =>
+    Object.keys(gameStates.value).filter((id) => gameStates.value[id] === "playing"),
+  );
+  /** 已委托客户端、尚未开始计时的游戏（启动中 / 更新中） */
+  const launchingGames = computed(() =>
+    Object.keys(gameStates.value).filter((id) => gameStates.value[id] !== "playing"),
+  );
+  function launchState(gameId: string): LaunchState | null {
+    return stateOf(gameStates.value, gameId);
+  }
+  function dispatchLaunch(event: LaunchEvent) {
+    gameStates.value = reduceLaunchStates(gameStates.value, event);
+  }
+  /** 启动超时提示：store 只记事实，toast 交给 HomeView（store 不碰 UI API） */
+  const launchNotice = ref<{ gameId: string; kind: "timeout" } | null>(null);
+  function clearLaunchNotice() {
+    launchNotice.value = null;
+  }
   // 封面路径映射 (game_id -> { main, thumb })，含已移除游戏的留档封面
   const coverPaths = ref<Record<string, api.CoverSet>>({});
   // 封面获取进度
@@ -40,23 +68,62 @@ export const useGamesStore = defineStore("games", () => {
   const savePathStatus = ref<Record<string, boolean>>({});
   const checkingSavePaths = ref(false);
 
-  // 监听后端游戏停止事件，清理 activeGames
+  // 会话状态事件统一挂在全局 store（此前 platform-* 挂在 HomeView，
+  // 一旦视图生命周期变化就会丢事件 → 状态永远清不掉）
   let unlistenGameStopped: (() => void) | null = null;
+  let unlistenSessionSettled: (() => void) | null = null;
+  let unlistenPlatformStarted: (() => void) | null = null;
+  let unlistenPlatformUpdating: (() => void) | null = null;
+  let unlistenPlatformWaiting: (() => void) | null = null;
+  let unlistenPlatformTimeout: (() => void) | null = null;
   let unlistenCoverProgress: (() => void) | null = null;
   let unlistenGameInfoProgress: (() => void) | null = null;
   let unlistenCoversUpgraded: (() => void) | null = null;
+  let listenersReady = false;
+
+  /** 挂载 / 重连时整体对齐后端会话快照（后端是唯一真相源） */
+  async function syncLaunchStates() {
+    try {
+      const snapshots = await api.getActiveSessions();
+      dispatchLaunch({ type: "synced", snapshots });
+    } catch (e) {
+      console.error("同步后端会话状态失败:", e);
+    }
+  }
 
   async function setupEventListeners() {
-    if (unlistenGameStopped) return;
+    if (listenersReady) {
+      await syncLaunchStates();
+      return;
+    }
     unlistenGameStopped = await listen<string>("game-stopped", (event) => {
-      const gameId = event.payload;
-      const idx = activeGames.value.indexOf(gameId);
-      if (idx !== -1) {
-        activeGames.value.splice(idx, 1);
-      }
+      dispatchLaunch({ type: "stopped", gameId: event.payload });
       // 刷新游戏数据以更新时长。
       // 轻量模式：游戏退出不会增删游戏/封面/类型，跳过全量封面与类型重扫
       loadGames({ light: true });
+    });
+
+    // 重复启动顶掉旧会话：只刷新时长，绝不改三态（新会话刚刚建好）
+    unlistenSessionSettled = await listen<string>("game-session-settled", () => {
+      loadGames({ light: true });
+    });
+
+    // 平台游戏待命转正：只有后端真正发现游戏进程，才升为「游玩中」
+    unlistenPlatformStarted = await listen<string[]>("platform-game-started", (event) => {
+      dispatchLaunch({ type: "activated", gameIds: event.payload });
+    });
+    // Steam 客户端明确报告 Updating=1：显示「更新中」，绝不显示「游玩中」
+    unlistenPlatformUpdating = await listen<string>("platform-launch-updating", (event) => {
+      dispatchLaunch({ type: "updating", gameId: event.payload });
+    });
+    // 更新结束但进程还没起：把角标从「更新中」回落到「启动中」
+    unlistenPlatformWaiting = await listen<string>("platform-launch-waiting", (event) => {
+      dispatchLaunch({ type: "waiting", gameId: event.payload });
+    });
+    // 启动超时 / 取消：清回 idle，并让视图弹一条说明
+    unlistenPlatformTimeout = await listen<string>("platform-launch-timeout", (event) => {
+      dispatchLaunch({ type: "stopped", gameId: event.payload });
+      launchNotice.value = { gameId: event.payload, kind: "timeout" };
     });
 
     // 监听封面获取进度事件
@@ -81,31 +148,37 @@ export const useGamesStore = defineStore("games", () => {
       console.info(`[Cover] 缩略图规格升级完成，重建 ${event.payload} 张，刷新封面映射`);
       loadAllCovers().catch(() => {});
     });
+
+    listenersReady = true;
+    await syncLaunchStates();
   }
 
   // 清理事件监听器（应用退出时调用）
   function cleanupEventListeners() {
-    if (unlistenGameStopped) {
-      unlistenGameStopped();
-      unlistenGameStopped = null;
-    }
-    if (unlistenCoverProgress) {
-      unlistenCoverProgress();
-      unlistenCoverProgress = null;
-    }
-    if (unlistenGameInfoProgress) {
-      unlistenGameInfoProgress();
-      unlistenGameInfoProgress = null;
-    }
-    if (unlistenCoversUpgraded) {
-      unlistenCoversUpgraded();
-      unlistenCoversUpgraded = null;
-    }
+    unlistenGameStopped?.();
+    unlistenGameStopped = null;
+    unlistenSessionSettled?.();
+    unlistenSessionSettled = null;
+    unlistenPlatformStarted?.();
+    unlistenPlatformStarted = null;
+    unlistenPlatformUpdating?.();
+    unlistenPlatformUpdating = null;
+    unlistenPlatformWaiting?.();
+    unlistenPlatformWaiting = null;
+    unlistenPlatformTimeout?.();
+    unlistenPlatformTimeout = null;
+    unlistenCoverProgress?.();
+    unlistenCoverProgress = null;
+    unlistenGameInfoProgress?.();
+    unlistenGameInfoProgress = null;
+    unlistenCoversUpgraded?.();
+    unlistenCoversUpgraded = null;
+    listenersReady = false;
   }
 
   // 计算属性：筛选 + 排序统一走 lib/gameFilter.ts（纯函数，有单测守护）
   // 三态口径：已通关 = status === "completed"（用户手动标记）；
-  // 已游玩 / 未游玩 = 由 play_time_seconds 派生，与后端 get_status_stats 的 CASE 同口径。
+  // 已游玩 / 未游玩 = 由 play_time_seconds 派生；后端第二套 CASE 已删除，别再提它。
   // 原实现在这里内联了一份同义逻辑，且末尾留着一个 UI 值域下永远走不到的
   // 「按原始 status 精确匹配」分支——2026-10-17 随抽离一并清理。
   const filteredGames = computed(() =>
@@ -232,12 +305,27 @@ export const useGamesStore = defineStore("games", () => {
     }
   }
 
+  /**
+   * 手动添加游戏：入库后自动跑一次 LLM 补全（元数据 + 正式命名）。
+   *
+   * **不再自动拉封面**（2026-10-30 按老爷要求改）：旧实现这里调 `fetchCovers()`，
+   * 而它是个「批量补全库内**所有**缺失封面」的动作 —— 加一个游戏会把整库扫一遍，
+   * 图和这条新条目还未必对得上。封面改由详情页「更换封面」三源手动指定。
+   *
+   * 补全失败一律静默（未配置 LLM / 断网 / 模型返回异常都很常见），只留日志：
+   * 添加本身已经成功，没理由弹红框让用户以为没加进去。
+   * 返回入库后的条目，调用方据此立刻给出"已添加"反馈。
+   */
   async function addGameManual(name: string, exePath: string) {
     try {
-      await api.addGameManual(name, exePath);
+      const game = await api.addGameManual(name, exePath);
       await loadGames();
       checkAchievementsQuietly();
-      fetchCovers().catch(() => {});
+      // LLM 一次要几秒到十几秒，后台跑，不挡住"已添加"的反馈；成功后 store 内就地更新
+      fetchGameInfoLlm(game.id)
+        .then(() => loadGames())
+        .catch((e) => console.warn("添加后自动补全游戏信息失败:", e));
+      return game;
     } catch (e) {
       console.error("添加游戏失败:", e);
       throw e;
@@ -367,12 +455,34 @@ export const useGamesStore = defineStore("games", () => {
 
   async function launch(gameId: string) {
     try {
-      await api.launchGame(gameId);
-      if (!activeGames.value.includes(gameId)) {
-        activeGames.value.push(gameId);
+      const outcome = await api.launchGame(gameId);
+      // 本地直启：PID 在手，立即计时；平台委托：只标「启动中」，
+      // 等后端 platform-game-started 才升「游玩中」（Steam 更新期尤其关键）。
+      // untracked：后端连 exe_path 都补不出身份签名，绝不能显示游玩中。
+      switch (outcome.kind) {
+        case "delegated":
+          dispatchLaunch({ type: "delegated", gameId });
+          break;
+        case "untracked":
+          dispatchLaunch({ type: "untracked", gameId });
+          break;
+        default:
+          dispatchLaunch({ type: "spawned", gameId });
       }
     } catch (e) {
       console.error("启动游戏失败:", e);
+      throw e;
+    }
+  }
+
+  /** 停止计时（不关闭游戏进程）：立即清状态，后端 game-stopped 事件再来一次也幂等 */
+  async function stop(gameId: string) {
+    try {
+      const result = await api.stopGame(gameId);
+      dispatchLaunch({ type: "stopped", gameId });
+      return result;
+    } catch (e) {
+      console.error("停止游戏失败:", e);
       throw e;
     }
   }
@@ -515,6 +625,11 @@ export const useGamesStore = defineStore("games", () => {
     searchQuery,
     selectedGame,
     activeGames,
+    launchingGames,
+    gameStates,
+    launchState,
+    launchNotice,
+    clearLaunchNotice,
     coverPaths,
     coverSrc,
     coverFetchProgress,
@@ -541,6 +656,7 @@ export const useGamesStore = defineStore("games", () => {
     setCoverFromUrl,
     setCoverFromSteam,
     launch,
+    stop,
     toggleFav,
     removeGame,
     renameGame,

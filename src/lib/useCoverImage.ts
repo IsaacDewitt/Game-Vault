@@ -15,15 +15,22 @@ export function useCoverImage(game: Ref<Game>, preferThumb = true) {
   // 标记图片渲染是否失败（asset URL 存在但无法渲染）
   const renderFailed = ref(false);
 
-  // 仅当 game.id 变化时重置渲染失败状态（避免在 computed 内修改 ref 导致死循环）
-  watch(() => game.value.id, () => {
-    renderFailed.value = false;
-  }, { immediate: true });
-
   // 直接从 store 的封面路径映射生成 asset URL
   const coverImage = computed(() => {
     return store.coverSrc(game.value.id, preferThumb);
   });
+
+  // 【2026-11-08】换游戏 **或换封面** 都要重置失败态。
+  // 旧版只 watch game.id：同一游戏换封面（asset URL 靠 `?t=` 变化）时
+  // renderFailed 仍是 true，新图被占位符一直挡到组件重挂。
+  // 注意 watch 必须放在 coverImage 之后，否则 immediate 会撞上 TDZ。
+  watch(
+    [() => game.value.id, coverImage],
+    () => {
+      renderFailed.value = false;
+    },
+    { immediate: true }
+  );
 
   // 如果配置了封面路径但没有可用的 asset URL，说明文件失效（删除/损坏）
   const imgFailed = computed(() => {
@@ -41,9 +48,10 @@ export function useCoverImage(game: Ref<Game>, preferThumb = true) {
     return !coverImage.value || imgFailed.value || renderFailed.value;
   });
 
+  // `imgFailed` 只供内部 showPlaceholder 判定，不再对外导出：
+  // 消费方统一用 showPlaceholder，避免又有人只判「有路径没 URL」而漏掉 @error。
   return {
     coverImage,
-    imgFailed,
     showPlaceholder,
     handleImageError,
   };

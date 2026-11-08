@@ -17,7 +17,7 @@ pub const COVER_MAX_FILE_SIZE: u64 = 20 * 1024 * 1024;
 
 /// 后台进程检测轮询间隔（秒）—— **存在活跃会话或待命会话时**
 ///
-/// 注意：该间隔**不影响时长精度**——会话起始时刻取"点击启动那一刻"，
+/// 注意：该间隔**不影响时长精度**——本地直启取 spawn 时刻，平台委托取进程现身时刻；
 /// 轮询间隔只决定"游戏退出后多久被察觉"（时长偏大而非偏小，且不跨会话累积）。
 ///
 /// 2026-09-19 由 10 秒收紧到 1 秒。前提是扫描方式同步改成了分层（见 `core/tracker.rs`）：
@@ -77,14 +77,50 @@ pub const GAME_SIBLING_HELPERS: &[&str] = &[
     "steamwebhelper",
 ];
 
+/// 安装 / 更新 / 分发 / 反作弊类进程名（小写、不含扩展名、按子串匹配）
+///
+/// 用于**待命转正**时的身份闸门：这些进程同样躺在游戏安装目录下，
+/// 只靠 `install_path` 前缀会被误当成游戏本体（Steam 更新期尤其常见）。
+/// 名单刻意只收「绝无可能是可玩游戏主程序」的名字，宁可漏也不能误杀：
+/// 诸如 `Launcher.exe` / `PlayRDR2.exe` 这类游戏自带的启动壳**不在**其中。
+pub const GAME_SETUP_HELPERS: &[&str] = &[
+    "vcredist", "vc_redist", "dxsetup", "dxwebsetup", "dotnet", "oalinst",
+    "physx", "redist", "setup", "unins", "install", "installer",
+    "updater", "update", "patcher", "crashreport", "crashhandler", "crashpad",
+    "werfault", "easyanticheat", "eac_", "battleye", "beservice", "be_service",
+];
+
 /// 平台游戏「待命窗口」（秒）
 ///
 /// 从 Game Vault 发起 `steam://` / `com.epicgames.launcher://` 启动请求后，
 /// 游戏进程由客户端异步拉起（还要过 DRM 校验、云存档同步，慢加载数见不鲜），
-/// 因此不能立即计时，而要在此期限内等待进程出现：
-/// 命中即转正式会话（起始时刻回溯到点击那一刻），超时视为未启动
-/// （可能正在更新 / 用户取消了 / 客户端未登录）。
+/// 因此不能立即计时，而要在此期限内等待进程出现：命中即转正式会话，
+/// 超时视为未启动（用户取消了 / 客户端未登录 / 没有更新信号的长等待）。
+///
+/// 【2026-11-04】不再是「一刀切 5 分钟」：Steam 明确报告 `Updating=1` 时，
+/// 待命按 `STEAM_ARM_RENEW_SECS` 续期，直到更新结束再给一个宽限期。
+/// 固定窗口只作为「没有客户端状态信号」时的兜底。
+/// 另：转正的起始时刻改为**进程现身那一刻**，等待期（更新 / 排队 / 登录）不计入时长。
 pub const PLATFORM_ARM_WINDOW_SECS: i64 = 300;
+
+/// Steam 报告「正在更新」时，每次给待命续多久（秒）
+///
+/// 每拍都会查一次注册表（HKCU 只读，微秒级），只要 `Updating=1` 就续期，
+/// 因此大版本更新几十分钟也不会把待命丢掉；更新一结束，最多再等这么久
+/// 仍无进程现身即判超时。Epic 没有等价状态信号，仍走固定窗口。
+pub const STEAM_ARM_RENEW_SECS: i64 = 60;
+
+/// 待命会话自「点击启动」起的**绝对**上限（秒，2026-11-08 新增）。
+///
+/// `Updating=1` 时每拍续期本是为了覆盖几十分钟的大版本更新，但 Steam 客户端
+/// 崩溃 / 强杀后 `HKCU\...\Apps\<appid>\Updating` 可能残留为 1 且 `Running=0`，
+/// 此时 `decide_pending` 会无限 `Renew`：连进程表都不查、deadline 永远推后，
+/// 游戏真跑起来也不计时，前端一直卡「更新中」。给一个绝对天花板；到点后
+/// 只用来「不再信任 Updating 信号」，**不是**直接判死：
+/// 超上限后恢复进程探测，游戏真被拉起照样能转正计时，只有确实没进程才结算。
+/// 2 小时覆盖 100GB 级更新；旧版 30 分钟直接 Timeout，会把「更新完才启动」
+/// 的整段时长确定性丢掉。
+pub const STEAM_ARM_MAX_RENEW_SECS: i64 = 7200;
 
 
 // ==================== HTTP 超时 ====================
@@ -105,8 +141,13 @@ pub const COVER_FETCH_TIMEOUT_SECS: u64 = 20;
 /// 但"卡住不动"要能尽快判死。两者靠这个值分开。
 pub const COVER_READ_TIMEOUT_SECS: u64 = 12;
 
-/// 封面图片下载**单次尝试**的总超时（秒）。比 API 宽松，理由见上。
-pub const COVER_DOWNLOAD_TIMEOUT_SECS: u64 = 45;
+/// 封面图片下载**单次尝试**的总超时（秒）。
+///
+/// 必须小于总预算 `COVER_TOTAL_BUDGET_SECS`，否则这个值永远取不到：
+/// `budget_timeout` 取的是「本值」与「剩余预算」的较小者，预算 40s 时永远赢。
+/// 旧值 45 就是一例死配置（连同上面注释里「成功下载耗时 41 秒」的说法一起作废——
+/// 41 秒在 40s 预算下必然被掐断）。
+pub const COVER_DOWNLOAD_TIMEOUT_SECS: u64 = 38;
 
 /// **单次抓取的总预算（秒）**——这是"不卡死"的唯一保证。
 ///
@@ -130,8 +171,32 @@ pub const COVER_RETRY_BACKOFF_MS: u64 = 400;
 /// 一次检索里最多尝试下载几张候选图（第一张失败还有后备）
 pub const COVER_DOWNLOAD_CANDIDATES: usize = 3;
 
-/// 批量抓封面时每个游戏之间的间隔（毫秒），避免撞 SteamGridDB 免费层限流
-pub const COVER_BATCH_INTERVAL_MS: u64 = 250;
+/// 批量抓封面时每个游戏之间的间隔（毫秒），避免撞 SteamGridDB 免费层限流。
+///
+/// 每个游戏最多打 2 次 API（autocomplete + grids）+ 1~3 次图床下载，图床多走
+/// Akamai（Steam）或 SGDB CDN，不计入 API 配额。故 2s 间隔 ≈ 1 次 API/秒，
+/// 与免费层限流对齐；50 个游戏约 100 秒，只在缺封面时触发，可接受。
+/// 旧值 250ms（≈4~8 req/s）与这里写明的 1 req/s 自相矛盾，实测容易叠出 429。
+pub const COVER_BATCH_INTERVAL_MS: u64 = 2000;
+
+/// 撞到 429 后歇多久再抓下一款（毫秒）。
+///
+/// 限流不是致命错误：换一款游戏往往就能成，不该让整批收工。
+pub const COVER_RATE_LIMIT_BACKOFF_MS: u64 = 3000;
+
+/// `reg query` 子进程的硬超时（秒，2026-11-08 新增）。
+///
+/// `Command::output()` 没有等待上限：杀软挂钩 / 注册表服务忙时会永久挂住
+/// 调用线程。正常一次查询几十毫秒，3 秒足够覆盖异常抖动；超时按「读不到」
+/// 退化（代理直连、Steam 根目录交给其它路径兜底），比整条命令卡死好。
+pub const REG_QUERY_TIMEOUT_SECS: u64 = 3;
+
+/// API / JSON 响应体的硬上限（字节，2026-11-08 新增）。
+///
+/// `fetch_bytes_with_retry` 用流式读取逐 chunk 累加，超过即停止并报错。
+/// 正常 storesearch / SGDB 响应几十 KB ~ 几百 KB，4MB 留足余量；
+/// 图片下载另走 `COVER_MAX_FILE_SIZE`(20MB) 的独立防线。
+pub const API_MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// LLM 请求超时（秒）— 工具调用循环可能需要更长时间
 pub const LLM_REQUEST_TIMEOUT_SECS: u64 = 120;

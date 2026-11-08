@@ -17,7 +17,8 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
-tauri-plugin-fs = "2"
+# 2026-11-08 移除 tauri-plugin-fs 的显式注册：前端零引用、capabilities 无 fs 权限。
+# crate 仍可能由 tauri-plugin-dialog 间接编译，但不再初始化这个用不到的插件。
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
 

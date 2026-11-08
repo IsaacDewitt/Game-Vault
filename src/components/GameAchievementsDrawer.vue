@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { NDrawer, NDrawerContent } from "naive-ui";
 import type { GameAchievements } from "../lib/tauri";
 import { displayName, useGamesStore } from "../stores/games";
@@ -7,9 +7,8 @@ import {
   CATEGORY_META,
   categoryColor,
   computeGameAchievementProgress,
-  formatAchievementProgress,
   groupAchievements,
-  groupProgress,
+  groupStatusText,
   type AchievementGroup,
 } from "../lib/achievements";
 import { formatDate } from "../lib/format";
@@ -26,16 +25,20 @@ const store = useGamesStore();
 
 const game = computed(() => store.games.find((g) => g.id === props.entry.game_id) ?? null);
 const name = computed(() => (game.value ? displayName(game.value) : props.entry.game_name));
-const coverSrc = computed(() => store.coverSrc(props.entry.game_id, false));
+// 头像只有 72×96：取 512 缩略图即可，别为这个小格子解码整张原图
+const coverSrc = computed(() => store.coverSrc(props.entry.game_id, true));
 const imgFailed = ref(false);
+// 封面换了一张（或补上了）之后要解除失败态，否则会一直显示占位符直到组件重挂
+watch(coverSrc, () => {
+  imgFailed.value = false;
+});
 
 const progress = computed(() => computeGameAchievementProgress(props.entry.achievements));
 const groups = computed(() => groupAchievements(props.entry.achievements));
 
-/** 组状态文案：全解锁就不必再报「进度到哪一级」 */
+/** 组状态文案：卡片墙与抽屉共用同一份口径（见 lib/achievements.ts） */
 function groupText(group: AchievementGroup): string {
-  if (group.unlockedCount === group.items.length) return "已全部解锁";
-  return formatAchievementProgress(groupProgress(group));
+  return groupStatusText(group);
 }
 </script>
 
@@ -81,13 +84,17 @@ function groupText(group: AchievementGroup): string {
         </div>
       </div>
 
-      <!-- 已删除留档说明：解锁记录按设计保留，但条目已不在库中 -->
+      <!-- 已删除留档说明：解锁记录按设计保留，但条目已不在库中、不再结算新成就 -->
       <div v-if="entry.removed" class="note removed-note">
         该游戏已从库中删除，此处展示的是其历史解锁记录——成就记录不随删除消失。
+        <template v-if="progress.skipped > 0">
+          其中不依赖参考时长的条目仍计入完成度。
+        </template>
       </div>
 
-      <!-- 完成度口径说明：缺 HLTB 参考时长的条目不计入分母 -->
-      <div v-if="progress.skipped > 0" class="note skipped-note">
+      <!-- 完成度口径说明：只对在库条目说「缺 HLTB」——
+           留档条目也走 skipped，但它们其实有参考时长，只是不再结算（见上一条 note） -->
+      <div v-if="!entry.removed && progress.skipped > 0" class="note skipped-note">
         另有 {{ progress.skipped }} 条成就因缺少 HLTB 参考时长，无法达成，不计入完成度。
       </div>
 
@@ -132,7 +139,13 @@ function groupText(group: AchievementGroup): string {
                   :title="`第 ${idx + 1} 级`"
                 ></span>
               </div>
-              <span class="row-progress">{{ groupText(group) }}</span>
+              <!-- 留档条目的 progress 恒为 0（后端对 removed 早退不结算），
+                   再报「0 / 10 本」会和左边亮着的等级圆点自相矛盾 -->
+              <span class="row-progress">
+                {{ entry.removed
+                  ? `已解锁 ${group.unlockedCount}/${group.items.length}`
+                  : groupText(group) }}
+              </span>
               <span v-if="group.lastUnlockedAt" class="row-time">
                 {{ formatDate(group.lastUnlockedAt) }}解锁
               </span>

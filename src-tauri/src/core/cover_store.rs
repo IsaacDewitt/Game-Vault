@@ -38,6 +38,7 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::core::Database;
 use crate::models::cover::*;
@@ -126,6 +127,75 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
         return Err(e).with_context(|| format!("替换封面文件失败: {}", target.display()));
     }
     Ok(())
+}
+
+/// 一组文件替换的可回滚句柄。
+///
+/// `commit_prepared` / 缩略图升级都会「先换文件、再写 DB」。若第二步失败，
+/// 旧文件必须能从备份恢复，否则磁盘是新字节、索引却仍记旧 sha256。备份用
+/// 唯一临时名，且只在 DB 全部写成功后才删除。
+struct FileSwap {
+    backups: Vec<(PathBuf, PathBuf)>,
+}
+
+impl FileSwap {
+    fn apply(staged: &[(PathBuf, PathBuf)]) -> Result<Self> {
+        let mut backups = Vec::new();
+        for (tmp, dst) in staged {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let backup = if dst.exists() {
+                let backup = super::cover_fetcher::unique_temp_path(dst);
+                std::fs::copy(dst, &backup)
+                    .with_context(|| format!("备份旧封面失败: {}", dst.display()))?;
+                Some(backup)
+            } else {
+                None
+            };
+
+            if let Err(e) = std::fs::rename(tmp, dst) {
+                // 失败的本次 tmp 与后续未消费的 tmp 都不能留成孤儿。
+                for (t, _) in staged {
+                    let _ = std::fs::remove_file(t);
+                }
+                if let Some(b) = &backup {
+                    let _ = std::fs::remove_file(b);
+                }
+                Self::restore(&backups);
+                return Err(e).with_context(|| format!("替换封面文件失败: {}", dst.display()));
+            }
+            if let Some(b) = backup {
+                backups.push((dst.clone(), b));
+            }
+        }
+        Ok(Self { backups })
+    }
+
+    fn restore(backups: &[(PathBuf, PathBuf)]) {
+        for (dst, backup) in backups {
+            match std::fs::read(backup) {
+                Ok(bytes) => {
+                    if let Err(e) = write_atomic(dst, &bytes) {
+                        tracing::error!("封面回滚失败 {}：{}（备份仍在 {}）", dst.display(), e, backup.display());
+                        continue;
+                    }
+                    let _ = std::fs::remove_file(backup);
+                }
+                Err(e) => tracing::error!("读取封面备份失败 {}：{}", backup.display(), e),
+            }
+        }
+    }
+
+    fn rollback(self) {
+        Self::restore(&self.backups);
+    }
+
+    fn commit(self) {
+        for (_, backup) in &self.backups {
+            let _ = std::fs::remove_file(backup);
+        }
+    }
 }
 
 /// 移动文件（跨目录同盘直接 rename；失败退化为复制+删源）
@@ -275,6 +345,12 @@ fn build_main(img: &image::DynamicImage, source: &[u8], source_format: image::Im
 // ==================== 对外操作 ====================
 
 /// 查询某主体可用的封面（绝对路径，文件不存在则视为无）
+///
+/// **仅测试使用**（2026-10-30）：原先唯一的命令层调用方是手账「刷新信息」里的
+/// "新封面是否已在索引里"判重，那段随「不再自动拉封面」一并删掉了。
+/// 留着是因为它是最直接的索引读取口径，几乎每个封面测试都要用它断言；
+/// 真要恢复自动抓取，把 `cfg(test)` 去掉即可。
+#[cfg(test)]
 pub fn resolve(db: &Database, owner_kind: &str, owner_id: &str) -> Result<CoverSet> {
     let mut set = CoverSet::default();
     for row in db.cover_rows(owner_kind, owner_id)? {
@@ -304,17 +380,61 @@ pub fn resolve(db: &Database, owner_kind: &str, owner_id: &str) -> Result<CoverS
 /// 大图的解码/编码动辄数百毫秒，若一直握着全局 DB 锁，其它命令全部排队。
 pub struct PreparedCover {
     rows: Vec<CoverIndexRow>,
+    /// 无锁阶段写好的临时文件 `(临时路径, 正式路径)`。
+    ///
+    /// 【2026-11-08】旧版 prepare 直接把主图/缩略图写到固定的
+    /// `{owner_id}.{ext}`，两次并发换同一条目的封面时，后一次 rename
+    /// 会盖掉前一次的文件，而 DB 索引可能还留着前一次的 sha256 ——
+    /// 引用计数据此判断会误删仍被手账引用的图。现在 prepare 只写
+    /// 唯一临时名，由 `commit_prepared` 在**全局 DB 锁内**串行替换。
+    staged: Vec<(PathBuf, PathBuf)>,
 }
 
-/// 预处理（**不接触数据库**）：识别格式 → 解码 → 编码主图/缩略图 → 落盘 → 生成索引行。
+impl Drop for PreparedCover {
+    fn drop(&mut self) {
+        // 预处理后被丢弃（条目已删 / 下载失败 / 提前返回）时清掉临时文件，
+        // 不能让未提交的文件变成永远没人认领的孤儿。
+        for (tmp, _) in &self.staged {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+}
+
+/// 无锁阶段：把编码结果写到同目录的唯一临时名，等 commit 时再原子替换正式文件。
+fn write_staged(target: &Path, bytes: &[u8]) -> Result<(PathBuf, PathBuf)> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = super::cover_fetcher::unique_temp_path(target);
+    std::fs::write(&tmp, bytes).with_context(|| format!("写入临时文件失败: {}", tmp.display()))?;
+    let written = std::fs::metadata(&tmp)?.len();
+    if written != bytes.len() as u64 {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("封面写入校验失败（期望 {} 字节，实际 {}）", bytes.len(), written);
+    }
+    Ok((tmp, target.to_path_buf()))
+}
+
+/// 预处理（**不接触数据库**）：识别格式 → 解码 → 编码主图/缩略图 → 写暂存文件 → 生成索引行。
 ///
-/// 副作用只有两个原子写入（主图与缩略图）；索引尚未登记，提交前这些文件是"孤儿"，
-/// 由 [`commit_prepared`] 收编。
+/// 副作用只有两个唯一命名的暂存文件；正式文件与索引都尚未动，由
+/// [`commit_prepared`] 在 DB 锁内一并收编（未提交的暂存文件随 Drop 清理）。
 pub fn prepare_bytes(owner_kind: &str, owner_id: &str, bytes: &[u8]) -> Result<PreparedCover> {
     path::ensure_cover_dirs()?;
 
-    let format = image::guess_format(bytes).context("无法识别图片格式")?;
-    let img = image::load_from_memory(bytes).context("无法解码图片")?;
+    // 【2026-11-08】解码前显式收紧尺寸/内存上限。image 0.25 默认只有
+    // 512MiB 的 non-strict max_alloc、宽高无限制，本地手选一张 decompression
+    // bomb（体积不大、像素极大）仍可能把进程撑爆；封面根本用不到超大图。
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .context("无法识别图片格式")?;
+    let format = reader.format().context("无法识别图片格式")?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    reader.limits(limits);
+    let img = reader.decode().context("无法解码图片")?;
     let (width, height) = (img.width(), img.height());
 
     let (main_bytes, main_ext) = build_main(&img, bytes, format)?;
@@ -322,12 +442,15 @@ pub fn prepare_bytes(owner_kind: &str, owner_id: &str, bytes: &[u8]) -> Result<P
 
     let main_rel = format!("{}.{}", owner_id, main_ext);
     let thumb_rel = format!("thumb/{}.{}", owner_id, thumb_ext);
-    write_atomic(&abs_path(&main_rel), &main_bytes)?;
-    write_atomic(&abs_path(&thumb_rel), &thumb_bytes)?;
+
+    // 先建 PreparedCover 再逐个写暂存文件：任何一步 `?` 早退都会触发 Drop，
+    // 把已写好的临时文件清干净，不给磁盘留孤儿。
+    let mut prepared = PreparedCover { rows: Vec::new(), staged: Vec::new() };
+    prepared.staged.push(write_staged(&abs_path(&main_rel), &main_bytes)?);
+    prepared.staged.push(write_staged(&abs_path(&thumb_rel), &thumb_bytes)?);
 
     let now = now_rfc3339();
-    Ok(PreparedCover {
-        rows: vec![
+    prepared.rows = vec![
             CoverIndexRow {
                 owner_kind: owner_kind.to_string(),
                 owner_id: owner_id.to_string(),
@@ -352,41 +475,72 @@ pub fn prepare_bytes(owner_kind: &str, owner_id: &str, bytes: &[u8]) -> Result<P
                 state: STATE_ACTIVE.to_string(),
                 updated_at: now,
             },
-        ],
-    })
+    ];
+    Ok(prepared)
 }
 
 /// 读文件 + 预处理（**不接触数据库**，供命令层在无锁段调用）
 pub fn prepare_path(owner_kind: &str, owner_id: &str, src: &Path) -> Result<PreparedCover> {
+    // 本地手选路径也必须过体积预检（下载链路早已有 COVER_MAX_FILE_SIZE 防线）：
+    // 误选一个视频/镜像文件不该被整包读进内存再交给解码器。
+    let meta = std::fs::metadata(src)
+        .with_context(|| format!("读取图片信息失败: {}", src.display()))?;
+    if meta.len() > crate::utils::constants::COVER_MAX_FILE_SIZE {
+        anyhow::bail!(
+            "图片文件过大（{} 字节，上限 {} 字节）",
+            meta.len(),
+            crate::utils::constants::COVER_MAX_FILE_SIZE
+        );
+    }
     let bytes = std::fs::read(src).with_context(|| format!("读取图片失败: {}", src.display()))?;
     prepare_bytes(owner_kind, owner_id, &bytes)
 }
 
-/// 提交预处理结果：写索引 → 回收被替换掉的旧文件 → 同步封面字段。
-/// 调用方须持有 DB 锁，本函数只做数据库操作与"无引用的旧文件"清理，耗时短。
+/// 提交预处理结果：带备份地替换正式文件 → 写索引 → 回收旧文件 → 同步封面字段。
+/// 调用方须持有 DB 锁；除 `rename` 与数据库操作外只做"无引用的旧文件"清理，耗时短。
+/// `rename` 放在锁内是刻意的：同一 owner 的并发提交因此天然串行；DB 失败时按备份回滚文件。
 pub fn commit_prepared(
     db: &Database,
     owner_kind: &str,
     owner_id: &str,
-    prepared: PreparedCover,
+    mut prepared: PreparedCover,
 ) -> Result<CoverSet> {
-    let protect: Vec<String> = prepared.rows.iter().map(|r| r.rel_path.clone()).collect();
-    let removed = db.replace_cover_rows(owner_kind, owner_id, &prepared.rows)?;
-    gc_rows(db, &removed, &protect)?;
-    sync_owner_paths(db, owner_kind, owner_id)?;
+    // 【2026-11-08】在调用方持有的全局 DB 锁内，把暂存文件替换到正式路径。
+    // 同一 owner 的并发换图因此按 commit 顺序串行收敛；旧文件先备份，
+    // 若随后任何一步 DB 写入失败则整体回滚，避免「磁盘新字节 / 索引旧 sha」。
+    // `mem::take` 保证中途 return 时不会出现没人清理的 staged 列表。
+    let staged = std::mem::take(&mut prepared.staged);
+    let swap = FileSwap::apply(&staged)?;
 
-    Ok(CoverSet {
-        main: prepared
-            .rows
-            .first()
-            .map(|r| abs_path(&r.rel_path).to_string_lossy().to_string()),
-        thumb: prepared
-            .rows
-            .get(1)
-            .map(|r| abs_path(&r.rel_path).to_string_lossy().to_string()),
-        // 主图行的时间戳就是本次替换时刻（prepared.rows 里 main 恒为首行）
-        updated_at: prepared.rows.first().map(|r| r.updated_at.clone()),
-    })
+    let commit = (|| -> Result<CoverSet> {
+        let protect: Vec<String> = prepared.rows.iter().map(|r| r.rel_path.clone()).collect();
+        let removed = db.replace_cover_rows(owner_kind, owner_id, &prepared.rows)?;
+        gc_rows(db, &removed, &protect)?;
+        sync_owner_paths(db, owner_kind, owner_id)?;
+        Ok(CoverSet {
+            main: prepared
+                .rows
+                .first()
+                .map(|r| abs_path(&r.rel_path).to_string_lossy().to_string()),
+            thumb: prepared
+                .rows
+                .get(1)
+                .map(|r| abs_path(&r.rel_path).to_string_lossy().to_string()),
+            // 主图行的时间戳就是本次替换时刻（prepared.rows 里 main 恒为首行）
+            updated_at: prepared.rows.first().map(|r| r.updated_at.clone()),
+        })
+    })();
+
+    match commit {
+        Ok(set) => {
+            swap.commit();
+            Ok(set)
+        }
+        Err(e) => {
+            swap.rollback();
+            Err(e)
+        }
+    }
 }
 
 /// 入库成功后清理源文件（`ingest_path` 的第三步；命令层拆锁时也复用它）。
@@ -428,6 +582,7 @@ pub fn ingest_path(
 /// 迁移存量主图：
 /// - 文件按本条目 id 命名（自己的文件）→ 走 ingest 转码替换（不透明 PNG 转 JPEG 省体积），旧的同名异扩展名文件由引用计数保护后清理；
 /// - 文件属于别的条目（历史"裸抄路径"共享）→ 原地登记，不复制不删除，靠 sha256 引用计数保障后续删除安全。
+#[cfg(test)]
 pub fn migrate_existing_cover(
     db: &Database,
     owner_kind: &str,
@@ -447,6 +602,7 @@ pub fn migrate_existing_cover(
 }
 
 /// 现有文件"原样登记"：不转码，只补缩略图并写索引（用于迁移存量封面）
+#[cfg(test)]
 pub fn register_in_place(
     db: &Database,
     owner_kind: &str,
@@ -681,6 +837,9 @@ pub struct ThumbUpgradeReport {
 /// - 按 `rel_path` **分组**：共享同一物理文件的多个主体一起改，引用计数不受影响；
 /// - **同步推进主图行的 `updated_at`**：前端 asset URL 的破缓存参数取自主图行时间戳，
 ///   不推进的话 WebView2 照旧命中缓存里的小缩略图，用户会以为"改了没生效"。
+///
+/// 仅测试保留：生产入口是 `upgrade_thumbs_with_short_locks`，后者把图像重活移出 DB 锁。
+#[cfg(test)]
 pub fn upgrade_thumbs(db: &Database) -> Result<ThumbUpgradeReport> {
     let want = THUMB_MAX_EDGE.to_string();
     if db.get_setting(THUMB_SPEC_FLAG)?.as_deref() == Some(want.as_str()) {
@@ -789,6 +948,9 @@ const MIGRATION_FLAG_AGAIN: &str = "covers_index_v1_rerun";
 ///    目录外的（历史手工路径）转码入库。
 /// 2. 已移除条目（墓碑）没有封面时，按同名/英文名从手账条目**共享**一张过来
 ///    （这就是 Mafia: The Old Country 那类"游戏删了、手账里还留着图"的救图路径）。
+///
+/// 仅测试保留：生产入口是 `migrate_with_short_locks`，后者按条目拆锁且不阻塞首屏后的操作。
+#[cfg(test)]
 pub fn migrate(db: &Database) -> Result<CoverMigrateReport> {
     let done = db.get_setting(MIGRATION_FLAG)?.as_deref() == Some("1");
     let rerun = db.get_setting(MIGRATION_FLAG_AGAIN)?.as_deref() == Some("1");
@@ -872,6 +1034,356 @@ pub fn migrate(db: &Database) -> Result<CoverMigrateReport> {
         report.bytes_before,
         report.bytes_after
     );
+    Ok(report)
+}
+
+fn lock_db(db: &Arc<Mutex<Database>>) -> MutexGuard<'_, Database> {
+    match db.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn owner_exists(db: &Database, owner_kind: &str, owner_id: &str) -> Result<bool> {
+    match owner_kind {
+        OWNER_GAME => Ok(db.get_game_by_id(owner_id)?.is_some()),
+        OWNER_REVIEW => Ok(db.get_review_by_id(owner_id)?.is_some()),
+        _ => Ok(false),
+    }
+}
+
+/// 无锁准备一条存量封面的索引行与暂存文件。
+///
+/// 自己的文件走 `prepare_path`（转码 + 生成缩略图）；历史共享文件保留原主图，
+/// 只替换主图行的元数据并暂存新缩略图。所有解码/编码都在 DB 锁外完成。
+fn prepare_migration_cover(
+    owner_kind: &str,
+    owner_id: &str,
+    src: &Path,
+) -> Result<PreparedCover> {
+    let own_file = src
+        .file_stem()
+        .map(|s| s.to_string_lossy() == owner_id)
+        .unwrap_or(false);
+    let mut prepared = prepare_path(owner_kind, owner_id, src)?;
+    if own_file {
+        return Ok(prepared);
+    }
+
+    let rel = rel_path_of(src).context("共享封面不在 covers 目录内")?;
+    let bytes = std::fs::read(src).with_context(|| format!("读取共享封面失败: {}", src.display()))?;
+    let (width, height) = image::image_dimensions(src)?;
+
+    // prepare_path 为「自己的文件」生成了主图暂存；共享文件不需要替换主图，
+    // 删掉这个暂存，再把 main 行改指回原始 rel_path。
+    let mut staged = std::mem::take(&mut prepared.staged);
+    if !staged.is_empty() {
+        let (main_tmp, _) = staged.remove(0);
+        let _ = std::fs::remove_file(main_tmp);
+    }
+    prepared.staged = staged;
+    if let Some(main) = prepared.rows.first_mut() {
+        main.rel_path = rel;
+        main.sha256 = sha256_hex(&bytes);
+        main.width = width;
+        main.height = height;
+        main.bytes = bytes.len() as u64;
+    }
+
+    // 缩略图已存在则沿用旧文件，不重复覆盖；索引元数据按磁盘上的真实字节写。
+    let thumb_target = prepared.rows.get(1).map(|r| abs_path(&r.rel_path));
+    if let Some(target) = thumb_target {
+        if target.exists() {
+            if let Some((tmp, _)) = prepared.staged.pop() {
+                let _ = std::fs::remove_file(tmp);
+            }
+            let existing = std::fs::read(&target)?;
+            let (tw, th) = image::image_dimensions(&target)?;
+            if let Some(thumb) = prepared.rows.get_mut(1) {
+                thumb.sha256 = sha256_hex(&existing);
+                thumb.width = tw;
+                thumb.height = th;
+                thumb.bytes = existing.len() as u64;
+            }
+        }
+    }
+    Ok(prepared)
+}
+
+/// 生产用迁移入口：只在一张图的 prepare / commit 之间短暂拿锁。
+pub fn migrate_with_short_locks(db: &Arc<Mutex<Database>>) -> Result<CoverMigrateReport> {
+    let (done, rerun) = {
+        let guard = lock_db(db);
+        (
+            guard.get_setting(MIGRATION_FLAG)?.as_deref() == Some("1"),
+            guard.get_setting(MIGRATION_FLAG_AGAIN)?.as_deref() == Some("1"),
+        )
+    };
+    if done && !rerun {
+        return Ok(CoverMigrateReport::default());
+    }
+    {
+        let guard = lock_db(db);
+        guard.ensure_cover_storage()?;
+    }
+
+    let mut report = CoverMigrateReport {
+        bytes_before: dir_size(&path::get_covers_dir()),
+        ..Default::default()
+    };
+    let owners: Vec<(String, String, Option<String>)> = {
+        let guard = lock_db(db);
+        let mut owners = Vec::new();
+        for game in guard.get_games(&Default::default())? {
+            owners.push((OWNER_GAME.to_string(), game.id, game.cover_local.or(game.cover_url)));
+        }
+        for review in guard.get_reviews(&Default::default())? {
+            owners.push((OWNER_REVIEW.to_string(), review.id, review.cover_local.or(review.cover_url)));
+        }
+        owners
+    };
+
+    for (kind, id, cover_path) in owners {
+        let Some(path_str) = cover_path else { continue };
+        let src = Path::new(&path_str);
+        let needs_migration = {
+            let guard = lock_db(db);
+            guard.cover_rows(&kind, &id)?.is_empty()
+        };
+        if !needs_migration {
+            continue;
+        }
+        if !src.exists() {
+            report.missing_file += 1;
+            continue;
+        }
+
+        let prepared = match prepare_migration_cover(&kind, &id, src) {
+            Ok(p) => p,
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!("封面迁移预处理失败 {} {}: {}", kind, id, e);
+                continue;
+            }
+        };
+        let outcome = (|| -> Result<bool> {
+            let guard = lock_db(db);
+            if !owner_exists(&guard, &kind, &id)? || !guard.cover_rows(&kind, &id)?.is_empty() {
+                return Ok(false);
+            }
+            let set = commit_prepared(&guard, &kind, &id, prepared)?;
+            cleanup_ingest_source(&guard, src, &set, true)?;
+            Ok(true)
+        })();
+        match outcome {
+            Ok(true) => report.indexed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!("封面迁移失败 {} {}: {}", kind, id, e);
+            }
+        }
+    }
+
+    let tombstones = {
+        let guard = lock_db(db);
+        guard.all_tombstones()?
+    };
+    for (tomb_id, name) in tombstones {
+        let outcome = (|| -> Result<bool> {
+            let guard = lock_db(db);
+            if !guard.cover_rows(OWNER_GAME, &tomb_id)?.is_empty() {
+                return Ok(false);
+            }
+            let Some(review_id) = guard.find_review_id_by_game_name(&name)? else {
+                return Ok(false);
+            };
+            share_from(&guard, OWNER_REVIEW, &review_id, OWNER_GAME, &tomb_id, STATE_ARCHIVED)
+        })();
+        match outcome {
+            Ok(true) => {
+                report.relinked += 1;
+                tracing::info!("已移除条目「{}」从手账回挂封面", name);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!("回挂封面失败 {}: {}", name, e);
+            }
+        }
+    }
+
+    report.bytes_after = dir_size(&path::get_covers_dir());
+    {
+        let guard = lock_db(db);
+        guard.set_setting(MIGRATION_FLAG, "1")?;
+        guard.set_setting(MIGRATION_FLAG_AGAIN, "0")?;
+    }
+    tracing::info!(
+        "封面迁移完成：登记 {}，回挂 {}，缺文件 {}，失败 {}，目录 {} → {} 字节",
+        report.indexed,
+        report.relinked,
+        report.missing_file,
+        report.failed,
+        report.bytes_before,
+        report.bytes_after
+    );
+    Ok(report)
+}
+
+/// 生产用缩略图升级：解码/编码/写暂存全在锁外，逐组短锁更新索引。
+pub fn upgrade_thumbs_with_short_locks(db: &Arc<Mutex<Database>>) -> Result<ThumbUpgradeReport> {
+    let want = THUMB_MAX_EDGE.to_string();
+    let (done, rows) = {
+        let guard = lock_db(db);
+        let done = guard.get_setting(THUMB_SPEC_FLAG)?.as_deref() == Some(want.as_str());
+        let rows = if done { Vec::new() } else { guard.all_cover_rows()? };
+        (done, rows)
+    };
+    if done {
+        return Ok(ThumbUpgradeReport::default());
+    }
+    path::ensure_cover_dirs()?;
+
+    let mut groups: std::collections::BTreeMap<String, Vec<CoverIndexRow>> =
+        std::collections::BTreeMap::new();
+    let mut main_by_owner: std::collections::HashMap<(String, String), CoverIndexRow> =
+        std::collections::HashMap::new();
+    for row in rows {
+        if row.kind == KIND_MAIN {
+            main_by_owner
+                .entry((row.owner_kind.clone(), row.owner_id.clone()))
+                .or_insert(row.clone());
+        }
+        if row.kind == KIND_THUMB {
+            groups.entry(row.rel_path.clone()).or_default().push(row);
+        }
+    }
+
+    let mut report = ThumbUpgradeReport::default();
+    for (rel_path, group) in groups {
+        let abs = abs_path(&rel_path);
+        match image::image_dimensions(&abs) {
+            Ok((w, h)) if w.max(h) >= THUMB_MAX_EDGE => {
+                report.skipped += 1;
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("缩略图重建跳过（读不到尺寸）{}: {}", rel_path, e);
+                report.skipped += 1;
+                continue;
+            }
+        }
+
+        let first = &group[0];
+        let main_abs = main_by_owner
+            .get(&(first.owner_kind.clone(), first.owner_id.clone()))
+            .map(|r| abs_path(&r.rel_path))
+            .filter(|p| p.exists());
+        let Some(main_abs) = main_abs else {
+            tracing::warn!("缩略图重建跳过（主图缺失）: {}", rel_path);
+            report.skipped += 1;
+            continue;
+        };
+        let img = match image::open(&main_abs) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!("缩略图重建失败（主图解码）{}: {}", main_abs.display(), e);
+                report.failed += 1;
+                continue;
+            }
+        };
+        let (bytes, tw, th, thumb_ext) = match build_thumb(&img) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("缩略图重建失败（编码）{}: {}", rel_path, e);
+                report.failed += 1;
+                continue;
+            }
+        };
+        let new_rel = swap_ext(&rel_path, thumb_ext);
+        let (tmp, dst) = match write_staged(&abs_path(&new_rel), &bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("缩略图重建写盘失败 {}: {}", new_rel, e);
+                report.failed += 1;
+                continue;
+            }
+        };
+        let sha = sha256_hex(&bytes);
+        let now = now_rfc3339();
+
+        let outcome = (|| -> Result<()> {
+            let guard = lock_db(db);
+            // 锁外准备期间状态可能变化：提交时重新读取当前行，避免把旧快照的
+            // owner/state 写回去，也顺带确认旧 rel_path 仍是这条缩略图。
+            let mut current_rows = Vec::with_capacity(group.len());
+            for row in &group {
+                let current = guard.cover_rows(&row.owner_kind, &row.owner_id)?;
+                let Some(thumb_row) = current
+                    .into_iter()
+                    .find(|r| r.kind == KIND_THUMB && r.rel_path == rel_path)
+                else {
+                    anyhow::bail!("封面索引在重建期间发生变化: {}", rel_path);
+                };
+                current_rows.push(thumb_row);
+            }
+            let swap = FileSwap::apply(&[(tmp.clone(), dst.clone())])?;
+            let db_result = (|| -> Result<()> {
+                for row in &current_rows {
+                    if new_rel != rel_path {
+                        guard.set_cover_rel_path(
+                            &row.owner_kind,
+                            &row.owner_id,
+                            KIND_THUMB,
+                            &new_rel,
+                            &row.state,
+                        )?;
+                    }
+                    guard.update_cover_meta(
+                        &row.owner_kind,
+                        &row.owner_id,
+                        KIND_THUMB,
+                        &sha,
+                        tw,
+                        th,
+                        bytes.len() as u64,
+                        &now,
+                    )?;
+                    guard.touch_cover_row(&row.owner_kind, &row.owner_id, KIND_MAIN, &now)?;
+                }
+                Ok(())
+            })();
+            match db_result {
+                Ok(()) => {
+                    swap.commit();
+                    if new_rel != rel_path && guard.cover_rel_refcount(&rel_path)? == 0 {
+                        let _ = std::fs::remove_file(abs_path(&rel_path));
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    swap.rollback();
+                    Err(e)
+                }
+            }
+        })();
+        match outcome {
+            Ok(()) => report.rebuilt += 1,
+            Err(e) => {
+                tracing::warn!("缩略图重建提交失败 {}: {}", rel_path, e);
+                report.failed += 1;
+            }
+        }
+        // 正常路径中 tmp 已被 rename；异常/索引变化时清掉暂存文件。
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    {
+        let guard = lock_db(db);
+        guard.set_setting(THUMB_SPEC_FLAG, &want)?;
+    }
     Ok(report)
 }
 
@@ -1366,5 +1878,42 @@ mod tests {
             let rows = db.cover_rows(OWNER_GAME, &id).unwrap();
             println!("墓碑「{}」封面行数 = {}", name, rows.len());
         }
+    }
+
+    /// 生产入口必须能在 Arc<Mutex<Database>> 上跑通，且共享主图不被重写。
+    #[test]
+    fn short_lock_migration_and_thumb_upgrade_work() {
+        use std::sync::{Arc, Mutex};
+
+        let db = db();
+        let id = uuid::Uuid::new_v4().to_string();
+        let src = test_root().join(format!("legacy-{id}.png"));
+        let original = opaque_png(1200, 1800);
+        std::fs::write(&src, &original).unwrap();
+
+        let mut game = crate::models::Game::new("短锁迁移测试".into());
+        game.id = id.clone();
+        game.cover_local = Some(src.to_string_lossy().to_string());
+        db.upsert_game(&game).unwrap();
+
+        let shared = Arc::new(Mutex::new(db));
+        let report = migrate_with_short_locks(&shared).unwrap();
+        assert_eq!(report.indexed, 1, "应登记一条存量封面，报告 {:?}", report);
+        assert_eq!(std::fs::read(&src).unwrap(), original, "共享主图不得被改写");
+
+        {
+            let guard = shared.lock().unwrap();
+            assert_eq!(guard.cover_rows(OWNER_GAME, &id).unwrap().len(), 2);
+        }
+        let thumb_report = upgrade_thumbs_with_short_locks(&shared).unwrap();
+        assert_eq!(thumb_report.failed, 0, "缩略图升级不应失败");
+
+        let want = THUMB_MAX_EDGE.to_string();
+        let guard = shared.lock().unwrap();
+        assert_eq!(
+            guard.get_setting(THUMB_SPEC_FLAG).unwrap().as_deref(),
+            Some(want.as_str()),
+            "升级完成必须写入规格标记"
+        );
     }
 }

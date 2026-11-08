@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import type { GameAchievements } from "../lib/tauri";
 import { displayName, useGamesStore } from "../stores/games";
 import { computeGameAchievementProgress } from "../lib/achievements";
@@ -19,6 +19,10 @@ const game = computed(() => store.games.find((g) => g.id === props.entry.game_id
 const name = computed(() => (game.value ? displayName(game.value) : props.entry.game_name));
 const coverSrc = computed(() => store.coverSrc(props.entry.game_id, true));
 const imgFailed = ref(false);
+// 封面换了一张（或补上了）之后要解除失败态，否则会一直显示占位符直到组件重挂
+watch(coverSrc, () => {
+  imgFailed.value = false;
+});
 
 const progress = computed(() => computeGameAchievementProgress(props.entry.achievements));
 </script>
@@ -52,7 +56,9 @@ const progress = computed(() => computeGameAchievementProgress(props.entry.achie
         class="progress-row"
         :title="
           progress.skipped
-            ? `另有 ${progress.skipped} 条成就因缺少 HLTB 参考时长，不计入完成度`
+            ? entry.removed
+              ? '已删除游戏不再结算，只按历史解锁记录计数'
+              : `另有 ${progress.skipped} 条成就因缺少 HLTB 参考时长，不计入完成度`
             : undefined
         "
       >

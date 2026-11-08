@@ -27,6 +27,10 @@ onMounted(async () => {
   }
 });
 
+// 【2026-11-08】收集定时器句柄，卸载时统一清理：组件若改为条件渲染，
+// 旧版 4.2s 后的回调仍会去改已卸载组件的 toasts ref。
+const toastTimers = new Set<ReturnType<typeof setTimeout>>();
+
 function pushToast(ev: UnlockEvent) {
   const item: ToastItem = { id: nextId++, def: ev.def, gameId: ev.game_id };
   toasts.value.push(item);
@@ -34,7 +38,11 @@ function pushToast(ev: UnlockEvent) {
     toasts.value.shift();
   }
   // 4 秒后自动消失
-  setTimeout(() => removeToast(item.id), 4200);
+  const timer = setTimeout(() => {
+    toastTimers.delete(timer);
+    removeToast(item.id);
+  }, 4200);
+  toastTimers.add(timer);
 }
 
 function removeToast(id: number) {
@@ -43,6 +51,8 @@ function removeToast(id: number) {
 
 onUnmounted(() => {
   unlisten?.();
+  for (const timer of toastTimers) clearTimeout(timer);
+  toastTimers.clear();
 });
 </script>
 

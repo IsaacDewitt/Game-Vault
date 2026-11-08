@@ -160,6 +160,82 @@ fn parse_appid(raw: &str) -> Option<String> {
     Some(n.to_string())
 }
 
+/// 从 Steam 商店搜索（storesearch）响应里挑一个 appid。
+///
+/// 响应里除真正的游戏（`type == "app"`）外还会混进 bundle / sub 之类的包体，
+/// 拿它们的 id 拼图床只会 404，故先按 type 过滤。
+///
+/// 选谁：优先「忽略大小写与首尾空格后完全相等」的名字（"Hollow Knight" 不该
+/// 被 "Hollow Knight: Silksong" 顶掉），否则取第一个 app ——
+/// 与 SteamGridDB 那条链路「取相关性最高的一条」口径一致。
+fn pick_appid_from_store_search(data: &serde_json::Value, term: &str) -> Option<String> {
+    let items = data["items"].as_array()?;
+    let wanted = term.trim().to_lowercase();
+    let mut first: Option<String> = None;
+
+    for app in items.iter().filter(|it| it["type"].as_str() == Some("app")) {
+        let Some(id) = app["id"].as_u64() else {
+            continue;
+        };
+        let id = id.to_string();
+        if let Some(name) = app["name"].as_str() {
+            if name.trim().to_lowercase() == wanted {
+                return Some(id);
+            }
+        }
+        if first.is_none() {
+            first = Some(id);
+        }
+    }
+    first
+}
+
+/// 抓取失败的成因分类。
+///
+/// 批量抓封面时靠它决定「跳过这一款继续」还是「整批收工」——旧实现只有「成功 / 失败」
+/// 两种结局，一个 429 或一次写盘失败就会把剩下的几十款全部放弃，还统一报「网络异常」，
+/// 把用户引向错误的方向（2026-10-28 审查指出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverFailureKind {
+    /// 网络/接口整体不可用（建连全断、读体全断）：后面的游戏大概率同样失败
+    Transport,
+    /// 限流 429：歇一会儿换下一款就好，不该整批中止
+    RateLimited,
+    /// API Key 无效 / 401 / 403：所有游戏都会失败，立刻收工
+    Unauthorized,
+    /// 其它业务性失败（响应解析、落盘等）：只影响这一条
+    Other,
+}
+
+impl CoverFailureKind {
+    // 【2026-11-08】删掉旧的 `aborts_batch()`：整批中止与否现在由
+    // commands/games.rs 按 `failure.kind` 分支决定（Unauthorized/Transport
+    // 才 break，RateLimited 退避续跑），这里留一个没人调的判据只会让
+    // 两处口径各自漂移。
+
+    fn priority(self) -> u8 {
+        match self {
+            Self::Unauthorized => 0,
+            Self::Transport => 1,
+            Self::RateLimited => 2,
+            Self::Other => 3,
+        }
+    }
+}
+
+/// `fetch_cover` 的失败体：既带成因分类，也带给人看的说明。
+#[derive(Debug)]
+pub struct CoverFailure {
+    pub kind: CoverFailureKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for CoverFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// 一次 SteamGridDB 检索的结果。
 ///
 /// 刻意不是 `Option`：旧实现把「网络失败」「限流」「没收录」全部揉成一个
@@ -171,8 +247,12 @@ enum SgdbSearch {
     Hit(Vec<String>),
     /// 确定未收录（搜索或 grids 返回空数组）
     NotFound,
-    /// 失败。`fatal` 表示换检索词也没用（API Key 无效）
-    Failed { reason: String, fatal: bool },
+    /// 失败。`fatal` 表示换检索词也没用；`kind` 供批量抓取决定是否整批收工
+    Failed {
+        reason: String,
+        fatal: bool,
+        kind: CoverFailureKind,
+    },
 }
 
 /// 传输层失败的标记包装。
@@ -272,7 +352,10 @@ impl CoverFetcher {
     }
 
     /// 获取游戏封面（异步）
-    pub async fn fetch_cover(&self, game: &Game) -> Result<Option<String>> {
+    pub async fn fetch_cover(
+        &self,
+        game: &Game,
+    ) -> std::result::Result<Option<String>, CoverFailure> {
         // 整次抓取的硬预算：所有请求的 timeout 都会被压到「剩余预算」以内，
         // 保证不会出现"点了刷新一直转圈"（2026-10-18 实测 3.5 分钟那次）。
         let deadline = std::time::Instant::now()
@@ -296,10 +379,17 @@ impl CoverFetcher {
                     Some("webp") => dest.with_extension("webp"),
                     _ => dest,
                 };
-                std::fs::copy(&local_cover, &final_dest)?;
+                std::fs::copy(&local_cover, &final_dest).map_err(|e| CoverFailure {
+                    kind: CoverFailureKind::Other,
+                    message: format!("复制本地封面失败: {e}"),
+                })?;
                 return Ok(Some(final_dest.to_string_lossy().to_string()));
             }
         }
+
+        // 本轮遇到过的失败（按成因分类）。收尾时靠它区分「真没收录」与
+        // 「网挂了 / 限流 / 找到了但下不下来」—— 这三类旧实现全被谎报成「未收录」。
+        let mut failures: Vec<(CoverFailureKind, String)> = Vec::new();
 
         // 3. Steam 官方图床（按 appid 精确直取，无需 API Key）
         //
@@ -317,14 +407,28 @@ impl CoverFetcher {
                     tracing::info!("使用 Steam 官方封面: {}", game.name);
                     return Ok(Some(actual_path.to_string_lossy().to_string()));
                 }
-                // 官方图床没有这张图（老游戏/DLC/工具类常见 404）就走下面
-                Err(e) => tracing::warn!("Steam 官方封面不可用（{url}）: {e}，回退 SteamGridDB"),
+                // 没这张图（老游戏/DLC/工具类常见 404）或网络失败：都记下来再走 SGDB。
+                // 以前这里只打日志，于是「没配 Key + Steam 图床又抓不到」时报不出真实原因。
+                Err(e) => {
+                    let kind = failure_kind_of(&e);
+                    tracing::warn!("Steam 官方封面不可用（{url}）: {e}，回退 SteamGridDB");
+                    failures.push((kind, format!("Steam 官方封面不可用: {e}")));
+                }
             }
         }
 
         // 4. SteamGridDB：英文名 → 游戏名 → 文件夹名，先命中先返回
+        //
+        //    没配 Key 不代表没法抓图：Steam 官方图床是免钥匙的，走到这里说明它也没成。
+        //    此时只把网络/鉴权类失败如实上抛，其余按「没有这张图」处理。
         if self.steamgriddb_api_key.is_empty() {
-            return Ok(None);
+            return match worst_failure(&failures) {
+                Some(kind) if kind != CoverFailureKind::Other => Err(CoverFailure {
+                    kind,
+                    message: join_failures(&failures),
+                }),
+                _ => Ok(None),
+            };
         }
 
         let cache_path = self.get_cache_path(&game.id);
@@ -350,7 +454,12 @@ impl CoverFetcher {
         // 「库里真没有」与「网全挂了」。前者返回 None（走默认封面），
         // 后者返回 Err（让用户知道是网络问题，而不是名字写错了）。
         let mut heard_back = false;
-        let mut failures: Vec<String> = Vec::new();
+        // 本轮最后一次致命失败（API Key 无效 / 限流 / 网络全断）。
+        // 与历史 failures 分开记：已回退成功的图床抖动不该决定整批命运。
+        let mut last_fatal_kind: Option<CoverFailureKind> = None;
+        // 「检索命中了，但候选图一张都没下来」：这同样算失败，且不能被
+        // 后面某个检索词的 NotFound 掩盖成「未收录」。
+        let mut hit_download_failed = false;
 
         for term in &terms {
             match self.search_steamgriddb(term, deadline).await {
@@ -365,7 +474,8 @@ impl CoverFetcher {
                                 // 旧实现在这里用 `if let Ok` 把错误整个丢掉，
                                 // 日志零痕迹 —— 这正是"拉图老有问题"却查不出原因的直接原因。
                                 tracing::warn!("封面下载失败（{url}）: {e}");
-                                failures.push(format!("封面下载失败: {e}"));
+                                failures.push((failure_kind_of(&e), format!("封面下载失败: {e}")));
+                                hit_download_failed = true;
                             }
                         }
                     }
@@ -374,59 +484,39 @@ impl CoverFetcher {
                     heard_back = true;
                     tracing::info!("SteamGridDB 未收录: {term}");
                 }
-                SgdbSearch::Failed { reason, fatal } => {
+                SgdbSearch::Failed { reason, fatal, kind } => {
                     tracing::warn!("SteamGridDB 检索失败（{term}）: {reason}");
-                    failures.push(reason);
+                    failures.push((kind, reason));
                     if fatal {
-                        // API Key 无效 / 限流：换检索词毫无意义，立刻止损
+                        // API Key 无效 / 限流 / 网络全断：换检索词毫无意义，立刻止损。
+                        // 记下这一次（而不是回头翻历史 failures）作为整批的真实成因。
+                        last_fatal_kind = Some(kind);
                         break;
                     }
                 }
             }
         }
 
-        // 5. 收尾：有明确答复 = 确实没有封面；全程失败 = 如实报网络错误
-        if heard_back || failures.is_empty() {
-            Ok(None)
-        } else {
-            Err(anyhow::anyhow!("{}", failures.join("；")))
-        }
-    }
-
-    /// 获取封面（供鉴赏等无安装路径的条目使用）
-    /// 流程：检查缓存 → SteamGridDB 按名字搜索 → 下载，不涉及本地游戏目录
-    pub async fn fetch_cover_for_id(&self, id: &str, name: &str) -> Result<Option<String>> {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(COVER_TOTAL_BUDGET_SECS);
-
-        // 1. 检查缓存（与游戏封面共用 covers 目录，id 为 uuid 无冲突）
-        if let Some(cache_path) = self.find_cached_cover(id) {
-            return Ok(Some(cache_path.to_string_lossy().to_string()));
-        }
-
-        // 2. 尝试 SteamGridDB（按名字搜索；候选图依次尝试）
-        if !self.steamgriddb_api_key.is_empty() {
-            let cache_path = self.get_cache_path(id);
-            match self.search_steamgriddb(name, deadline).await {
-                SgdbSearch::Hit(urls) => {
-                    for url in &urls {
-                        match self.download_image(url, &cache_path, true, deadline).await {
-                            Ok(actual_path) => {
-                                return Ok(Some(actual_path.to_string_lossy().to_string()));
-                            }
-                            Err(e) => tracing::warn!("封面下载失败（{url}）: {e}"),
-                        }
-                    }
-                }
-                SgdbSearch::NotFound => tracing::info!("SteamGridDB 未收录: {name}"),
-                SgdbSearch::Failed { reason, .. } => {
-                    tracing::warn!("SteamGridDB 检索失败（{name}）: {reason}");
-                    return Err(anyhow::anyhow!(reason));
-                }
+        // 5. 收尾（2026-11-08 修复错误语义）：只看「本轮最后一次致命失败」，
+        //    不再对全部历史 failures 取 worst_failure 代表整批。
+        //    - 旧版混一次非致命 Other + heard_back=true 时直接 Ok(None)，
+        //      把 429 限流谎报成「SteamGridDB 未收录」；
+        //    - 旧版把早期一次「已回退成功的 Steam 图床抖动」(Transport)
+        //      翻出来压过最后的 429，导致整批中止、剩余几十款全放弃。
+        //    只有确实没收到任何明确答复、或候选图下载失败时才回退到历史最严重项。
+        let fatal_kind = last_fatal_kind.or_else(|| {
+            if !heard_back || hit_download_failed {
+                Some(worst_failure(&failures).unwrap_or(CoverFailureKind::Other))
+            } else {
+                None
             }
+        });
+        if let Some(kind) = fatal_kind {
+            return Err(CoverFailure {
+                kind,
+                message: join_failures(&failures),
+            });
         }
-
-        // 3. 返回 None（使用默认封面）
         Ok(None)
     }
 
@@ -522,7 +612,11 @@ impl CoverFetcher {
         .await
         {
             Ok(v) => v,
-            Err(e) => return SgdbSearch::Failed { reason: format!("搜索请求失败: {e}"), fatal: true },
+            Err(e) => return SgdbSearch::Failed {
+                reason: format!("搜索请求失败: {e}"),
+                fatal: true,
+                kind: CoverFailureKind::Transport,
+            },
         };
 
         if !status.is_success() {
@@ -531,27 +625,38 @@ impl CoverFetcher {
                 reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => SgdbSearch::Failed {
                     reason: "SteamGridDB API Key 无效，请在设置中检查".to_string(),
                     fatal: true,
+                    kind: CoverFailureKind::Unauthorized,
                 },
                 // 429 限流（免费层约 1 req/s）：换检索词只会加深限流，直接止损
                 reqwest::StatusCode::TOO_MANY_REQUESTS => SgdbSearch::Failed {
                     reason: "SteamGridDB 请求过于频繁（429），请稍后重试".to_string(),
                     fatal: true,
+                    kind: CoverFailureKind::RateLimited,
                 },
                 other => SgdbSearch::Failed {
                     reason: format!("搜索接口返回 HTTP {other}"),
                     fatal: false,
+                    kind: CoverFailureKind::Other,
                 },
             };
         }
 
         let data: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
-            Err(e) => return SgdbSearch::Failed { reason: format!("搜索响应解析失败: {e}"), fatal: false },
+            Err(e) => return SgdbSearch::Failed {
+                reason: format!("搜索响应解析失败: {e}"),
+                fatal: false,
+                kind: CoverFailureKind::Other,
+            },
         };
 
         let Some(games) = data["data"].as_array() else {
             tracing::warn!("SteamGridDB 响应格式异常: {}", game_name);
-            return SgdbSearch::Failed { reason: "搜索响应格式异常".to_string(), fatal: false };
+            return SgdbSearch::Failed {
+                reason: "搜索响应格式异常".to_string(),
+                fatal: false,
+                kind: CoverFailureKind::Other,
+            };
         };
         let Some(first_game) = games.first() else {
             return SgdbSearch::NotFound;
@@ -576,7 +681,11 @@ impl CoverFetcher {
         .await
         {
             Ok(v) => v,
-            Err(e) => return SgdbSearch::Failed { reason: format!("封面列表请求失败: {e}"), fatal: false },
+            Err(e) => return SgdbSearch::Failed {
+                reason: format!("封面列表请求失败: {e}"),
+                fatal: false,
+                kind: CoverFailureKind::Transport,
+            },
         };
 
         // 这里曾经是「静默 Ok(None)」：grids 返回任何非 2xx 都当作"没有封面"，
@@ -585,12 +694,21 @@ impl CoverFetcher {
             return SgdbSearch::Failed {
                 reason: format!("封面列表接口返回 HTTP {g_status}"),
                 fatal: g_status == reqwest::StatusCode::TOO_MANY_REQUESTS,
+                kind: if g_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    CoverFailureKind::RateLimited
+                } else {
+                    CoverFailureKind::Other
+                },
             };
         }
 
         let grids_data: serde_json::Value = match serde_json::from_slice(&g_body) {
             Ok(v) => v,
-            Err(e) => return SgdbSearch::Failed { reason: format!("封面列表解析失败: {e}"), fatal: false },
+            Err(e) => return SgdbSearch::Failed {
+                reason: format!("封面列表解析失败: {e}"),
+                fatal: false,
+                kind: CoverFailureKind::Other,
+            },
         };
         let Some(grids) = grids_data["data"].as_array() else {
             return SgdbSearch::NotFound;
@@ -757,6 +875,45 @@ impl CoverFetcher {
         }).collect();
 
         Ok(options)
+    }
+
+    /// 按名字查 Steam **官方**封面地址（供手账等「无平台信息」条目使用）
+    ///
+    /// 两步走：Steam 商店搜索接口（storesearch）认出 appid → `steam_library_cover_url`
+    /// 拼 Akamai 官方图床。这条链路**不经过 SteamGridDB**，与 `set_game_cover_from_steam`
+    /// 最终落到同一个图床，只是 appid 的来源不同。
+    ///
+    /// storesearch 无需 API Key；2026-10-30 本机实测直连 200、0.97 秒。
+    pub async fn steam_cover_url_by_name(&self, name: &str) -> Result<String> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(COVER_OPTIONS_BUDGET_SECS);
+        let url = format!(
+            // 【2026-11-08】检索词是官方英文名（见 commands/reviews.rs 的
+            // `search_name`），旧版却固定 `l=schinese&cc=CN`：返回名多为中文，
+            // 精确同名分支永远不命中，退化成「取相关性第一条」；且 cc=CN 会把
+            // 国区未上架的游戏整批过滤掉，明明有官方图床却报「未能确定 AppID」。
+            // 改英文语种、去掉地区过滤，让英文 term 与返回名同语种、结果最全。
+            "https://store.steampowered.com/api/storesearch/?term={}&l=english",
+            urlencoding::encode(name)
+        );
+
+        let (status, body) = fetch_bytes_with_retry("Steam 商店搜索", deadline, || {
+            self.client.get(&url).timeout(budget_timeout(
+                deadline,
+                std::time::Duration::from_secs(COVER_FETCH_TIMEOUT_SECS),
+            ))
+        })
+        .await?;
+
+        if !status.is_success() {
+            anyhow::bail!("Steam 商店搜索接口返回 HTTP {status}");
+        }
+
+        let data: serde_json::Value = serde_json::from_slice(&body)?;
+        let appid = pick_appid_from_store_search(&data, name)
+            .ok_or_else(|| anyhow::anyhow!("Steam 商店未搜到「{name}」对应的游戏"))?;
+        steam_library_cover_url(&appid)
+            .ok_or_else(|| anyhow::anyhow!("Steam 返回的 appid 不合法: {appid}"))
     }
 
     /// 从 URL 下载图片到指定路径（**用户提供的地址**，供外部调用）
@@ -958,11 +1115,38 @@ impl CoverFetcher {
     }
 }
 
+
+/// 把内部错误折成批量抓取能看懂的成因分类。
+///
+/// `download_image` 会给网络类错误打 `TransportFailure` 标记；没有这个标记的
+/// （404、非图片、写盘失败）重试与整批中止都救不了，归 Other。
+fn failure_kind_of(e: &anyhow::Error) -> CoverFailureKind {
+    if e.downcast_ref::<TransportFailure>().is_some() {
+        CoverFailureKind::Transport
+    } else {
+        CoverFailureKind::Other
+    }
+}
+
+/// 一批失败里最该优先上报的成因（鉴权 > 网络 > 限流 > 其它）。
+fn worst_failure(failures: &[(CoverFailureKind, String)]) -> Option<CoverFailureKind> {
+    failures.iter().map(|(k, _)| *k).min_by_key(|k| k.priority())
+}
+
+/// 拼给人看的失败说明。
+fn join_failures(failures: &[(CoverFailureKind, String)]) -> String {
+    failures
+        .iter()
+        .map(|(_, m)| m.as_str())
+        .collect::<Vec<_>>()
+        .join("；")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_local_steam_appid, is_trusted_cover_host, parse_appid, pick_search_term,
-        steam_library_cover_url, CoverFetcher, TransportFailure,
+        detect_local_steam_appid, is_trusted_cover_host, parse_appid, pick_appid_from_store_search,
+        pick_search_term, steam_library_cover_url, CoverFetcher, TransportFailure,
     };
 
     /// 中文名 + 有官方英文名 → 用英文名搜（SteamGridDB 只收录英文名，
@@ -1017,6 +1201,61 @@ mod tests {
         assert_eq!(
             steam_library_cover_url(" 730 ").as_deref(),
             Some("https://cdn.cloudflare.steamstatic.com/steam/apps/730/library_600x900.jpg")
+        );
+    }
+
+    /// 商店搜索解析：精确同名的结果优先于排在前面的模糊结果。
+    /// 反例：搜 "Hollow Knight" 时 storesearch 会把续作排在前面，直接取第一条会贴错图。
+    #[test]
+    fn store_search_prefers_exact_name() {
+        let data = serde_json::json!({
+            "total": 2,
+            "items": [
+                { "type": "app", "name": "Hollow Knight: Silksong", "id": 1030300 },
+                { "type": "app", "name": "Hollow Knight", "id": 367520 }
+            ]
+        });
+        assert_eq!(
+            pick_appid_from_store_search(&data, "Hollow Knight").as_deref(),
+            Some("367520")
+        );
+        // 大小写与首尾空格不敏感（前端传来的名字常常带空格）
+        assert_eq!(
+            pick_appid_from_store_search(&data, "  hollow knight ").as_deref(),
+            Some("367520")
+        );
+    }
+
+    /// 没有精确同名时退化为「第一个 app」；bundle / sub 之类的包体必须跳过
+    #[test]
+    fn store_search_skips_bundles_and_falls_back_to_first_app() {
+        let data = serde_json::json!({
+            "items": [
+                { "type": "sub", "name": "Half-Life Complete", "id": 90 },
+                { "type": "bundle", "name": "Valve Bundle", "id": 100 },
+                { "type": "app", "name": "Half-Life 2", "id": 220 }
+            ]
+        });
+        assert_eq!(
+            pick_appid_from_store_search(&data, "Half-Life").as_deref(),
+            Some("220")
+        );
+    }
+
+    /// 空结果 / 结构异常 → None（调用方据此报「未搜到」，而不是拼出错误 URL）
+    #[test]
+    fn store_search_returns_none_when_empty() {
+        assert_eq!(pick_appid_from_store_search(&serde_json::json!({ "total": 0, "items": [] }), "x"), None);
+        assert_eq!(pick_appid_from_store_search(&serde_json::json!({}), "x"), None);
+        // 只有包体没有 app
+        assert_eq!(
+            pick_appid_from_store_search(&serde_json::json!({ "items": [{ "type": "sub", "id": 1 }] }), "x"),
+            None
+        );
+        // id 不是无符号整数
+        assert_eq!(
+            pick_appid_from_store_search(&serde_json::json!({ "items": [{ "type": "app", "id": -1 }] }), "x"),
+            None
         );
     }
 

@@ -18,9 +18,8 @@ import {
   CATEGORY_META,
   categoryColor,
   computeGameAchievementProgress,
-  formatAchievementProgress,
   groupAchievements,
-  groupProgress,
+  groupStatusText,
   type AchievementGroup,
   type GameAchievementProgress,
 } from "../lib/achievements";
@@ -105,8 +104,9 @@ const stats = computed(() => {
     return { unlocked: 0, total: 0, percent: 0, gamesWithProgress: 0, gamesPlayable: 0 };
   }
   const { unlocked_count, total_count, per_game } = summary.value;
-  const gamesWithProgress = per_game.filter((g) =>
-    g.achievements.some((a) => a.unlocked)
+  // 与相邻的「可解锁游戏」保持同一分母：已删除的留档条目不再结算，不进这两个数
+  const gamesWithProgress = per_game.filter(
+    (g) => !g.removed && g.achievements.some((a) => a.unlocked)
   ).length;
   // 「可解锁游戏」只数在库条目：已删除的留档条目不再参与结算，算进去会虚高
   const gamesPlayable = per_game.filter((g) => !g.removed).length;
@@ -303,7 +303,7 @@ const selectedEntry = computed(
 
               <div class="card-foot">
                 <span class="progress-text">
-                  {{ formatAchievementProgress(groupProgress(group)) }}
+                  {{ groupStatusText(group) }}
                 </span>
                 <span v-if="group.lastUnlockedAt" class="unlock-time">
                   {{ formatDate(group.lastUnlockedAt) }}解锁
@@ -366,7 +366,13 @@ const selectedEntry = computed(
           </div>
           <n-empty
             v-else
-            :description="allCards.length ? '没有符合条件的游戏' : '库中还没有可结算成就的游戏'"
+            :description="
+              allCards.length
+                ? removedCards.length
+                  ? '在库游戏中没有符合条件的条目，已删除的见下方'
+                  : '没有符合条件的游戏'
+                : '库中还没有可结算成就的游戏'
+            "
             style="padding: 40px 0"
           />
 

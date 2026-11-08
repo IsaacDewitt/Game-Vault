@@ -6,13 +6,15 @@ import {
   formatAchievementProgress,
   groupAchievements,
   groupProgress,
+  groupStatusText,
   type AchievementStatusLike,
 } from "./achievements";
 
 function status(
   baseId: string,
   tier: number,
-  over: Partial<AchievementStatusLike> = {}
+  over: Partial<AchievementStatusLike> = {},
+  unit: "seconds" | "count" = "count"
 ): AchievementStatusLike {
   const def: AchievementDef = {
     id: `${baseId}-${tier}`,
@@ -25,6 +27,7 @@ function status(
     tier,
     tier_total: 3,
     target: tier * 10,
+    unit,
   };
   return { def, unlocked: false, unlocked_at: null, progress: 0, target: def.target, ...over };
 }
@@ -80,7 +83,25 @@ describe("groupProgress：组进度取「下一个未达成」的目标", () => 
   });
 });
 
-describe("formatAchievementProgress：文案按量级切换", () => {
+describe("groupStatusText：全解锁不再报进度", () => {
+  it("全部等级解锁后直接说「已全部解锁」，不出现 30 / 20 这种倒挂", () => {
+    const [group] = groupAchievements([
+      status("P-01", 1, { unlocked: true, progress: 10 }),
+      status("P-01", 2, { unlocked: true, progress: 30 }),
+    ]);
+    expect(groupStatusText(group)).toBe("已全部解锁");
+  });
+
+  it("未全解锁时仍按下一级目标报进度", () => {
+    const [group] = groupAchievements([
+      status("P-01", 1, { unlocked: true, progress: 10 }),
+      status("P-01", 2, { unlocked: false, progress: 12 }),
+    ]);
+    expect(groupStatusText(group)).toBe("10 / 20");
+  });
+});
+
+describe("formatAchievementProgress：按显式量纲切换，不靠数值猜", () => {
   it("target = 0 是「未收录参考时长」，不能说成未完成", () => {
     expect(formatAchievementProgress({ progress: 0, target: 0 })).toBe("未收录参考时长");
   });
@@ -90,16 +111,44 @@ describe("formatAchievementProgress：文案按量级切换", () => {
     expect(formatAchievementProgress({ progress: 0, target: 1 })).toBe("未完成");
   });
 
-  it("小时级用时长格式", () => {
-    expect(formatAchievementProgress({ progress: 3600, target: 7200 })).toBe("1h 0m / 2h 0m");
+  it("unit = seconds 走时长格式，与 target 大小无关", () => {
+    expect(formatAchievementProgress({ progress: 3600, target: 7200, unit: "seconds" })).toBe(
+      "1h 0m / 2h 0m"
+    );
+    // P-08/P-09 的 HLTB 参考时长可能只有 10 分钟（600 秒）
+    expect(formatAchievementProgress({ progress: 120, target: 600, unit: "seconds" })).toBe(
+      "2m / 10m"
+    );
   });
 
-  it("分钟级显示分钟", () => {
-    expect(formatAchievementProgress({ progress: 120, target: 600 })).toBe("2 分钟 / 10 分钟");
-  });
-
-  it("个位数级显示计数", () => {
+  it("计数型成就即便 target 很大也直出数字（旧版误显示成「X 分钟」）", () => {
+    // G-02 藏书家 250 款、G-18 老江湖 500 次、G-39 养老玩家 365 天
+    expect(formatAchievementProgress({ progress: 120, target: 250 })).toBe("120 / 250");
+    expect(formatAchievementProgress({ progress: 0, target: 500 })).toBe("0 / 500");
+    expect(formatAchievementProgress({ progress: 100, target: 365 })).toBe("100 / 365");
     expect(formatAchievementProgress({ progress: 3, target: 5 })).toBe("3 / 5");
+  });
+
+  it("缺省 unit 按计数处理，兼容旧数据", () => {
+    expect(formatAchievementProgress({ progress: 3, target: 5 })).toBe("3 / 5");
+  });
+});
+
+describe("groupStatusText：卡片墙也按量纲出文案", () => {
+  it("计数型组显示纯数字，不出现「4 分钟 / 4 分钟」", () => {
+    const [group] = groupAchievements([
+      status("G-02", 1, { progress: 120, target: 250 }),
+      status("G-02", 2, { progress: 120, target: 250 }),
+    ]);
+    expect(groupStatusText(group)).toBe("120 / 250");
+  });
+
+  it("秒型组显示时长", () => {
+    const [group] = groupAchievements([
+      status("P-02", 1, { progress: 120, target: 600 }, "seconds"),
+      status("P-02", 2, { progress: 120, target: 600 }, "seconds"),
+    ]);
+    expect(groupStatusText(group)).toBe("2m / 10m");
   });
 });
 

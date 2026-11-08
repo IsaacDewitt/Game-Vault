@@ -143,12 +143,65 @@ pub struct LlmFetcher {
     client: Client,
 }
 
+/// 判断 LLM 端点是否应绕过系统代理（本地 / 内网 / 链路本地地址直连）。
+///
+/// `url::Url::host_str()` 对 IPv6 字面量返回带方括号的 `[::1]`，不能拿裸字符串
+/// 和 `"::1"` 比较，更不能只用 `fc`/`fd`/`fe80` 前缀猜——后者会把外网域名也
+/// 误判成内网。这里去掉方括号后交给标准库解析，按真实 IP 段判断。
+fn is_local_endpoint(url: &reqwest::Url) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    let Some(raw_host) = url.host_str() else {
+        return false;
+    };
+    let host = raw_host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".local") {
+        return true;
+    }
+
+    let is_local_v4 = |ip: Ipv4Addr| ip.is_loopback() || ip.is_private() || ip.is_link_local();
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return is_local_v4(ip);
+    }
+    if let Ok(ip) = host.parse::<Ipv6Addr>() {
+        let octets = ip.octets();
+        // fc00::/7 唯一本地、fe80::/10 链路本地；`::ffff:a.b.c.d` 映射地址按 IPv4 判。
+        let unique_local = matches!(octets[0], 0xfc | 0xfd);
+        let link_local = octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80;
+        let mapped_v4 = ip.to_ipv4().is_some_and(is_local_v4);
+        return ip.is_loopback() || unique_local || link_local || mapped_v4;
+    }
+    false
+}
+
 impl LlmFetcher {
     pub fn new() -> Result<Self> {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(LLM_REQUEST_TIMEOUT_SECS))
-            .build()
-            .context("创建 HTTP 客户端失败")?;
+        // 【2026-11-08】与封面链路对齐：建连单独限时 + 跟随 Windows 系统代理。
+        // 旧版只有一个 120s 总超时且不读代理，老爷开着 Clash 时封面能拉、
+        // LLM 补全却在 TLS 握手卡死处干等两分钟（本机到 Cloudflare 握手
+        // 约 21% 卡死，封面链路为此专门加了 8s connect_timeout）。
+        //
+        // 刻意**不设 read_timeout**：本地/慢速 LLM 生成两个 token 之间可能
+        // 停顿十几秒，封面那档 12s 读超时会把正常回答掐断，总超时已兜底。
+        let mut builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(COVER_CONNECT_TIMEOUT_SECS))
+            .timeout(std::time::Duration::from_secs(LLM_REQUEST_TIMEOUT_SECS));
+
+        if let Some(raw) = crate::utils::net::system_proxy_url() {
+            if let Ok(proxy_url) = reqwest::Url::parse(&raw) {
+                // 本地 Ollama / 内网自建端点必须直连，不能被系统代理劫走；
+                // 其余（云端 API）走代理，与封面链路同口径。
+                builder = builder.proxy(reqwest::Proxy::custom(move |url: &reqwest::Url| {
+                    if is_local_endpoint(url) {
+                        None
+                    } else {
+                        Some(proxy_url.clone())
+                    }
+                }));
+            }
+        }
+
+        let client = builder.build().context("创建 HTTP 客户端失败")?;
         Ok(Self { client })
     }
 
@@ -1125,5 +1178,42 @@ mod tests {
         assert_eq!(meta.save_paths.len(), 1);
         // genres 去重后应该只有 2 个
         assert_eq!(meta.genres.len(), 2);
+    }
+
+    fn endpoint_is_local(raw: &str) -> bool {
+        is_local_endpoint(&reqwest::Url::parse(raw).expect("测试 URL 应可解析"))
+    }
+
+    /// 本地 IPv4 / IPv6 / mDNS 端点必须直连，不能被系统代理劫走。
+    /// 特别是 `Url::host_str()` 对 IPv6 返回 `[::1]` 这类带方括号的字符串。
+    #[test]
+    fn test_local_llm_endpoints_bypass_proxy() {
+        for url in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://172.16.5.8:11434/v1",
+            "http://169.254.10.2:11434/v1",
+            "http://[::1]:11434/v1",
+            "http://[fc00::1]:11434/v1",
+            "http://[fd12:3456::1]:11434/v1",
+            "http://[fe80::1]:11434/v1",
+            "http://[::ffff:127.0.0.1]:11434/v1",
+            "http://ollama.local:11434/v1",
+        ] {
+            assert!(endpoint_is_local(url), "{url} 应绕过代理");
+        }
+    }
+
+    /// 外网域名不能靠 fc/fd/fe80 之类的字符串前缀被误判成本地地址。
+    #[test]
+    fn test_external_llm_endpoints_use_proxy() {
+        for url in [
+            "https://api.openai.com/v1",
+            "https://fc-api.example.com/v1",
+            "https://fd.example.com/v1",
+            "https://fe80.example.com/v1",
+        ] {
+            assert!(!endpoint_is_local(url), "{url} 应走系统代理");
+        }
     }
 }

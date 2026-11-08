@@ -115,7 +115,7 @@ function setFilter(f: "portrait" | "landscape" | "all") {
     :show="show"
     preset="card"
     title=""
-    :style="{ width: '720px' }"
+    class="cover-picker-modal"
     :bordered="false"
     :closable="true"
     :mask-closable="true"
@@ -327,5 +327,14 @@ function setFilter(f: "portrait" | "landscape" | "all") {
   display: flex;
   justify-content: center;
   padding: 16px 0;
+}
+</style>
+
+<!-- 非 scoped：弹窗被 teleport 到 body，scoped 选择器命中不了内部卡片。
+     与 PlatformImportModal 同口径：class 会透传到 .n-modal 本身，用复合选择器定宽。 -->
+<style>
+.n-modal.cover-picker-modal {
+  width: 720px;
+  max-width: 92vw;
 }
 </style>

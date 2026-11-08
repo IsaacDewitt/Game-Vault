@@ -11,6 +11,19 @@ pub struct PlaySessionDetail {
     pub duration_seconds: u64,
 }
 
+/// 会话状态快照（供前端在挂载 / 重连时对齐后端真相源）
+///
+/// 三态与前端 `LaunchState` 一一对应：
+/// - `playing`：正式计时中；
+/// - `launching`：已委托客户端、等进程现身（尚未计时）；
+/// - `updating`：客户端明确报告正在更新（Steam `Updating=1`）。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSnapshot {
+    pub game_id: String,
+    pub state: String,
+}
+
 /// 活跃的游戏会话（内存中；game_id 即 HashMap 的 key，不重复存字段）
 #[derive(Debug, Clone)]
 pub struct ActiveSession {
@@ -99,11 +112,5 @@ pub struct HourlyStats {
     pub total_seconds: u64,
 }
 
-/// 游戏状态统计（三态：未游玩 / 已游玩 / 已通关，2026-09-06 起与前端筛选口径对齐，
-/// 不再含 playing / abandoned 桶 —— 收藏是独立维度不参与状态互斥）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatusStats {
-    pub unplayed: u32,
-    pub played: u32,
-    pub completed: u32,
-}
+// 【2026-11-08】移除 `StatusStats`：状态分布统计已下线，三态口径只保留在
+// 前端 `src/lib/gameFilter.ts`；这里不再维护第二份结构，避免两边各自漂移。

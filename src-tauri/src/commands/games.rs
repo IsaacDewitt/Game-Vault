@@ -3,14 +3,17 @@ use tauri_plugin_opener::OpenerExt;
 use std::sync::{Arc, Mutex};
 use crate::core::{Database, PlayTimeTracker, GameLauncher};
 use crate::core::launcher::LaunchOutcome;
-use crate::core::cover_fetcher::CoverFetcher;
+use crate::core::tracker::{FinishedSession, StopOutcome};
+use crate::core::cover_fetcher::{CoverFailureKind, CoverFetcher};
 use crate::core::cover_store;
 use crate::models::cover::{OWNER_GAME, OWNER_REVIEW};
 use crate::core::llm_fetcher::{LlmFetcher, LlmConfig, LlmProtocol, LlmGameMeta};
 use crate::models::*;
 use crate::models::settings::Settings;
 use crate::utils;
-use crate::utils::constants::{COVER_BATCH_INTERVAL_MS, COVER_MIN_FILE_SIZE};
+use crate::utils::constants::{
+    COVER_BATCH_INTERVAL_MS, COVER_MIN_FILE_SIZE, COVER_RATE_LIMIT_BACKOFF_MS,
+};
 use super::lock_or_recover;
 
 /// 获取游戏列表
@@ -34,14 +37,70 @@ pub fn get_game_detail(
     db.get_game_by_id(&game_id).map_err(|e| e.to_string())
 }
 
+/// 启动结果（回传前端，决定「立即游玩中」还是「启动中」）
+///
+/// - `spawned`：本地 exe 已由我们亲自拉起，PID 在手，可以立刻算游玩中；
+/// - `delegated`：只把 URI 交给了 Steam/Epic，游戏进程尚未出现，
+///   前端必须显示「启动中」，等 `platform-game-started` 才升为「游玩中」；
+/// - `untracked`：进程拉起了，但连从 exe_path 都补不出身份签名，不能显示游玩中。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LaunchOutcomeDto {
+    Spawned,
+    Delegated,
+    Untracked,
+}
+
+/// 会话收尾：持久化时长 → 成就检测 → 通知前端刷新列表
+///
+/// 后台轮询线程与「停止游戏」命令必须走同一条路，否则手动停止会漏掉
+/// 温会话释放 / 成就解锁 / 列表时长刷新。`emit_game_stopped=false` 用于
+/// 「重复启动顶掉旧会话」：此时同一 game_id 的新会话已经建好，不能再广播
+/// `game-stopped` 把前端的新三态清掉，只发一个不影响状态的刷新事件。
+pub fn finalize_finished_sessions(
+    app: &tauri::AppHandle,
+    db: &Arc<Mutex<Database>>,
+    finished: &[FinishedSession],
+    emit_game_stopped: bool,
+) {
+    if finished.is_empty() {
+        return;
+    }
+    // 游戏会话结束 → 释放截图温会话
+    crate::core::capture::release_warm_session();
+    PlayTimeTracker::persist_finished_sessions(db, finished);
+
+    // 时长/次数类成就。用 lock_or_recover：Mutex 中毒时恢复锁继续检测，
+    // 而不是像旧版 `if let Ok(...)` 那样静默跳过（时长照写、成就永远不补）。
+    let mut new_unlocks = Vec::new();
+    {
+        let db_guard = lock_or_recover(db);
+        match crate::core::AchievementEngine::evaluate(&db_guard) {
+            Ok(events) => new_unlocks = events,
+            Err(e) => tracing::error!("成就检测失败: {}", e),
+        }
+    }
+    if !new_unlocks.is_empty() {
+        let _ = app.emit("achievement-unlocked", &new_unlocks);
+    }
+    for session in finished {
+        if emit_game_stopped {
+            let _ = app.emit("game-stopped", &session.game_id);
+        } else {
+            let _ = app.emit("game-session-settled", &session.game_id);
+        }
+    }
+}
+
 /// 启动游戏
 #[tauri::command(async)]
 pub fn launch_game(
+    app: tauri::AppHandle,
     db: State<'_, Arc<Mutex<Database>>>,
     tracker: State<'_, Arc<Mutex<PlayTimeTracker>>>,
     wakeup: State<'_, Arc<crate::PollWakeup>>,
     game_id: String,
-) -> Result<(), String> {
+) -> Result<LaunchOutcomeDto, String> {
     // 阶段 1：获取游戏数据，然后立即释放 DB 锁
     let game = {
         let db_guard = lock_or_recover(&db);
@@ -63,47 +122,76 @@ pub fn launch_game(
     // 平台游戏走 armed 待命而非即时计时：进程由客户端异步拉起（还要过 DRM 校验、云存档同步），
     // 在进程现身之前无法确认游戏真的跑起来了，先待命可避免"点了启动但没起来"记下一笔假时长。
     // Steam 游戏的 exe_name 为空（acf 不记录 exe 名），照样能靠 install_path 前缀匹配识别。
-    let exe_name = game.exe_name.clone().unwrap_or_default();
-    let mut tracker_guard = lock_or_recover(&tracker);
-
-    let finished_session = match outcome {
-        LaunchOutcome::Spawned(pid) => {
-            // 既无 exe 名也无安装目录 → 无从追踪（与旧行为一致：不启动追踪）
-            if exe_name.is_empty() && game.install_path.is_none() {
-                tracing::warn!("游戏 {} 缺少 exe 名与安装目录，无法追踪时长", game.name);
-                None
-            } else {
-                tracker_guard.start_tracking(
-                    &game_id,
-                    &exe_name,
-                    game.exe_path.as_deref(),
-                    Some(pid),
-                    game.install_path.as_deref(),
-                )
+    let mut exe_name = game.exe_name.clone().unwrap_or_default();
+    let mut install_path = game.install_path.clone();
+    // 老库条目可能只有 exe_path。身份签名能从路径补出来，不能因为两个字段为空
+    // 就把游戏标成「游玩中」却完全不追踪（后端没有会话，永远不会发 game-stopped）。
+    if exe_name.is_empty() && install_path.is_none() {
+        if let Some(path_str) = game.exe_path.as_deref() {
+            let path = std::path::Path::new(path_str);
+            if let Some(name) = path.file_name() {
+                exe_name = name.to_string_lossy().to_string();
+            }
+            if let Some(parent) = path.parent() {
+                install_path = Some(parent.to_string_lossy().to_string());
             }
         }
-        LaunchOutcome::Delegated { uri } => {
-            tracing::info!("已委托 {} 客户端拉起「{}」: {}", game.platform, game.name, uri);
-            tracker_guard.arm_session(
+    }
+    let has_identity = !exe_name.is_empty()
+        || install_path.as_deref().is_some_and(|d| d.len() >= 4)
+        || game.exe_path.as_deref().is_some_and(|p| !p.is_empty());
+    if !has_identity {
+        tracing::warn!("游戏 {} 缺少可用的 exe 签名，启动但不追踪时长", game.name);
+        let stopped = {
+            let mut tracker_guard = lock_or_recover(&tracker);
+            tracker_guard.stop_tracking(&game_id)
+        };
+        match stopped {
+            StopOutcome::Stopped(finished) => {
+                finalize_finished_sessions(&app, db.inner(), &[finished], true)
+            }
+            StopOutcome::Cancelled => {
+                let _ = app.emit("game-stopped", &game_id);
+            }
+            StopOutcome::NotFound => {}
+        }
+        wakeup.notify();
+        return Ok(LaunchOutcomeDto::Untracked);
+    }
+
+    let mut tracker_guard = lock_or_recover(&tracker);
+    let (finished_session, dto) = match outcome {
+        LaunchOutcome::Spawned(pid) => {
+            let finished = tracker_guard.start_tracking(
                 &game_id,
                 &exe_name,
                 game.exe_path.as_deref(),
-                game.install_path.as_deref(),
-            )
+                Some(pid),
+                install_path.as_deref(),
+            );
+            (finished, LaunchOutcomeDto::Spawned)
+        }
+        LaunchOutcome::Delegated { uri } => {
+            tracing::info!("已委托 {} 客户端拉起「{}」: {}", game.platform, game.name, uri);
+            // 带上平台标识：Steam 待命期要查客户端自报的「正在更新」状态
+            let finished = tracker_guard.arm_platform_session(
+                &game_id,
+                &exe_name,
+                game.exe_path.as_deref(),
+                install_path.as_deref(),
+                Some(game.platform.as_str()),
+                game.platform_id.as_deref(),
+            );
+            (finished, LaunchOutcomeDto::Delegated)
         }
     };
 
     if let Some(finished_session) = finished_session {
-        // 有旧会话结束 → 释放 Tracker 锁再获取 DB 锁持久化
+        // 【2026-11-08】旧会话被重复启动顶掉时，与后台轮询 / 停止命令共用同一条
+        // 收尾路径：只 add_play_session 会漏掉温会话释放、成就检测与列表刷新。
+        // 但这里不能发 game-stopped，否则晚到的事件会清掉刚建好的新会话状态。
         drop(tracker_guard);
-        let db_guard = lock_or_recover(&db);
-        if let Err(e) = db_guard.add_play_session(
-            &finished_session.game_id,
-            &finished_session.start_time,
-            finished_session.duration_seconds,
-        ) {
-            tracing::error!("保存旧游戏会话失败 (game_id: {}): {}", finished_session.game_id, e);
-        }
+        finalize_finished_sessions(&app, db.inner(), &[finished_session], false);
     }
 
     // 叫醒后台轮询线程（2026-09-19）。
@@ -112,7 +200,48 @@ pub fn launch_game(
     // 本地游戏虽已即时计时，但退出检测同样要等它醒来才开始。
     wakeup.notify();
 
-    Ok(())
+    Ok(dto)
+}
+
+/// 停止游戏：只结束 Game Vault 的计时会话，**不关闭游戏进程**
+///
+/// 返回 `stopped`（结算了一条时长）/ `cancelled`（待命被取消，本就没计时）/
+/// `not_found`（该游戏没有会话）。三种情况前端都会把状态清回「启动游戏」。
+#[tauri::command(async)]
+pub fn stop_game(
+    db: State<'_, Arc<Mutex<Database>>>,
+    tracker: State<'_, Arc<Mutex<PlayTimeTracker>>>,
+    app: tauri::AppHandle,
+    game_id: String,
+) -> Result<String, String> {
+    let outcome = {
+        let mut tracker_guard = lock_or_recover(&tracker);
+        tracker_guard.stop_tracking(&game_id)
+    };
+
+    let result = match outcome {
+        StopOutcome::Stopped(finished) => {
+            finalize_finished_sessions(&app, db.inner(), &[finished], true);
+            "stopped"
+        }
+        StopOutcome::Cancelled => {
+            // 待命取消也要通知前端：此时没有 finished 会话，没人会发 game-stopped
+            let _ = app.emit("game-stopped", &game_id);
+            "cancelled"
+        }
+        StopOutcome::NotFound => "not_found",
+    };
+
+    Ok(result.to_string())
+}
+
+/// 活跃会话状态快照：前端挂载 / 重连时对齐后端真相源
+#[tauri::command(async)]
+pub fn get_active_sessions(
+    tracker: State<'_, Arc<Mutex<PlayTimeTracker>>>,
+) -> Result<Vec<crate::models::SessionSnapshot>, String> {
+    let tracker_guard = lock_or_recover(&tracker);
+    Ok(tracker_guard.snapshot())
 }
 
 /// 切换收藏状态
@@ -516,53 +645,54 @@ pub async fn fetch_missing_covers(
     db: State<'_, Arc<Mutex<Database>>>,
     app_handle: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
-    // 第一阶段：收集需要获取封面的游戏信息，然后立即释放数据库锁
-    let (games_without_cover, api_key) = {
+    // 第一阶段：锁内只取数据库快照，随后立刻释放锁。
+    // 【2026-11-08】旧版把「逐个 path.exists() + fs::metadata()」也塞在锁内，
+    // 封面在网盘/移动硬盘/慢盘上时，一次批量抓封面就能把 get_games、
+    // 每秒时长落库等所有 DB 命令堵住。文件 IO 一律挪到锁外。
+    let (games, api_key) = {
         let db_guard = lock_or_recover(&db);
-
         let filter = GameFilter::default();
         let games = db_guard.get_games(&filter).map_err(|e| e.to_string())?;
-        let games_without_cover: Vec<Game> = games.into_iter()
-            .filter(|g| {
-                // 条件1: 没有设置任何封面
-                if g.cover_url.is_none() && g.cover_local.is_none() {
-                    return true;
-                }
-                // 条件2: cover_url 指向的文件无效（不存在或太小）
-                if let Some(ref cover_url) = g.cover_url {
-                    let path = std::path::Path::new(cover_url);
-                    if !path.exists() {
-                        return true;
-                    }
-                    if let Ok(metadata) = std::fs::metadata(path) {
-                        if metadata.len() < COVER_MIN_FILE_SIZE {
-                            return true;
-                        }
-                    }
-                }
-                // 条件3: cover_local 指向的文件无效
-                if let Some(ref cover_local) = g.cover_local {
-                    let path = std::path::Path::new(cover_local);
-                    if !path.exists() {
-                        return true;
-                    }
-                    if let Ok(metadata) = std::fs::metadata(path) {
-                        if metadata.len() < COVER_MIN_FILE_SIZE {
-                            return true;
-                        }
-                    }
-                }
-                false
-            })
-            .collect();
-
         let api_key = db_guard.get_setting("steamgriddb_api_key")
             .map_err(|e| e.to_string())?
             .unwrap_or_default();
-
-        (games_without_cover, api_key)
+        (games, api_key)
         // db_guard 在此释放
     };
+
+    let games_without_cover: Vec<Game> = games.into_iter()
+        .filter(|g| {
+            // 条件1: 没有设置任何封面
+            if g.cover_url.is_none() && g.cover_local.is_none() {
+                return true;
+            }
+            // 条件2: cover_url 指向的文件无效（不存在或太小）
+            if let Some(ref cover_url) = g.cover_url {
+                let path = std::path::Path::new(cover_url);
+                if !path.exists() {
+                    return true;
+                }
+                if let Ok(metadata) = std::fs::metadata(path) {
+                    if metadata.len() < COVER_MIN_FILE_SIZE {
+                        return true;
+                    }
+                }
+            }
+            // 条件3: cover_local 指向的文件无效
+            if let Some(ref cover_local) = g.cover_local {
+                let path = std::path::Path::new(cover_local);
+                if !path.exists() {
+                    return true;
+                }
+                if let Ok(metadata) = std::fs::metadata(path) {
+                    if metadata.len() < COVER_MIN_FILE_SIZE {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .collect();
 
     if games_without_cover.is_empty() {
         return Ok(serde_json::json!({
@@ -572,13 +702,10 @@ pub async fn fetch_missing_covers(
         }));
     }
 
-    if api_key.is_empty() {
-        return Ok(serde_json::json!({
-            "fetched": 0,
-            "total": games_without_cover.len(),
-            "errors": ["未配置 SteamGridDB API Key，请在设置中填写"],
-        }));
-    }
+    // 注意：**不因缺 SteamGridDB Key 提前退出**。Steam 官方图床（按 appid 直取）是
+    // 免钥匙的，本地 repack 也能反查出 appid；没配 Key 只是少一条 SGDB 回退路径，
+    // 不该让整批一张图都不抓（2026-10-28 审查发现：这行早退把免钥匙那条路一起堵死了）。
+    // 真的抓不到时，`fetch_cover` 会给出「未收录 / 网络失败」的准确结论。
 
     // 第二阶段：进行网络请求（不持有数据库锁）
     let cache_dir = utils::path::get_app_data_dir().join("covers");
@@ -627,25 +754,40 @@ pub async fn fetch_missing_covers(
                 }
             }
             Ok(None) => {
-                // 走到这里说明 SteamGridDB 给了**明确答复**（未收录），
-                // 网络失败会走下面的 Err 分支——两种结局不再混在一句话里。
-                tracing::warn!("未找到封面: {} (SteamGridDB 未收录该游戏)", game.name);
-                errors.push(format!("{}: SteamGridDB 未收录，请检查游戏名称或手动设置封面", game.name));
+                // 走到这里说明各条免 Key / SGDB 路径都给了明确「没有这张图」的答复；
+                // 网络失败会走下面的 Err 分支，不能再统一谎报成 SGDB 未收录。
+                tracing::warn!("未找到可用封面: {}", game.name);
+                errors.push(format!("{}: 未找到可用封面，请检查游戏名称或手动设置封面", game.name));
             }
-            Err(e) => {
-                tracing::warn!("获取封面失败 {}: {}", game.name, e);
-                errors.push(format!("{}: {}", game.name, e));
-                // `fetch_cover` 只在「一次明确答复都没拿到」时返回 Err（网络/接口全灭），
-                // 后面的游戏大概率同样失败 —— 直接收工，别让用户对着转圈等半小时。
-                let remaining = total_missing.saturating_sub(index as u32 + 1);
-                if remaining > 0 {
-                    tracing::warn!("网络异常，中止批量抓取，剩余 {} 个未尝试", remaining);
-                    errors.push(format!(
-                        "网络异常，已中止：剩余 {} 个游戏未尝试，请检查网络或代理后重试",
-                        remaining
-                    ));
+            Err(failure) => {
+                tracing::warn!("获取封面失败 {}: {}", game.name, failure.message);
+                errors.push(format!("{}: {}", game.name, failure.message));
+                // 只有「网络全断 / Key 无效」才值得整批收工——这两种后面每款都会失败。
+                // 429 限流、单条落盘失败只影响这一款，继续下一个；旧实现一律 break，
+                // 于是一次 429 就能让剩下几十款全部放弃，还统一报「请检查网络」。
+                match failure.kind {
+                    CoverFailureKind::Unauthorized => {
+                        errors.push("SteamGridDB API Key 无效，已中止批量抓取".to_string());
+                        break;
+                    }
+                    CoverFailureKind::Transport => {
+                        let remaining = total_missing.saturating_sub(index as u32 + 1);
+                        if remaining > 0 {
+                            tracing::warn!("网络异常，中止批量抓取，剩余 {} 个未尝试", remaining);
+                            errors.push(format!(
+                                "网络异常，已中止：剩余 {} 个游戏未尝试，请检查网络或代理后重试",
+                                remaining
+                            ));
+                        }
+                        break;
+                    }
+                    CoverFailureKind::RateLimited => {
+                        // 让限流窗口过去再试下一款；不 break，否则一批全废
+                        tracing::warn!("触发限流，歇 {}ms 后继续下一款", COVER_RATE_LIMIT_BACKOFF_MS);
+                        crate::utils::net::sleep_ms(COVER_RATE_LIMIT_BACKOFF_MS).await;
+                    }
+                    CoverFailureKind::Other => {}
                 }
-                break;
             }
         }
     }

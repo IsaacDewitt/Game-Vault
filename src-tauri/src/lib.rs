@@ -403,7 +403,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
+        // 2026-11-08 移除 tauri-plugin-fs 注册：前端零引用、capabilities 无 fs 权限
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![]),
@@ -510,12 +510,12 @@ pub fn run() {
                 // 重建完要通知前端重拉封面映射（见下），故一并带上 AppHandle
                 let cover_app = app.handle().clone();
                 std::thread::spawn(move || {
+                    // 【2026-11-08 复审】迁移 / 缩略图升级现在都在函数内部按条目短锁：
+                    // 图片解码、编码和写暂存不握全局 DB 锁，不再需要靠 8s 延迟
+                    // 去「躲」首屏命令。保留 2.5s 只为错开启动瞬间的磁盘高峰。
                     std::thread::sleep(std::time::Duration::from_millis(2500));
-                    let db_guard = match cover_db.lock() {
-                        Ok(g) => g,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    match core::cover_store::migrate(&db_guard) {
+
+                    match core::cover_store::migrate_with_short_locks(&cover_db) {
                         Ok(r) if r.indexed + r.relinked > 0 => tracing::info!(
                             "封面索引迁移：登记 {}，回挂 {}，缺文件 {}，失败 {}（{} → {} 字节）",
                             r.indexed, r.relinked, r.missing_file, r.failed, r.bytes_before, r.bytes_after
@@ -523,9 +523,10 @@ pub fn run() {
                         Ok(_) => tracing::debug!("封面索引迁移：无需处理"),
                         Err(e) => tracing::error!("封面索引迁移失败: {}", e),
                     }
+
                     // 缩略图规格升级（2026-09-27：长边 256 → 512，卡片糊的根因）：
                     // 老缩略图不会自己重生，必须在迁移之后补一次重建，否则界面看着跟没改一样。
-                    match core::cover_store::upgrade_thumbs(&db_guard) {
+                    match core::cover_store::upgrade_thumbs_with_short_locks(&cover_db) {
                         Ok(r) if r.rebuilt > 0 => {
                             tracing::info!(
                                 "缩略图规格升级：重建 {}，跳过 {}，失败 {}（长边上限 {}）",
@@ -533,9 +534,7 @@ pub fn run() {
                             );
                             // 重建会推进封面行时间戳（破缓存）。前端启动时拿到的映射还是旧的，
                             // 不重拉的话首启看到的仍是缓存里的旧小图 —— "改了没生效"。
-                            drop(db_guard);
                             let _ = cover_app.emit("covers-upgraded", r.rebuilt);
-                            return;
                         }
                         Ok(_) => tracing::debug!("缩略图规格升级：无需处理"),
                         Err(e) => tracing::error!("缩略图规格升级失败: {}", e),
@@ -616,38 +615,27 @@ pub fn run() {
                     };
                     // Tracker 锁已释放
 
-                    // 阶段 2：持久化已结束的会话到数据库（独立获取 DB 锁）
-                    if !tick.finished.is_empty() {
-                        // 游戏已退出 → 释放截图温会话。常驻 WGC 会话的意义是"游戏会话期一直挂着"，
-                        // 游戏没了就没必要留着，否则捕获线程与句柄会一直挂到下一次截图才发现失效。
-                        core::capture::release_warm_session();
+                    // 阶段 2：会话收尾（持久化 / 释放温会话 / 成就 / game-stopped）
+                    // 与「停止游戏」命令共用同一条路径，避免两处逻辑漂移。
+                    commands::games::finalize_finished_sessions(
+                        &app_handle,
+                        &db_arc,
+                        &tick.finished,
+                        true,
+                    );
 
-                        core::PlayTimeTracker::persist_finished_sessions(&db_arc, &tick.finished);
-
-                        // 会话结束后检测成就（时长/次数类成就），新解锁通过事件通知前端
-                        let mut new_unlocks = Vec::new();
-                        if let Ok(db_guard) = db_arc.lock() {
-                            match core::AchievementEngine::evaluate(&db_guard) {
-                                Ok(events) => new_unlocks = events,
-                                Err(e) => tracing::error!("成就检测失败: {}", e),
-                            }
-                        }
-                        if !new_unlocks.is_empty() {
-                            let _ = app_handle.emit("achievement-unlocked", &new_unlocks);
-                        }
+                    // 平台游戏：进入更新态 / 退出更新态 / 待命转正 / 超时未启动，通知前端切换三态
+                    for game_id in &tick.updating {
+                        let _ = app_handle.emit("platform-launch-updating", game_id);
                     }
-
-                    // 平台游戏：待命转正 / 超时未启动，通知前端以便给出反馈
+                    for game_id in &tick.waiting {
+                        let _ = app_handle.emit("platform-launch-waiting", game_id);
+                    }
                     if !tick.activated.is_empty() {
                         let _ = app_handle.emit("platform-game-started", &tick.activated);
                     }
                     for game_id in &tick.arm_timeouts {
                         let _ = app_handle.emit("platform-launch-timeout", game_id);
-                    }
-
-                    // 通知前端
-                    for session in &tick.finished {
-                        let _ = app_handle.emit("game-stopped", &session.game_id);
                     }
 
                     // 阶段 3：前台是被追踪的游戏时，后台预建截图温会话。
@@ -884,6 +872,8 @@ pub fn run() {
             commands::games::get_games,
             commands::games::get_game_detail,
             commands::games::launch_game,
+            commands::games::stop_game,
+            commands::games::get_active_sessions,
             commands::games::toggle_favorite,
             commands::games::delete_game,
             commands::games::add_game_manual,
@@ -926,6 +916,8 @@ pub fn run() {
             commands::reviews::delete_review,
             commands::reviews::fetch_review_cover_options,
             commands::reviews::set_review_cover_from_url,
+            commands::reviews::set_review_cover_from_local,
+            commands::reviews::set_review_cover_from_steam,
             commands::reviews::import_review_from_game,
             commands::reviews::get_review_play_times,
             // 统计相关
@@ -935,7 +927,6 @@ pub fn run() {
             commands::stats::get_genre_stats,
             commands::stats::get_heatmap_stats,
             commands::stats::get_hourly_stats,
-            commands::stats::get_status_stats,
             commands::stats::get_play_sessions,
             // 成就相关
             commands::achievements::get_achievements,

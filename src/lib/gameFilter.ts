@@ -5,14 +5,17 @@ import { displayName } from "./format";
  * 游戏库的筛选与排序单一实现。
  *
  * 为什么放在这里：这套口径原先写在 `stores/games.ts` 的 `filteredGames` computed 里，
- * 与后端 `get_status_stats` 的 SQL 推导是两份互不相干的实现，只能靠注释维持一致。
+ * 后端 `get_status_stats` 还有一份 SQL 推导，两份实现互不相干、只能靠注释维持一致。
  * 抽成纯函数后可以被 vitest 直接覆盖（增量口径出错会红），store 只负责接线。
+ *
+ * **本文件是三态口径的唯一真相源**（2026-11-08 收敛完成）：状态分布饼图下线后，
+ * 后端的第二套 SQL、命令与前端封装已一并删除，"两份实现各自漂移"的隐患消除。
+ * 将来若要做状态统计，请在此文件补纯函数并加单测，别在 Rust 侧再写一份 CASE。
  *
  * **口径约定（改动前先看这里）**
  * - 「已通关」= `status === "completed"`（用户手动标记，唯一真值来源）。
  * - 「已游玩 / 未游玩」= 由 `play_time_seconds` 派生，与 `status` 无关
- *   （`playing` / `abandoned` 这类历史标记一律按有无时长归入这两桶，
- *   后端 `get_status_stats` 的 CASE 表达式同口径）。
+ *   （`playing` / `abandoned` 这类历史标记一律按有无时长归入这两桶）。
  * - 「收藏」是独立维度，与三态互斥：选中收藏时不再按状态过滤
  *   （与 `HomeView` 的按钮组语义一致，选收藏就只看收藏）。
  */

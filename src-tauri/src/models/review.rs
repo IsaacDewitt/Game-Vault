@@ -83,8 +83,8 @@ pub struct ReviewFilter {
 /// 游玩时长候选行（手账「我的游玩时长」按名匹配游戏库用）。
 ///
 /// 两路来源与 `get_play_stats` 同口径：在库游戏取 `games` 卡片累计；
-/// 已删游戏取 `play_stats_daily` 孤儿历史（墓碑还原名字）。墓碑只留 name，
-/// 故已删条目的 `name_en` 恒为 None。
+/// 已删游戏取 `play_stats_daily` 孤儿历史（墓碑还原名字）。
+/// 墓碑也存 `name_en`（2026-10-09 起），故已删条目同样能按英文名被认领。
 #[derive(Debug, Clone)]
 pub struct PlayTimeCandidate {
     pub name: String,

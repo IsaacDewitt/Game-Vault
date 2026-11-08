@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { LaunchOutcome, SessionSnapshot } from "./launchState";
 
 // ==================== 类型定义 ====================
 
@@ -94,12 +95,6 @@ export interface HourlyStats {
   total_seconds: number;
 }
 
-export interface StatusStats {
-  unplayed: number;
-  played: number;
-  completed: number;
-}
-
 export interface Settings {
   theme: string;
   language: string;
@@ -137,6 +132,8 @@ export interface AchievementDef {
   /** 总等级数 */
   tier_total: number;
   target: number;
+  /** 目标值量纲：seconds=秒（走时长格式），count=次/款/天（走纯数字） */
+  unit: "seconds" | "count";
 }
 
 export interface GlobalAchievementStatus {
@@ -194,8 +191,21 @@ export async function getGameDetail(gameId: string): Promise<Game | null> {
   return invoke("get_game_detail", { gameId });
 }
 
-export async function launchGame(gameId: string): Promise<void> {
-  return invoke("launch_game", { gameId });
+/** 返回启动方式：spawned = 本地 exe 已拉起（可直接算游玩中）；
+ *  delegated = 只把 URI 交给 Steam/Epic（前端应显示「启动中」，等后端转正）；
+ *  untracked = 已启动但缺少身份签名，不追踪、不显示游玩中。 */
+export async function launchGame(gameId: string): Promise<LaunchOutcome> {
+  return invoke<LaunchOutcome>("launch_game", { gameId });
+}
+
+/** 停止计时（不关闭游戏进程）。返回 stopped / cancelled / not_found */
+export async function stopGame(gameId: string): Promise<string> {
+  return invoke<string>("stop_game", { gameId });
+}
+
+/** 后端会话状态快照：前端挂载 / 重连时对齐三态，不再自己猜 */
+export async function getActiveSessions(): Promise<SessionSnapshot[]> {
+  return invoke<SessionSnapshot[]>("get_active_sessions");
 }
 
 export async function toggleFavorite(gameId: string): Promise<boolean> {
@@ -352,10 +362,6 @@ export async function getHeatmapStats(days?: number): Promise<HeatmapDay[]> {
 
 export async function getHourlyStats(): Promise<HourlyStats[]> {
   return invoke("get_hourly_stats");
-}
-
-export async function getStatusStats(): Promise<StatusStats> {
-  return invoke("get_status_stats");
 }
 
 export async function setGameStatus(gameId: string, status: string): Promise<void> {
@@ -698,7 +704,10 @@ export async function addReview(name: string): Promise<Review> {
   return invoke("add_review", { name });
 }
 
-/** 刷新手账条目：LLM 拉元数据 + SteamGridDB 拉封面 */
+/**
+ * 刷新手账条目：只拉 LLM 元数据（含命名与官方英文名）。
+ * 封面自 2026-10-30 起不再自动拉取，改由「更换封面」的三个来源手动指定。
+ */
 export async function refreshReviewInfo(reviewId: string): Promise<Review> {
   return invoke("refresh_review_info", { reviewId });
 }
@@ -756,6 +765,16 @@ export async function fetchReviewCoverOptions(reviewId: string): Promise<CoverOp
 
 export async function setReviewCoverFromUrl(reviewId: string, url: string): Promise<void> {
   return invoke("set_review_cover_from_url", { reviewId, url });
+}
+
+/** 手动选择本地图片作为手账封面（只收进封面库，不动原文件） */
+export async function setReviewCoverFromLocal(reviewId: string, coverPath: string): Promise<void> {
+  return invoke("set_review_cover_from_local", { reviewId, coverPath });
+}
+
+/** 使用 Steam 官方封面（appid 先按名认领游戏库，认不到再查 Steam 商店搜索） */
+export async function setReviewCoverFromSteam(reviewId: string): Promise<void> {
+  return invoke("set_review_cover_from_steam", { reviewId });
 }
 
 /** 从游戏库导入到游戏手账 */

@@ -186,14 +186,23 @@ fn apply_meta_to_review(updated: &mut Review, meta: &LlmGameMeta) {
     }
 }
 
-/// 刷新手账条目信息：LLM 拉元数据（若启用）+ SteamGridDB 拉封面（若有 Key）
+/// 刷新手账条目信息：只拉 LLM 元数据（含命名与官方英文名）。
+///
+/// **不再拉封面**（2026-10-30 按老爷要求改）：封面的三个来源全部交给用户手动挑选
+/// （本地图片 / Steam 官方 / SteamGridDB，见 `set_review_cover_from_local` /
+/// `set_review_cover_from_steam` / `set_review_cover_from_url`）。
+/// 旧实现里点一次「刷新信息」就会用 SteamGridDB 抓一张图并**无条件覆盖**当前封面，
+/// 手动挑好的图白挑一次 —— 信息归信息、图归图，两条链路就此分开。
+///
+/// 写回前重新读库再合并（与 `games.rs::fetch_game_info_llm` 同口径）：LLM 请求动辄
+/// 十几秒，期间用户改的评分/评价/截图目录不能被阶段 1 的快照整条写回抹掉。
 #[tauri::command]
 pub async fn refresh_review_info(
     db: State<'_, Arc<Mutex<Database>>>,
     review_id: String,
 ) -> Result<Review, String> {
     // 阶段 1：读取条目与设置，立即释放 DB 锁
-    let (mut review, settings) = {
+    let (review, settings) = {
         let db_guard = lock_or_recover(&db);
         let review = db_guard.get_review_by_id(&review_id)
             .map_err(|e| e.to_string())?
@@ -202,115 +211,45 @@ pub async fn refresh_review_info(
         (review, settings)
     };
 
+    // 与 games.rs::fetch_game_info_llm 同口径：没配 LLM 就明说，不假装"刷新成功"。
+    // 添加流程里这条错误被前端静默吞掉（catch 不弹框），不影响入库；
+    // 手动点「刷新信息」时则会如实弹出来，用户知道该去设置页。
+    if !settings.llm_enabled {
+        return Err("未启用 LLM 获取游戏信息，请在设置中配置".to_string());
+    }
+    if settings.llm_api_key.is_empty() {
+        return Err("未配置 LLM API Key，请在设置中填写".to_string());
+    }
+
     // 阶段 2：LLM 拉取元数据（无锁状态下 await）
-    if settings.llm_enabled && !settings.llm_api_key.is_empty() {
-        let protocol = match settings.llm_protocol.as_str() {
-            "anthropic" => LlmProtocol::Anthropic,
-            _ => LlmProtocol::Openai,
-        };
-        let config = LlmConfig {
-            enabled: true,
-            protocol,
-            api_key: settings.llm_api_key.clone(),
-            base_url: settings.llm_base_url.clone(),
-            model: settings.llm_model.clone(),
-        };
-
-        let fetcher = LlmFetcher::new().map_err(|e| format!("创建 LLM 客户端失败: {}", e))?;
-        let mut meta = fetcher.fetch_game_meta(&config, &review.name)
-            .await
-            .map_err(|e| format!("LLM 获取游戏信息失败: {}", e))?;
-        // 名称语言闸门只作用于 LLM 路径（手动改名走 update_review_meta，用户说了算），
-        // 故在合入之前先把越界的 name 摘掉
-        drop_english_name_for_chinese_entry(&mut meta, &review.name);
-        apply_meta_to_review(&mut review, &meta);
-    }
-
-    // 阶段 3：SteamGridDB 拉封面（无锁状态下 await，只拿到文件路径，入索引放到阶段 4）
-    // SteamGridDB 只认官方英文名：原名含非 ASCII 字符时改用英文名搜索（LLM 失败则退回原名）
-    let mut fetched_cover: Option<String> = None;
-    if !settings.steamgriddb_api_key.is_empty() {
-        let search_name = if !review.name.is_ascii() {
-            review.name_en.as_deref().unwrap_or(&review.name)
-        } else {
-            &review.name
-        };
-        let cache_dir = utils::path::get_app_data_dir().join("covers");
-        let fetcher = CoverFetcher::new(cache_dir, settings.steamgriddb_api_key.clone())
-            .map_err(|e| e.to_string())?;
-        match fetcher.fetch_cover_for_id(&review.id, search_name).await {
-            Ok(Some(path)) => fetched_cover = Some(path),
-            Ok(None) => {}
-            Err(e) => tracing::warn!("手账封面获取失败 {}（搜索词: {}）: {}", review.name, search_name, e),
-        }
-    }
-
-    // 阶段 3.5：短锁判断新封面是否已在索引里（避免下面无锁段白做一次解码/编码）
-    let cover_needs_ingest = match fetched_cover.as_deref() {
-        Some(path) => {
-            let db_guard = lock_or_recover(&db);
-            !cover_store::resolve(&db_guard, OWNER_REVIEW, &review.id)
-                .map(|set| set.main.as_deref() == Some(path))
-                .unwrap_or(false)
-        }
-        None => false,
+    let protocol = match settings.llm_protocol.as_str() {
+        "anthropic" => LlmProtocol::Anthropic,
+        _ => LlmProtocol::Openai,
+    };
+    let config = LlmConfig {
+        enabled: true,
+        protocol,
+        api_key: settings.llm_api_key.clone(),
+        base_url: settings.llm_base_url.clone(),
+        model: settings.llm_model.clone(),
     };
 
-    // 阶段 3.6：无锁段做图像重活（读文件 → 解码 → 转码 → 缩略图 → 落盘）
-    let prepared_cover = if cover_needs_ingest {
-        let path = match fetched_cover.as_deref() {
-            Some(p) => p,
-            None => unreachable!("cover_needs_ingest 蕴含 fetched_cover 有值"),
-        };
-        match cover_store::prepare_path(OWNER_REVIEW, &review.id, std::path::Path::new(path)) {
-            Ok(prepared) => Some(prepared),
-            Err(e) => {
-                tracing::warn!("手账封面预处理失败，回退用原始文件: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let fetcher = LlmFetcher::new().map_err(|e| format!("创建 LLM 客户端失败: {}", e))?;
+    let mut meta = fetcher.fetch_game_meta(&config, &review.name)
+        .await
+        .map_err(|e| format!("LLM 获取游戏信息失败: {}", e))?;
 
-    // 阶段 4：重新取锁保存
+    // 阶段 3：重取锁，以**库内最新值**为底合并后保存
     let db_guard = lock_or_recover(&db);
-
-    // 新拉到的封面统一入库（转码 + 缩略图 + 索引）；已在索引里的缓存文件不重复处理
-    if let Some(path) = fetched_cover {
-        let ingested = prepared_cover.map(|prepared| {
-            // 只有写索引这一步持锁；中间文件入库成功后再清理
-            let set = cover_store::commit_prepared(&db_guard, OWNER_REVIEW, &review.id, prepared)?;
-            cover_store::cleanup_ingest_source(&db_guard, std::path::Path::new(&path), &set, true)?;
-            Ok::<_, anyhow::Error>(set)
-        });
-        match ingested {
-            Some(Ok(set)) => {
-                review.cover_local = set.main.clone().or(Some(path.clone()));
-                review.cover_url = review.cover_local.clone();
-            }
-            Some(Err(e)) => {
-                tracing::warn!("手账封面入库失败，回退用原始文件: {}", e);
-                review.cover_local = Some(path.clone());
-                review.cover_url = Some(path);
-            }
-            // 已在索引里（或预处理失败）：直接用抓取器落盘的路径
-            None => {
-                review.cover_local = Some(path.clone());
-                review.cover_url = Some(path);
-            }
-        }
-    }
-
-    // 封面必须走专用函数落库：update_review 有意不含封面字段（见其注释），
-    // 若只调 update_review，这里拉到的封面只存在于返回值中——前端当时显示正常，
-    // 但 DB 里仍是 NULL，任何一次"读-改-写"（切状态/评分）都会让封面在界面上消失。
-    if let Some(cover) = review.cover_local.as_ref() {
-        db_guard.update_review_cover(&review.id, cover)
-            .map_err(|e| e.to_string())?;
-    }
-    db_guard.update_review(&review).map_err(|e| e.to_string())?;
-    Ok(review)
+    let mut latest = db_guard.get_review_by_id(&review_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "手账条目不存在".to_string())?;
+    // 名称语言闸门只作用于 LLM 路径（手动改名走 update_review_meta，用户说了算），
+    // 故在合入之前先把越界的 name 摘掉
+    drop_english_name_for_chinese_entry(&mut meta, &latest.name);
+    apply_meta_to_review(&mut latest, &meta);
+    db_guard.update_review(&latest).map_err(|e| e.to_string())?;
+    Ok(latest)
 }
 
 /// 手动更新手账条目元数据（与 LLM 字段一致，含改名）
@@ -467,6 +406,142 @@ pub async fn fetch_review_cover_options(
         .map_err(|e| e.to_string())
 }
 
+/// 把手账封面收进封面库（下载来源无关的统一入库口径）
+///
+/// 「本地选图 / Steam 官方 / 从 URL 设封面」三条路共用：差别只在图片从哪来，
+/// 入库规则（转码、缩略图、sha256 去重、引用计数、清理中间文件）必须完全一致。
+/// 与 `games.rs::ingest_downloaded_cover` 对称。
+///
+/// 拆两段的目的同 `set_game_cover`：解码/编码是数百毫秒的重活，放**无锁段**做，
+/// 只有写索引这一步短暂持锁，避免一张大图把其它 DB 命令全堵住。
+fn ingest_review_cover(
+    db: &State<'_, Arc<Mutex<Database>>>,
+    review_id: &str,
+    actual_path: &std::path::Path,
+) -> Result<(), String> {
+    let prepared = cover_store::prepare_path(OWNER_REVIEW, review_id, actual_path)
+        .map_err(|e| e.to_string())?;
+    let db_guard = lock_or_recover(db);
+    // 【2026-11-08】下载/解码可能耗时数十秒，期间条目可能已被删除。
+    // 必须与写索引共用同一把锁复查主体存在，否则会留下一条 owner_id
+    // 已不存在的封面索引：它自己就是引用，sha256 计数永远 ≥1，文件再也删不掉。
+    db_guard
+        .get_review_by_id(review_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "手账条目不存在".to_string())?;
+    let set = cover_store::commit_prepared(&db_guard, OWNER_REVIEW, review_id, prepared)
+        .map_err(|e| e.to_string())?;
+    // 中间文件入库成功后清理（共享/原地替换的保护规则在函数内）
+    let _ = cover_store::cleanup_ingest_source(&db_guard, actual_path, &set, true);
+    Ok(())
+}
+
+/// 设置手账封面：手动选择本地图片
+///
+/// 与 `games.rs::set_game_cover` 同口径：只把图片内容收进封面库，
+/// **用户选的原文件不动**（故不调 `cleanup_ingest_source`）。
+#[tauri::command(async)]
+pub fn set_review_cover_from_local(
+    db: State<'_, Arc<Mutex<Database>>>,
+    review_id: String,
+    cover_path: String,
+) -> Result<(), String> {
+    let src = std::path::Path::new(&cover_path);
+    if !src.exists() {
+        return Err("选择的图片文件不存在".to_string());
+    }
+
+    // 先校验条目存在（同 set_game_cover）：否则会给已经删掉的 review_id 写进一条
+    // 封面索引 + 文件，而那条索引没有任何界面能读到、也没有清理逻辑会碰它 ——
+    // 它自己就是那条引用，引用计数永远 ≥1，文件永远删不掉。
+    {
+        let db_guard = lock_or_recover(&db);
+        db_guard.get_review_by_id(&review_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "手账条目不存在".to_string())?;
+    }
+
+    let prepared = cover_store::prepare_path(OWNER_REVIEW, &review_id, src)
+        .map_err(|e| e.to_string())?;
+    let db = lock_or_recover(&db);
+    // 【2026-11-08 复审】解码/编码可能耗数百毫秒，期间条目可能被删。
+    // 与 `ingest_review_cover` 同口径，在写索引的同一把锁里复查一次，
+    // 否则会留下自引用、永远删不掉的孤儿封面索引。
+    db.get_review_by_id(&review_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "手账条目不存在".to_string())?;
+    cover_store::commit_prepared(&db, OWNER_REVIEW, &review_id, prepared)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// 使用 Steam 官方封面（手账条目没有平台/安装目录信息，appid 靠两条来源认定）
+///
+/// 1. 先在**游戏库**里按名字认领（`name`/`name_en` 2×2 交叉，与手账游玩时长同口径）：
+///    命中就用那条目的 appid —— 零网络、最准（Steam 平台条目直取 `platform_id`，
+///    本地 repack 从安装目录的 appid 线索文件反查）；
+/// 2. 游戏库里没有，再打 Steam 商店搜索接口按名字查 appid（无需 API Key）。
+///
+/// 认不到就给一句明确的错误，绝不"随便贴一张"。
+#[tauri::command]
+pub async fn set_review_cover_from_steam(
+    db: State<'_, Arc<Mutex<Database>>>,
+    review_id: String,
+) -> Result<(), String> {
+    // 阶段 1：读取条目 / 名字认领游戏库 / 取设置，立即释放 DB 锁
+    let (search_name, local_url, api_key) = {
+        let db_guard = lock_or_recover(&db);
+        let review = db_guard.get_review_by_id(&review_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "手账条目不存在".to_string())?;
+
+        // Steam（商店搜索与图床）只认官方英文名：原名含非 ASCII 时优先用英文名
+        let search_name = if !review.name.is_ascii() {
+            review.name_en.clone().unwrap_or_else(|| review.name.clone())
+        } else {
+            review.name.clone()
+        };
+
+        // 先认领游戏库：两个名字都拿去撞 games.name / games.name_en
+        let keys = vec![review.name.clone(), search_name.clone()];
+        let local_url = db_guard
+            .find_game_by_any_name(&keys)
+            .map_err(|e| e.to_string())?
+            .and_then(|game| crate::core::cover_fetcher::steam_cover_url_for(&game));
+
+        let api_key = db_guard.get_setting("steamgriddb_api_key")
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+
+        (search_name, local_url, api_key)
+    };
+
+    let covers_dir = utils::path::get_covers_dir();
+    utils::path::ensure_dir_exists(&covers_dir).map_err(|e| e.to_string())?;
+    let save_path = covers_dir.join(format!(".{}.steam", review_id));
+
+    // 下载客户端只为复用它的代理/超时配置；Steam 图床本身不需要 API Key
+    let fetcher = CoverFetcher::new(covers_dir.clone(), api_key).map_err(|e| e.to_string())?;
+
+    // 阶段 2：确定封面地址 —— 游戏库认得就用它，否则打商店搜索（无锁状态下 await）
+    let steam_url = match local_url {
+        Some(url) => {
+            tracing::info!("手账《{}》按名认领到游戏库条目，直取 Steam 官方封面", search_name);
+            url
+        }
+        None => fetcher
+            .steam_cover_url_by_name(&search_name)
+            .await
+            .map_err(|e| format!("未能确定 Steam AppID：{}", e))?,
+    };
+
+    // 阶段 3：下载 → 入库（入库在无锁段做图像重活，只有写索引时短锁）
+    let actual_path = fetcher.download_from_url(&steam_url, &save_path)
+        .await
+        .map_err(|e| format!("下载 Steam 官方封面失败: {}", e))?;
+    ingest_review_cover(&db, &review_id, &actual_path)
+}
+
 /// 从 URL 下载封面并设置为手账条目封面
 #[tauri::command]
 pub async fn set_review_cover_from_url(
@@ -493,14 +568,7 @@ pub async fn set_review_cover_from_url(
         .await
         .map_err(|e| format!("下载封面失败: {}", e))?;
 
-    // 拆锁（2026-09-12）：解码/编码在无锁段完成，只有写索引时短暂持锁
-    let prepared = cover_store::prepare_path(OWNER_REVIEW, &review_id, &actual_path)
-        .map_err(|e| e.to_string())?;
-    let db_guard = lock_or_recover(&db);
-    let set = cover_store::commit_prepared(&db_guard, OWNER_REVIEW, &review_id, prepared)
-        .map_err(|e| e.to_string())?;
-    let _ = cover_store::cleanup_ingest_source(&db_guard, &actual_path, &set, true);
-    Ok(())
+    ingest_review_cover(&db, &review_id, &actual_path)
 }
 
 /// 由游戏库条目构造手账条目：复用元数据 + 语言归位 + 补官方英文名。
@@ -640,13 +708,14 @@ pub fn get_review_play_times(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<HashMap<String, ReviewPlayTime>, String> {
     let db = lock_or_recover(&db);
-    let reviews = db.get_reviews(&ReviewFilter::default()).map_err(|e| e.to_string())?;
+    // 只取 id/name/name_en：认领只认名字，没必要把评价正文整表搬一遍
+    let reviews = db.get_review_names().map_err(|e| e.to_string())?;
     let candidates = db.get_play_time_candidates().map_err(|e| e.to_string())?;
 
     let mut map = HashMap::new();
-    for r in reviews {
-        if let Some(pt) = pick_play_time(&r.name, r.name_en.as_deref(), &candidates) {
-            map.insert(r.id, pt);
+    for (id, name, name_en) in reviews {
+        if let Some(pt) = pick_play_time(&name, name_en.as_deref(), &candidates) {
+            map.insert(id, pt);
         }
     }
     Ok(map)

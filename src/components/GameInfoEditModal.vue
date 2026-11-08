@@ -142,7 +142,7 @@ async function handleSave() {
     :show="show"
     preset="card"
     title=""
-    :style="{ width: '560px' }"
+    class="game-info-edit-modal"
     :bordered="false"
     :closable="true"
     :mask-closable="true"
@@ -378,5 +378,14 @@ async function handleSave() {
   border-radius: 3px;
   background: rgba(255, 255, 255, 0.08);
   color: rgba(255, 255, 255, 0.7);
+}
+</style>
+
+<!-- 非 scoped：弹窗被 teleport 到 body，scoped 选择器命中不了内部卡片。
+     与 PlatformImportModal 同口径：class 会透传到 .n-modal 本身，用复合选择器定宽。 -->
+<style>
+.n-modal.game-info-edit-modal {
+  width: 560px;
+  max-width: 92vw;
 }
 </style>

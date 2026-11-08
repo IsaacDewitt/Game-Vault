@@ -6,6 +6,20 @@ use crate::core::Database;
 /// 成就引擎：定义 + 检测 + 汇总
 pub struct AchievementEngine;
 
+/// 目标值单位为「秒」的成就基础 ID。
+///
+/// 其余成就的 target 一律是计数（款 / 次 / 天 / 级），前端按纯数字展示。
+/// 这份白名单是**唯一**的量纲真相源：新增时间型成就时必须把 base_id 加进来，
+/// 否则前端会把「3 小时」显示成「10800 / 10800」。
+/// 宁可显式列举也不按数值猜：P-08/P-09 的 HLTB 参考时长可能只有 600 秒
+/// （比 G-18 的 500 次、G-39 的 365 天还小），数值区间根本不具判别力。
+const SECONDS_TARGET_BASES: &[&str] = &[
+    // 全局：累计时长 / 单次会话 / 周末 / 单日
+    "G-04", "G-05", "G-15", "G-19", "G-30", "G-32",
+    // 单游戏：累计时长 / HLTB 参考时长 / 单次或单日时长
+    "P-02", "P-03", "P-04", "P-05", "P-08", "P-09", "P-10", "P-12", "P-16",
+];
+
 impl AchievementEngine {
     /// 生成一条多级成就的展平定义列表
     fn tiered(
@@ -19,6 +33,13 @@ impl AchievementEngine {
     ) -> Vec<AchievementDef> {
         let total = targets.len() as u32;
         let id_prefix = base.to_lowercase().replace('-', "");
+        // 量纲由定义白名单决定，不随 target 数值浮动（同一成就的多级也必然同量纲）
+        let unit = if SECONDS_TARGET_BASES.contains(&base) {
+            "seconds"
+        } else {
+            "count"
+        }
+        .to_string();
         targets
             .iter()
             .enumerate()
@@ -33,6 +54,7 @@ impl AchievementEngine {
                 tier: (i + 1) as u32,
                 tier_total: total,
                 target: *target,
+                unit: unit.clone(),
             })
             .collect()
     }
@@ -292,10 +314,23 @@ impl AchievementEngine {
             let mut achievements = Vec::new();
             for def in defs.iter().filter(|d| d.scope == "pergame") {
                 let (progress, _) = Self::eval_per_game(def, gs);
-                let target = match def.base_id.as_str() {
-                    "P-08" => gs.hltb_main_story.map(|m| m * 60).unwrap_or(0),
-                    "P-09" => gs.hltb_completionist.map(|m| m * 60).unwrap_or(0),
-                    _ => def.target,
+                // 留档条目（removed）不参与结算（见 `eval_per_game` 早退），它那两条依赖
+                // HLTB 的成就也必须报 target = 0，否则前端按「target > 0 即可达成」计入分母，
+                // 而它们永远解不开 —— 留档卡片的完成度就会永远停在天花板（旧口径 88%）。
+                //
+                // 【只清 P-08/P-09，其余 14 条 def.target 必须原样】：
+                // 若一并清零，前端分母会塌成「已解锁条目数」，留档卡片直接跳 100%。
+                let target = if gs.removed {
+                    match def.base_id.as_str() {
+                        "P-08" | "P-09" => 0,
+                        _ => def.target,
+                    }
+                } else {
+                    match def.base_id.as_str() {
+                        "P-08" => gs.hltb_main_story.map(|m| m * 60).unwrap_or(0),
+                        "P-09" => gs.hltb_completionist.map(|m| m * 60).unwrap_or(0),
+                        _ => def.target,
+                    }
                 };
                 achievements.push(GameAchievementStatus {
                     def: def.clone(),
@@ -370,6 +405,42 @@ mod tests {
         assert_eq!(defs.len(), 72, "展平后成就记录总数应为 72");
     }
 
+    /// 【2026-11-08】量纲必须由白名单显式给出，前端才不会把「250 款」显示成「4 分钟」。
+    /// 这里同时钉死两件事：白名单里的每个 base_id 都真有定义；每条定义的 unit 与白名单一致。
+    #[test]
+    fn every_definition_has_explicit_unit() {
+        let defs = AchievementEngine::definitions();
+        for base in SECONDS_TARGET_BASES {
+            assert!(
+                defs.iter().any(|d| d.base_id == *base),
+                "白名单中的 {base} 没有对应定义（改名或漏定义）"
+            );
+        }
+        for d in &defs {
+            let expected = if SECONDS_TARGET_BASES.contains(&d.base_id.as_str()) {
+                "seconds"
+            } else {
+                "count"
+            };
+            assert_eq!(d.unit, expected, "{} 的 unit 标错", d.id);
+        }
+        // 反面护栏：真实定义里计数型最大 target（G-18 的 500 次）已大于
+        // 某些秒型成就的 target（P-08/P-09 的 HLTB 占位 0），
+        // 证明「按数值大小猜单位」根本不可行，禁止回退。
+        let max_count_target = defs
+            .iter()
+            .filter(|d| d.unit == "count")
+            .map(|d| d.target)
+            .max()
+            .unwrap_or(0);
+        assert!(max_count_target >= 500, "计数型成就应存在大数值目标");
+        assert!(
+            defs.iter()
+                .any(|d| d.unit == "seconds" && d.target <= max_count_target),
+            "应存在 target 不大于计数型的秒型成就（HLTB 动态目标）"
+        );
+    }
+
     /// 汇总计数去重口径（2026-10-12 拍板）：已解锁数 = 至少解锁过一次的**定义条目**数，
     /// 每款游戏的同名成就（如各游戏各自的「破冰」）只计一次；已删定义的幽灵行不计入。
     ///
@@ -402,5 +473,89 @@ mod tests {
         );
         // 不变量：百分比恒 ≤ 100%
         assert!(summary.unlocked_count <= summary.total_count);
+    }
+
+    /// 【2026-10-28】留档条目的 P-08/P-09 必须报 target = 0，其余 14 条原样。
+    ///
+    /// 背景：留档条目不参与结算（`eval_per_game` 早退返回 (0,false)），但 HLTB 会从同名
+    /// 手账回填，于是这两条成了「可达但永不可完成」——前端按 target>0 计入分母，
+    /// 留档卡片的完成度就永远停在天花板（旧口径 16 条里卡 14/16 = 88%）。
+    ///
+    /// 反向护栏同样重要：**不能**把 16 条统一清零，否则分母塌成「已解锁条目数」，
+    /// 留档卡片会直接跳 100%。故这里同时断言 P-01 的 target 仍是 1、条目数仍是 16。
+    #[test]
+    fn removed_game_reports_zero_target_for_hltb_achievements() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+        let now = "2026-10-28T00:00:00+00:00";
+
+        // 留档条目：入库 → 删（只删 games 行）→ 写墓碑 → 留一条历史解锁让它进 with_traces
+        let mut game = Game::new("战神".to_string());
+        game.id = "g-removed".to_string();
+        db.upsert_game(&game).unwrap();
+        db.delete_game("g-removed").unwrap();
+        db.insert_tombstone("g-removed", "战神", Some("God of War"), Some("GoW.exe"), now)
+            .unwrap();
+        db.try_unlock_achievement("p01_1", "g-removed", now).unwrap();
+
+        // 手账里填了 HLTB，名字与墓碑一致 → database.rs 那一段会把它回填给留档条目
+        let mut review = Review::new("战神".to_string());
+        review.hltb_main_story = Some(10);
+        review.hltb_completionist = Some(20);
+        db.insert_review(&review).unwrap();
+
+        let summary = AchievementEngine::get_summary(&db).unwrap();
+        let entry = summary
+            .per_game
+            .iter()
+            .find(|g| g.game_id == "g-removed")
+            .expect("留档条目应出现在成就列表里");
+        assert!(entry.removed, "该条目应标记为已删除留档");
+
+        let target_of = |base: &str| {
+            entry
+                .achievements
+                .iter()
+                .find(|a| a.def.base_id == base)
+                .unwrap_or_else(|| panic!("缺少成就定义 {base}"))
+                .target
+        };
+
+        assert_eq!(target_of("P-08"), 0, "留档条目的主线成就不得再算可达成");
+        assert_eq!(target_of("P-09"), 0, "留档条目的完美通关不得再算可达成");
+        assert_eq!(target_of("P-01"), 1, "其余成就的目标值必须原样保留");
+        // 单游戏 16 个基础定义里有一个是二级成就，展平后 17 条（与 defs.len()==72 的口径一致）
+        assert_eq!(entry.achievements.len(), 17, "单游戏成就条目数不得缩水");
+    }
+
+    /// 【反向护栏】在库且填了 HLTB 的条目，P-08/P-09 仍取 HLTB 分钟数 × 60。
+    /// 防「清零写成无条件」，把正常条目的参考时长也抹掉。
+    #[test]
+    fn live_game_keeps_hltb_targets() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+
+        let mut game = Game::new("控制".to_string());
+        game.id = "g-live".to_string();
+        game.hltb_main_story = Some(10);
+        game.hltb_completionist = Some(20);
+        db.upsert_game(&game).unwrap();
+
+        let summary = AchievementEngine::get_summary(&db).unwrap();
+        let entry = summary
+            .per_game
+            .iter()
+            .find(|g| g.game_id == "g-live")
+            .expect("在库条目应出现在成就列表里");
+        assert!(!entry.removed);
+
+        let target_of = |base: &str| {
+            entry
+                .achievements
+                .iter()
+                .find(|a| a.def.base_id == base)
+                .unwrap_or_else(|| panic!("缺少成就定义 {base}"))
+                .target
+        };
+        assert_eq!(target_of("P-08"), 600, "主线 10 分钟 × 60 应保持 600");
+        assert_eq!(target_of("P-09"), 1200, "完美通关 20 分钟 × 60 应保持 1200");
     }
 }

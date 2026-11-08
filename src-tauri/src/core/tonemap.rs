@@ -271,7 +271,14 @@ pub fn tonemap_rgba16f_to_srgb(
     let stats = LuminanceStats::from_frame(&linear, ws);
 
     // 三级判定：ws 是帧内 SDR 白的真实线性值
-    let path = if stats.max <= ws {
+    // 容差不是随手加的：WGC 帧是 Rgba16F，SDR 白在帧里就是 f16(ws)。
+    // SDRWhiteLevel/1000 有近一半档位不能被 f16 精确表示（如 2.4 → 2.400390625），
+    // 此时 stats.max 会比 ws 大半个 ulp —— 无容差判定会把**纯 SDR 帧**判成扩展范围，
+    // 全帧白从 255 让到 241、0.76×ws 以上的颜色被去饱和。
+    // f16 相对舍入上限 2^-11 ≈ 4.88e-4，取 1.001 覆盖它，代价是超过白电平 0.1% 以内的
+    // 内容按 SDR 处理（最多差 1 个码阶）。
+    let sdr_tolerance = 1.001;
+    let path = if stats.max <= ws * sdr_tolerance {
         if (ws - 1.0).abs() < 1e-6 {
             ToneMapPath::DirectSrgb
         } else {
@@ -350,6 +357,29 @@ mod tests {
             }
         }
         src
+    }
+
+    /// 【2026-10-28】纯 SDR 帧在「白电平无法被 f16 精确表示」的档位上必须仍保持 255。
+    ///
+    /// 1000~6000 逐档实测：49.6% 的 SDRWhiteLevel 档位会被 f16 向上取整
+    /// （如 1.4 → 1.400390625），帧内白像素的 max 就比 ws 大半个 ulp。
+    /// 路径判定没有容差时，整帧会被误判成 ExtendedRange：SDR 白掉到 241、
+    /// 0.76×ws 以上的颜色被去饱和。这条测试钉住那个容差。
+    #[test]
+    fn test_pure_sdr_frame_with_lossy_f16_white_level_stays_255() {
+        let ws = 1.4_f32; // f16(1.4) = 1.400390625 > 1.4
+        assert!(
+            f16::from_f32(ws).to_f32() > ws,
+            "该档位应被 f16 向上取整，否则这条测试失去意义"
+        );
+        let src = fp16_frame(&[[ws, ws, ws, 1.0], [0.5, 0.5, 0.5, 1.0]]);
+        let (out, path) = tonemap_rgba16f_to_srgb(&src, 2, 1, ws);
+        assert_eq!(
+            path,
+            ToneMapPath::DivideWhiteLevel,
+            "纯 SDR 帧不得被 f16 舍入误判成扩展范围"
+        );
+        assert_eq!(out[0], 255, "SDR 白必须仍是 255，实际 {}", out[0]);
     }
 
     /// 纯 SDR 内容（线性 ≤ 1.0）应走 DirectSrgb 且零变换

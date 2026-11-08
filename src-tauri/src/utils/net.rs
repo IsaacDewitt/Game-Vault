@@ -94,20 +94,57 @@ where
                     continue;
                 }
 
-                match resp.bytes().await {
-                    Ok(body) => return Ok((status, body.to_vec())),
-                    Err(e) => {
-                        tracing::warn!(
-                            "{label}: 读取响应体失败（第 {attempt}/{COVER_RETRY_ATTEMPTS} 次）: {e}"
-                        );
-                        last = Some(anyhow::anyhow!("读取响应体失败: {e}"));
-                        if attempt < COVER_RETRY_ATTEMPTS {
-                            sleep(backoff(attempt)).await;
-                            continue;
-                        }
-                        return Err(last.unwrap_or_else(|| anyhow::anyhow!("{label}: 读体失败")));
+                // 【2026-11-08】流式读体 + 硬上限。旧的 `resp.bytes()` 会把整包
+                // 无上限缓冲：API 端点被劫持、代理回显大页或服务端持续输出时
+                // 能直接把进程内存撑爆（图片下载早已有 20MB 防线，这里补齐 API 侧）。
+                let mut resp = resp;
+                if let Some(declared) = resp.content_length() {
+                    if declared > crate::utils::constants::API_MAX_RESPONSE_BYTES {
+                        return Err(anyhow::anyhow!(
+                            "{label}: 响应体声明 {declared} 字节，超过上限 {} 字节",
+                            crate::utils::constants::API_MAX_RESPONSE_BYTES
+                        ));
                     }
                 }
+                let mut buf: Vec<u8> = Vec::new();
+                let mut read_error: Option<anyhow::Error> = None;
+                let mut overflow = false;
+                loop {
+                    match resp.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if buf.len() as u64 + chunk.len() as u64
+                                > crate::utils::constants::API_MAX_RESPONSE_BYTES
+                            {
+                                overflow = true;
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk);
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            read_error = Some(anyhow::anyhow!("读取响应体失败: {e}"));
+                            break;
+                        }
+                    }
+                }
+                if overflow {
+                    return Err(anyhow::anyhow!(
+                        "{label}: 响应体超过 {} 字节上限，已停止读取",
+                        crate::utils::constants::API_MAX_RESPONSE_BYTES
+                    ));
+                }
+                if let Some(e) = read_error {
+                    tracing::warn!(
+                        "{label}: 读取响应体失败（第 {attempt}/{COVER_RETRY_ATTEMPTS} 次）: {e}"
+                    );
+                    last = Some(e);
+                    if attempt < COVER_RETRY_ATTEMPTS {
+                        sleep(backoff(attempt)).await;
+                        continue;
+                    }
+                    return Err(last.unwrap_or_else(|| anyhow::anyhow!("{label}: 读体失败")));
+                }
+                return Ok((status, buf));
             }
             Err(e) => {
                 let retryable = is_retryable_error(&e);
@@ -235,6 +272,64 @@ fn proxy_reachable(url: &str) -> bool {
     })
 }
 
+/// 带**硬超时**的子进程输出捕获（GUI 进程 spawn 控制台程序专用）。
+///
+/// `std::process::Command::output()` 没有等待上限：reg.exe 被安全软件挂起、
+/// 注册表服务忙时会无限阻塞调用线程（在 async 命令里就是占死一个 tokio
+/// worker，IPC 跟着停摆）。这里用 `spawn + try_wait` 轮询，超时即 kill，
+/// 绝不留一个挂死的子进程。
+///
+/// 【2026-11-08 复审】等待期间必须有线程**持续读 stdout**：Windows 管道
+/// 缓冲约 4KB，子进程输出一超就会阻塞在 write 上、永远不退出，于是
+/// `try_wait` 恒为 None、必走超时。旧版只在退出后 `wait_with_output`，
+/// 对「全键 / /s 递归」这类大输出命令会自造死锁。
+pub fn command_output_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+
+    let mut reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // 子进程已死、管道 EOF，读线程随即结束；join 回收不留悬挂线程
+                if let Some(handle) = reader.take() {
+                    let _ = handle.join();
+                }
+                return None;
+            }
+        }
+    };
+    // 子进程已退出 → 管道 EOF → join 不会卡
+    let stdout = reader
+        .take()
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
+}
+
 /// 读一个 WinINET 注册表值的**最后一段**（REG_SZ 的值 / REG_DWORD 的 `0x1`）。
 #[cfg(windows)]
 fn read_reg_value(name: &str) -> Option<String> {
@@ -243,16 +338,18 @@ fn read_reg_value(name: &str) -> Option<String> {
     // 约 5 秒（等控制台分配）。reg.exe 是控制台程序，必带。
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let out = std::process::Command::new("reg")
-        .args([
-            "query",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-            "/v",
-            name,
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args([
+        "query",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        "/v",
+        name,
+    ])
+    .creation_flags(CREATE_NO_WINDOW);
+    let out = command_output_with_timeout(
+        cmd,
+        Duration::from_secs(crate::utils::constants::REG_QUERY_TIMEOUT_SECS),
+    )?;
     if !out.status.success() {
         return None; // 该值不存在（例如从没设置过代理）
     }

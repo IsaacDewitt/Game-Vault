@@ -52,9 +52,18 @@ pub fn get_overview_stats(
     // 本月时长：直接按本地时区的年月聚合（不依赖 30 天窗口的隐含假设）
     let monthly_seconds = db.get_monthly_play_time().map_err(|e| e.to_string())?;
 
-    // 今日时长：直接按本地日期查日汇总（不再为取一条数据拉全 30 天）
+    // 今日时长：直接按本地日期查日汇总（不再为取一条数据拉全 30 天）。
+    // 【2026-11-08】旧版 `unwrap_or(0)` 把 DB 异常静默显示成「今天没玩」，
+    // 与同函数其余三项的 `?` 口径不一致，排查时毫无痕迹。留日志、回退 0，
+    // 不让一条汇总查询把整个概览页带崩。
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let today_seconds = db.get_day_play_time(&today).unwrap_or(0);
+    let today_seconds = match db.get_day_play_time(&today) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("读取今日时长失败: {e}");
+            0
+        }
+    };
 
     Ok(serde_json::json!({
         "game_count": game_count,
@@ -93,14 +102,8 @@ pub fn get_hourly_stats(
     db.get_hourly_stats().map_err(|e| e.to_string())
 }
 
-/// 获取游戏状态统计
-#[tauri::command(async)]
-pub fn get_status_stats(
-    db: State<'_, Arc<Mutex<Database>>>,
-) -> Result<StatusStats, String> {
-    let db = lock_or_recover(&db);
-    db.get_status_stats().map_err(|e| e.to_string())
-}
+// 【2026-11-08】移除 `get_status_stats` 命令：前端状态分布饼图已下线，
+// 三态口径唯一真相源是 `src/lib/gameFilter.ts`，不再保留第二套 SQL 命令。
 
 /// 获取游玩会话历史
 #[tauri::command(async)]

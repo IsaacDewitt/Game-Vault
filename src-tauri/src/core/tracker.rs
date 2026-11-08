@@ -3,13 +3,25 @@ use std::sync::{Arc, Mutex};
 use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind};
 use crate::models::*;
 use crate::core::Database;  // 用于 persist_finished_sessions 的参数类型
+use crate::core::{platform, steam_state};
 
 /// 已结束的游戏会话数据，用于外部持久化
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinishedSession {
     pub game_id: String,
     pub start_time: String,  // RFC 3339
     pub duration_seconds: u64,
+}
+
+/// 主动停止追踪的结果（前端「停止游戏」按钮用）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// 有正式会话：已结算，携带时长供持久化
+    Stopped(FinishedSession),
+    /// 只有待命会话：直接丢弃，本就没有计时
+    Cancelled,
+    /// 该游戏没有任何会话
+    NotFound,
 }
 
 /// 待命会话：已发起启动请求，但尚未在进程列表中发现游戏进程
@@ -22,10 +34,15 @@ struct PendingSession {
     exe_name: String,
     exe_path: Option<String>,
     install_path: Option<String>,
-    /// 点击启动的时刻：会话转正后作为起始时刻（加载期计入游玩）
+    /// 委托的平台与 appid：Steam 用它查客户端自报的「更新中」状态
+    platform: Option<String>,
+    platform_id: Option<String>,
+    /// 点击启动的时刻（仅用于诊断「等了多久」，**不再作为计时起点**）
     armed_at: chrono::DateTime<chrono::Utc>,
-    /// 待命截止时刻，超时视为未启动
+    /// 待命截止时刻；Steam 更新期间每拍续期，超时视为未启动
     deadline: chrono::DateTime<chrono::Utc>,
+    /// 「进入更新态」事件是否已通知前端，避免每秒刷一次
+    notified_updating: bool,
 }
 
 /// 一轮扫描的产出
@@ -37,6 +54,23 @@ pub struct TrackerTick {
     pub activated: Vec<String>,
     /// 待命会话超时未发现进程（前端应提示"未检测到游戏启动"）
     pub arm_timeouts: Vec<String>,
+    /// 客户端明确报告「正在更新」，前端应显示更新态而非游玩中
+    pub updating: Vec<String>,
+    /// 更新态已结束、进程尚未现身：前端应从「更新中」回落到「启动中」
+    pub waiting: Vec<String>,
+}
+
+/// 单个待命会话本拍的裁决（纯函数，便于单测）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingDecision {
+    /// 客户端正在更新：续期且**不转正**，哪怕安装目录里冒出了进程
+    Renew,
+    /// 游戏进程现身，可转正式会话
+    Activate(u32),
+    /// 超窗且无进程：放弃
+    Timeout,
+    /// 继续等
+    Wait,
 }
 
 /// 待检查活跃会话的快照（避免遍历时与 `&mut self` 借用冲突）
@@ -143,21 +177,34 @@ impl PlayTimeTracker {
         finished
     }
 
-    /// 待命启动：平台游戏经 URI 委托客户端启动后调用
-    ///
-    /// 与 `start_tracking` 的关键区别是**不立即计时**：平台游戏的进程由 Steam/Epic
-    /// 客户端异步拉起（还要过 DRM 校验、云存档同步），在进程现身之前无法确认
-    /// 游戏真的跑起来了。先登记待命，由 `check_active_sessions` 每轮尝试转正；
-    /// 超过 `PLATFORM_ARM_WINDOW_SECS` 仍未现身则放弃并回报前端
-    /// （避免"点了启动但游戏没起来"却记下一笔假时长）。
-    ///
-    /// 返回被顶掉的旧会话（语义与 `start_tracking` 一致）。
+    /// 待命启动（无平台信号的兼容入口，仅单测使用；生产路径走 `arm_platform_session`）
+    #[cfg(test)]
     pub fn arm_session(
         &mut self,
         game_id: &str,
         exe_name: &str,
         exe_path: Option<&str>,
         install_path: Option<&str>,
+    ) -> Option<FinishedSession> {
+        self.arm_platform_session(game_id, exe_name, exe_path, install_path, None, None)
+    }
+
+    /// 待命启动：平台游戏经 URI 委托客户端启动后调用
+    ///
+    /// 与 `start_tracking` 的关键区别是**不立即计时**：平台游戏的进程由 Steam/Epic
+    /// 客户端异步拉起（还要过 DRM 校验、云存档同步、甚至先下载更新），在进程现身
+    /// 之前无法确认游戏真的跑起来了。先登记待命，由 `check_active_sessions` 每轮
+    /// 尝试转正；Steam 报告 `Updating=1` 时续期，否则超过窗口仍未现身则放弃。
+    ///
+    /// 返回被顶掉的旧会话（语义与 `start_tracking` 一致）。
+    pub fn arm_platform_session(
+        &mut self,
+        game_id: &str,
+        exe_name: &str,
+        exe_path: Option<&str>,
+        install_path: Option<&str>,
+        platform_name: Option<&str>,
+        platform_id: Option<&str>,
     ) -> Option<FinishedSession> {
         // 同一游戏重复点击启动：先结算正在计时的会话，再重新待命
         let finished = if self.active_sessions.contains_key(game_id) {
@@ -174,16 +221,36 @@ impl PlayTimeTracker {
                 exe_name: exe_name.to_string(),
                 exe_path: exe_path.map(|s| s.to_string()),
                 install_path: install_path.map(|s| s.to_string()),
+                platform: platform_name.map(|s| s.to_string()),
+                platform_id: platform_id.map(|s| s.to_string()),
                 armed_at: now,
                 deadline: now + chrono::Duration::seconds(window),
+                notified_updating: false,
             },
         );
 
         tracing::info!(
-            "待命启动游戏: {} (exe: {}, path: {:?}, install: {:?})，{} 秒内等待进程现身",
-            game_id, exe_name, exe_path, install_path, window
+            "待命启动游戏: {} (exe: {}, path: {:?}, install: {:?}, platform: {:?}/{:?})，{} 秒内等待进程现身",
+            game_id, exe_name, exe_path, install_path, platform_name, platform_id, window
         );
         finished
+    }
+
+    /// 该进程是否「看起来就绝不是游戏本体」（伴随 / 安装 / 更新 / 反作弊进程）
+    ///
+    /// 这些进程同样躺在游戏安装目录下，只靠路径前缀识别会把它们当成游戏转正。
+    /// 名单按前缀匹配，且只收绝无可能是主程序的名字（见 constants 注释）。
+    fn is_non_game_process(name: &str) -> bool {
+        if Self::is_helper_process(name) {
+            return true;
+        }
+        let lower = name.to_lowercase();
+        let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+        // 安装/更新器常带游戏名前缀（GameUpdater.exe / PBZ_setup.exe），
+        // 故这里按子串匹配；名单全是「绝不可能是主程序」的语义词，误伤风险可控
+        crate::utils::constants::GAME_SETUP_HELPERS
+            .iter()
+            .any(|helper| stem.contains(helper))
     }
 
     /// 在系统进程列表中查找目标游戏的进程，返回其 PID
@@ -194,21 +261,36 @@ impl PlayTimeTracker {
     ///    Epic 的 `LaunchExecutable` 可能是启动器壳（实测 `Launcher.exe` / `PlayRDR2.exe`），
     ///    这两类都只能靠"进程落在安装目录下"来识别；
     /// 3. **进程名匹配**（兜底，exe_name 非空时）。
+    ///
+    /// 【2026-11-04 身份闸门】每一级都先排除伴随/安装/更新进程，并用 `classify`
+    /// 复核；第 2 级不再「撞到谁算谁」，而是收集全部候选后交给 `pick_anchor`
+    /// 挑最像本体的那个。现场教训：11-03 待命转正锚点 PID 4828，
+    /// 真正的前台游戏却是 PID 20144——旧实现把同目录的另一个进程当成了本体。
     fn find_game_process(
         sys: &System,
         install_path: Option<&str>,
         exe_path: Option<&str>,
         exe_name: Option<&str>,
     ) -> Option<u32> {
-        // 1. exe 完整路径精确匹配
+        let wanted_name = exe_name.unwrap_or("");
+
+        // 1. exe 完整路径精确匹配（取最小 PID，保证结果确定）
         if let Some(target) = exe_path {
             let target = target.to_lowercase();
+            let mut best: Option<u32> = None;
             for (pid, p) in sys.processes() {
+                if Self::is_non_game_process(p.name()) {
+                    continue;
+                }
                 if let Some(exe) = p.exe() {
                     if exe.to_string_lossy().to_lowercase() == target {
-                        return Some(pid.as_u32());
+                        let id = pid.as_u32();
+                        best = Some(best.map_or(id, |b| b.min(id)));
                     }
                 }
+            }
+            if best.is_some() {
+                return best;
             }
         }
 
@@ -216,25 +298,53 @@ impl PlayTimeTracker {
         if let Some(dir) = install_path {
             if dir.len() >= 4 {
                 let dir_lower = dir.to_lowercase();
-                for (pid, p) in sys.processes() {
-                    if let Some(exe) = p.exe() {
-                        if Self::exe_under_dir(&exe.to_string_lossy().to_lowercase(), &dir_lower) {
-                            return Some(pid.as_u32());
+                let candidates: Vec<(u32, String, String)> = sys
+                    .processes()
+                    .iter()
+                    .filter_map(|(pid, p)| {
+                        let name = p.name().to_string();
+                        if Self::is_non_game_process(&name) {
+                            return None;
                         }
-                    }
+                        let exe = p.exe()?.to_string_lossy().to_lowercase();
+                        if !Self::exe_under_dir(&exe, &dir_lower) {
+                            return None;
+                        }
+                        // 身份闸门：读得到路径且三条签名全不命中才算外人
+                        if Self::classify(
+                            Some(&exe),
+                            &name,
+                            wanted_name,
+                            exe_path,
+                            install_path,
+                        ) == ProcIdentity::Foreign
+                        {
+                            return None;
+                        }
+                        Some((pid.as_u32(), exe, name))
+                    })
+                    .collect();
+                if let Some(idx) = Self::pick_anchor(&candidates, wanted_name) {
+                    return Some(candidates[idx].0);
                 }
             }
         }
 
         // 3. 进程名兜底
-        if let Some(name) = exe_name {
-            let name = name.to_lowercase();
-            if !name.is_empty() {
-                for (pid, p) in sys.processes() {
-                    if p.name().to_lowercase() == name {
-                        return Some(pid.as_u32());
-                    }
+        if !wanted_name.is_empty() {
+            let name = wanted_name.to_lowercase();
+            let mut best: Option<u32> = None;
+            for (pid, p) in sys.processes() {
+                if Self::is_non_game_process(p.name()) {
+                    continue;
                 }
+                if p.name().to_lowercase() == name {
+                    let id = pid.as_u32();
+                    best = Some(best.map_or(id, |b| b.min(id)));
+                }
+            }
+            if best.is_some() {
+                return best;
             }
         }
 
@@ -578,7 +688,10 @@ impl PlayTimeTracker {
                     .map(|e| e.to_string_lossy().to_string())
                     .unwrap_or_default();
 
-                if Self::is_helper_process(&name)
+                // 【2026-11-08】与 find_game_process 共用同一份身份闸门：
+                // 安装/更新器也躺在安装目录下，只挡崩溃上报器会让游戏退出后
+                // 仍被判「在跑」（classify 对目录内进程恒 Game，永远兜不住）。
+                if Self::is_non_game_process(&name)
                     || Self::classify(Some(exe.as_str()), &name, exe_name, exe_path, install_path)
                         == ProcIdentity::Foreign
                 {
@@ -613,7 +726,7 @@ impl PlayTimeTracker {
                     if Self::exe_under_dir(exe, &install_lower) {
                         if let Some(p) = sys.process(*pid) {
                             let name = p.name().to_string();
-                            if !Self::is_helper_process(&name) {
+                            if !Self::is_non_game_process(&name) {
                                 hits.push((pid.as_u32(), exe.clone(), name));
                             }
                         }
@@ -629,8 +742,8 @@ impl PlayTimeTracker {
                         continue;
                     }
                     let name = p.name().to_string();
-                    if Self::is_helper_process(&name) {
-                        continue; // 崩溃上报器躺在安装目录下，但它不是游戏
+                    if Self::is_non_game_process(&name) {
+                        continue; // 崩溃上报器 / 安装器 / 更新器躺在安装目录下，但不是游戏
                     }
                     hits.push((pid.as_u32(), exe_lower, name));
                 }
@@ -748,7 +861,7 @@ impl PlayTimeTracker {
             return false;
         };
         let name = proc_info.name().to_string();
-        if Self::is_helper_process(&name) {
+        if Self::is_non_game_process(&name) {
             return false;
         }
         let exe = proc_info
@@ -1014,7 +1127,83 @@ impl PlayTimeTracker {
         true
     }
 
-    /// 处理待命会话：进程现身则转正，超窗则放弃
+    /// 待命会话本拍的裁决（纯函数，单测直接覆盖四种分支）
+    ///
+    /// `updating` 优先于 `hit`：Steam 明确报告正在更新时，安装目录里冒出的
+    /// 任何进程（安装脚本、更新器、VC 运行库分发器）都不许把会话转正。
+    fn decide_pending(
+        ps: &PendingSession,
+        now: chrono::DateTime<chrono::Utc>,
+        hit: Option<u32>,
+        updating: bool,
+    ) -> PendingDecision {
+        if updating {
+            // 【2026-11-08】更新态残留（Steam 崩溃后 Updating DWORD 没清）会让
+            // deadline 每拍续 60s，待命永不超时、进程表也永远不查。
+            // 绝对上限的作用是「不再信任这个信号」，**不是**直接判死：
+            // 超上限后回落到普通判定 —— 有进程就转正，没进程等 deadline
+            // 自然超时。旧版在这里直接 Timeout，会把「更新完才启动」的
+            // 整段游玩时长确定性丢掉（复审 🟠4）。
+            let waited = now.signed_duration_since(ps.armed_at).num_seconds();
+            if waited < crate::utils::constants::STEAM_ARM_MAX_RENEW_SECS {
+                return PendingDecision::Renew;
+            }
+        }
+        if let Some(pid) = hit {
+            return PendingDecision::Activate(pid);
+        }
+        if now >= ps.deadline {
+            return PendingDecision::Timeout;
+        }
+        PendingDecision::Wait
+    }
+
+    /// Steam 是否明确报告「正在更新且没在跑」（Epic 无此信号，恒 false）
+    fn steam_is_updating(ps: &PendingSession) -> bool {
+        ps.platform.as_deref() == Some(platform::PLATFORM_STEAM)
+            && ps
+                .platform_id
+                .as_deref()
+                .is_some_and(|id| steam_state::app_state(id).blocking_update())
+    }
+
+    /// 待命转正：起始时刻取**进程现身那一刻**
+    ///
+    /// 【2026-11-04 改口径】旧实现回溯到点击启动那一刻，于是 Steam 更新 / 排队 /
+    /// 客户端登录 / 云同步的整段等待全被算成游玩时长；超过固定窗口又会干脆丢掉
+    /// 会话，游戏更新完真跑起来反而不再计时。现在等待期一律不计入，
+    /// 时长精度只受「结束检测」影响（与本地游戏同口径）。
+    fn promote_pending(
+        &mut self,
+        game_id: &str,
+        ps: &PendingSession,
+        pid: u32,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.pending_sessions.remove(game_id);
+        self.active_sessions.insert(
+            game_id.to_string(),
+            ActiveSession {
+                exe_name: ps.exe_name.clone(),
+                exe_path: ps.exe_path.clone(),
+                spawned_pid: Some(pid),
+                install_path: ps.install_path.clone(),
+                start_time: now,
+                poll_cooldown_until: None,
+                hang: HangWatch::default(),
+                last_note: None,
+            },
+        );
+        tracing::info!(
+            "待命转正：游戏 {} 命中进程 PID {}，起始时刻 {}（等待 {} 秒未计入时长）",
+            game_id,
+            pid,
+            now.to_rfc3339(),
+            now.signed_duration_since(ps.armed_at).num_seconds().max(0)
+        );
+    }
+
+    /// 处理待命会话：更新中续期、进程现身转正、超窗放弃
     ///
     /// 借用说明：先对 pending 做快照再遍历，避免在修改 `pending_sessions` 的同时持有其不可变借用。
     fn process_pending_sessions(&mut self, tick: &mut TrackerTick) {
@@ -1026,44 +1215,71 @@ impl PlayTimeTracker {
             .collect();
 
         for (game_id, ps) in snapshot {
-            let hit = Self::find_game_process(
-                &self.sys,
-                ps.install_path.as_deref(),
-                ps.exe_path.as_deref(),
-                Some(ps.exe_name.as_str()),
-            );
+            let updating = Self::steam_is_updating(&ps);
+            // 【2026-11-08 复审】Updating 信号过了绝对上限就当它不可信，
+            // 恢复进程探测：Steam 崩溃后残留 DWORD=1、但游戏其实已启动时，
+            // 仍能在这里转正计时，而不是被一条陈旧状态直接判超时。
+            let stale_updating = updating
+                && now.signed_duration_since(ps.armed_at).num_seconds()
+                    >= crate::utils::constants::STEAM_ARM_MAX_RENEW_SECS;
+            // 正常的更新态下不必查进程表（查到了也不许转正）；
+            // 超上限后与「没有更新信号」同等对待。
+            let hit = if updating && !stale_updating {
+                None
+            } else {
+                Self::find_game_process(
+                    &self.sys,
+                    ps.install_path.as_deref(),
+                    ps.exe_path.as_deref(),
+                    Some(ps.exe_name.as_str()),
+                )
+            };
 
-            if let Some(pid) = hit {
-                self.pending_sessions.remove(&game_id);
-                self.active_sessions.insert(
-                    game_id.clone(),
-                    ActiveSession {
-                        exe_name: ps.exe_name.clone(),
-                        exe_path: ps.exe_path.clone(),
-                        spawned_pid: Some(pid),
-                        install_path: ps.install_path.clone(),
-                        // 起始时刻回溯到"点击启动那一刻"：加载期同样算作游玩，
-                        // 因此轮询间隔不影响时长精度（误差只来自结束检测）。
-                        start_time: ps.armed_at,
-                        poll_cooldown_until: None,
-                        hang: HangWatch::default(),
-                        last_note: None,
-                    },
-                );
-                tracing::info!(
-                    "待命转正：游戏 {} 命中进程 PID {}，起始时刻 {}",
-                    game_id,
-                    pid,
-                    ps.armed_at.to_rfc3339()
-                );
-                tick.activated.push(game_id);
-            } else if now >= ps.deadline {
-                self.pending_sessions.remove(&game_id);
-                tracing::warn!(
-                    "待命超时：游戏 {} 在窗口期内未发现进程（可能在更新 / 被取消 / 客户端未登录），放弃计时",
-                    game_id
-                );
-                tick.arm_timeouts.push(game_id);
+            match Self::decide_pending(&ps, now, hit, updating) {
+                PendingDecision::Renew => {
+                    if let Some(p) = self.pending_sessions.get_mut(&game_id) {
+                        p.deadline = now
+                            + chrono::Duration::seconds(
+                                crate::utils::constants::STEAM_ARM_RENEW_SECS,
+                            );
+                        if !p.notified_updating {
+                            p.notified_updating = true;
+                            tracing::info!(
+                                "Steam 正在更新游戏 {}（appid {:?}）：暂停转正、续期待命，不计入时长",
+                                game_id,
+                                ps.platform_id
+                            );
+                            tick.updating.push(game_id.clone());
+                        }
+                    }
+                }
+                PendingDecision::Activate(pid) => {
+                    if ps.notified_updating {
+                        tracing::info!("Steam 更新结束，游戏 {} 进程已现身，开始计时", game_id);
+                    }
+                    self.promote_pending(&game_id, &ps, pid, now);
+                    tick.activated.push(game_id);
+                }
+                PendingDecision::Timeout => {
+                    self.pending_sessions.remove(&game_id);
+                    tracing::warn!(
+                        "待命超时：游戏 {} 在窗口期内未发现进程（已取消 / 客户端未登录 / 更新后未启动），放弃计时",
+                        game_id
+                    );
+                    tick.arm_timeouts.push(game_id);
+                }
+                PendingDecision::Wait => {
+                    // 更新态刚结束但进程尚未现身：撤掉通知标记，
+                    // 这样若再次进入更新态仍能给前端发一次状态变化。
+                    // 【2026-11-08】同时通知前端把「更新中」回落到「启动中」——
+                    // 旧版后端在这里静默，前端会一直显示更新中直到转正/超时（最长 60s）。
+                    if ps.notified_updating {
+                        if let Some(p) = self.pending_sessions.get_mut(&game_id) {
+                            p.notified_updating = false;
+                        }
+                        tick.waiting.push(game_id.clone());
+                    }
+                }
             }
         }
     }
@@ -1153,6 +1369,62 @@ impl PlayTimeTracker {
     /// 若据此跳过扫描，待命将永远无法转正。
     pub fn has_pending_work(&self) -> bool {
         !self.active_sessions.is_empty() || !self.pending_sessions.is_empty()
+    }
+
+    /// 主动停止追踪（前端「停止游戏」按钮）
+    ///
+    /// 只结束 Game Vault 自己的计时会话，**绝不结束游戏进程**：
+    /// 需求是「点一下就停止计时」，不是替老爷关掉正在玩的游戏。
+    /// 会话移除后后台轮询不会再管它，也不会自动重新计时（只有显式启动才会）。
+    pub fn stop_tracking(&mut self, game_id: &str) -> StopOutcome {
+        if self.active_sessions.contains_key(game_id) {
+            let finished = self.stop_tracking_internal(game_id);
+            self.pending_sessions.remove(game_id);
+            return match finished {
+                Some(f) => {
+                    tracing::info!(
+                        "手动停止计时：游戏 {}，时长 {} 秒",
+                        game_id,
+                        f.duration_seconds
+                    );
+                    StopOutcome::Stopped(f)
+                }
+                // 会话刚建立不足 1 秒：已移除，但没有可写入的时长
+                None => StopOutcome::Cancelled,
+            };
+        }
+        if self.pending_sessions.remove(game_id).is_some() {
+            tracing::info!("手动取消待命：游戏 {}（原本就没有计时）", game_id);
+            return StopOutcome::Cancelled;
+        }
+        StopOutcome::NotFound
+    }
+
+    /// 会话状态快照：前端挂载 / 重连时对齐后端真相源
+    ///
+    /// 后端是唯一真相源——前端不再自己「点完就当在玩」，
+    /// 重启或重新挂载后从这里把三态拉回来。
+    pub fn snapshot(&self) -> Vec<SessionSnapshot> {
+        let mut out = Vec::with_capacity(self.active_sessions.len() + self.pending_sessions.len());
+        for id in self.active_sessions.keys() {
+            out.push(SessionSnapshot {
+                game_id: id.clone(),
+                state: "playing".to_string(),
+            });
+        }
+        for (id, ps) in &self.pending_sessions {
+            out.push(SessionSnapshot {
+                game_id: id.clone(),
+                state: if ps.notified_updating {
+                    "updating"
+                } else {
+                    "launching"
+                }
+                .to_string(),
+            });
+        }
+        out.sort_by(|a, b| a.game_id.cmp(&b.game_id));
+        out
     }
 
     /// 根据进程名（exe 文件名，忽略大小写）查找活跃游戏，返回 game_id。
@@ -1468,6 +1740,212 @@ mod tests {
             "300 秒待命窗口内不该判超时"
         );
         assert_eq!(tracker.session_counts(), (0, 1), "待命会话应原样保留");
+    }
+
+    // ============================================================
+    // 平台启动三态 / 停止计时（2026-11-04）
+    // ============================================================
+
+    fn pending_at(now: chrono::DateTime<chrono::Utc>) -> PendingSession {
+        PendingSession {
+            exe_name: "Game.exe".to_string(),
+            exe_path: None,
+            install_path: Some("Z:\\__no_such_dir__".to_string()),
+            platform: None,
+            platform_id: None,
+            armed_at: now - chrono::Duration::seconds(120),
+            deadline: now + chrono::Duration::seconds(60),
+            notified_updating: false,
+        }
+    }
+
+    /// 更新态优先于「进程已现身」：Steam 在更新时，安装脚本绝不能把会话转正
+    #[test]
+    fn decide_pending_covers_all_four_branches() {
+        let now = chrono::Utc::now();
+        let ps = pending_at(now);
+        assert_eq!(
+            PlayTimeTracker::decide_pending(&ps, now, Some(42), true),
+            PendingDecision::Renew,
+            "客户端正在更新 → 续期，不转正"
+        );
+        assert_eq!(
+            PlayTimeTracker::decide_pending(&ps, now, Some(42), false),
+            PendingDecision::Activate(42)
+        );
+        assert_eq!(
+            PlayTimeTracker::decide_pending(&ps, now, None, false),
+            PendingDecision::Wait
+        );
+        let expired = PendingSession {
+            deadline: now - chrono::Duration::seconds(1),
+            ..ps.clone()
+        };
+        assert_eq!(
+            PlayTimeTracker::decide_pending(&expired, now, None, false),
+            PendingDecision::Timeout
+        );
+    }
+
+    /// 【2026-11-08】Updating=1 残留（Steam 崩溃后没清注册表）不能无限续期：
+    /// deadline 每拍被推后 60s 看着还很早，必须靠 armed_at 的绝对上限兜底。
+    #[test]
+    fn stale_updating_flag_does_not_renew_forever() {
+        let now = chrono::Utc::now();
+        let ps = pending_at(now);
+        let max = crate::utils::constants::STEAM_ARM_MAX_RENEW_SECS;
+
+        // 刚好没到上限：仍按更新态续期
+        let young = PendingSession {
+            armed_at: now - chrono::Duration::seconds(max - 1),
+            deadline: now + chrono::Duration::seconds(60),
+            ..ps.clone()
+        };
+        assert_eq!(
+            PlayTimeTracker::decide_pending(&young, now, Some(42), true),
+            PendingDecision::Renew
+        );
+
+        // 超过上限：不再 Renew，但**不能**直接判死——游戏真被拉起要能转正
+        let stale = PendingSession {
+            armed_at: now - chrono::Duration::seconds(max + 1),
+            deadline: now + chrono::Duration::seconds(60),
+            ..ps.clone()
+        };
+        assert_eq!(
+            PlayTimeTracker::decide_pending(&stale, now, Some(42), true),
+            PendingDecision::Activate(42),
+            "Updating 残留 + 进程已现身：必须转正计时，不能丢掉整段时长"
+        );
+        assert_eq!(
+            PlayTimeTracker::decide_pending(&stale, now, None, true),
+            PendingDecision::Wait,
+            "无进程时继续等 deadline，不再无限续期"
+        );
+
+        // deadline 也过了、仍无进程 → 正常结算
+        let expired = PendingSession {
+            deadline: now - chrono::Duration::seconds(1),
+            ..stale
+        };
+        assert_eq!(
+            PlayTimeTracker::decide_pending(&expired, now, None, true),
+            PendingDecision::Timeout
+        );
+    }
+
+    /// 转正起点必须是「进程现身那一刻」，等待 120 秒不能算进游玩时长
+    #[test]
+    fn promotion_starts_at_process_appearance_not_click() {
+        let mut tracker = PlayTimeTracker::new();
+        let now = chrono::Utc::now();
+        let ps = pending_at(now);
+        tracker.pending_sessions.insert("g1".to_string(), ps.clone());
+
+        tracker.promote_pending("g1", &ps, 4242, now);
+
+        assert_eq!(tracker.session_counts(), (1, 0));
+        assert_eq!(tracker.active_sessions["g1"].start_time, now);
+        assert_ne!(tracker.active_sessions["g1"].start_time, ps.armed_at);
+        assert_eq!(tracker.active_sessions["g1"].spawned_pid, Some(4242));
+    }
+
+    /// 安装 / 更新 / 崩溃上报进程不得被当成游戏本体；真正的启动器壳要放行
+    #[test]
+    fn setup_processes_never_promote_a_pending_session() {
+        for name in [
+            "VC_redist.x64.exe",
+            "DXSETUP.exe",
+            "CrashReportClient.exe",
+            "SteamWebHelper.exe",
+            "GameUpdater.exe",
+            "unins000.exe",
+            "EasyAntiCheat_EOS.exe",
+        ] {
+            assert!(
+                PlayTimeTracker::is_non_game_process(name),
+                "{} 不该被当成游戏",
+                name
+            );
+        }
+        for name in ["PBZ.exe", "Launcher.exe", "PlayRDR2.exe", "Hellraiser-Win64-Shipping.exe"] {
+            assert!(
+                !PlayTimeTracker::is_non_game_process(name),
+                "{} 是可能被真正追踪的游戏进程，不得误杀",
+                name
+            );
+        }
+    }
+
+    /// 【2026-11-08 回归护栏】结算侧（evaluate_session 策略 1/2、counts_as_game、
+    /// sample_tree_cpu_usage）必须与待命转正共用同一份闸门。
+    ///
+    /// 旧版结算侧只用 `is_helper_process`（仅 4 个崩溃上报器前缀），而 classify
+    /// 对 install_path 内的进程恒判 Game —— 游戏退出后残留的更新器/安装器会被
+    /// 算进可信进程树，会话永远不结算（2026-10-20 幽灵会话的同类病灶）。
+    /// 本测试钉死「旧名单不够用」，防止有人把结算侧改回窄闸门。
+    #[test]
+    fn settlement_gate_must_include_setup_helpers() {
+        // 旧名单仍要保留（不能把两者改成互斥）
+        assert!(PlayTimeTracker::is_helper_process("CrashReportClient.exe"));
+        for name in [
+            "VC_redist.x64.exe",
+            "DXSETUP.exe",
+            "GameUpdater.exe",
+            "unins000.exe",
+            "EasyAntiCheat_EOS.exe",
+        ] {
+            assert!(
+                !PlayTimeTracker::is_helper_process(name),
+                "{name} 本就不在旧的 sibling 名单里"
+            );
+            assert!(
+                PlayTimeTracker::is_non_game_process(name),
+                "{name} 必须被结算侧排除，否则残留进程会顶住已结束的会话"
+            );
+        }
+    }
+
+    /// 手动停止：正式会话要结算、待命会话直接取消、无关 id 不影响其他会话
+    #[test]
+    fn stop_tracking_settles_active_and_cancels_pending() {
+        let mut tracker = PlayTimeTracker::new();
+        tracker.start_tracking("g1", "Game.exe", None, Some(std::process::id()), None);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let outcome = tracker.stop_tracking("g1");
+        assert!(
+            matches!(outcome, StopOutcome::Stopped(ref f) if f.duration_seconds >= 1),
+            "停止计时应结算出一条 >=1 秒的会话，实得 {:?}",
+            outcome
+        );
+        assert_eq!(tracker.session_counts(), (0, 0));
+
+        tracker.arm_session("g2", "Game.exe", None, Some("Z:\\__no_such_dir__"));
+        assert_eq!(tracker.stop_tracking("g2"), StopOutcome::Cancelled);
+        assert_eq!(tracker.stop_tracking("not-there"), StopOutcome::NotFound);
+        assert!(!tracker.has_pending_work());
+    }
+
+    /// 快照把后端三态交给前端，重启 / 重挂载后不会自己「猜」状态
+    #[test]
+    fn snapshot_reports_playing_launching_and_updating() {
+        let mut tracker = PlayTimeTracker::new();
+        tracker.start_tracking("a", "A.exe", None, Some(std::process::id()), None);
+        tracker.arm_session("b", "B.exe", None, Some("Z:\\__no_such_dir__"));
+        tracker.arm_session("c", "C.exe", None, Some("Z:\\__no_such_dir__"));
+        if let Some(ps) = tracker.pending_sessions.get_mut("c") {
+            ps.notified_updating = true;
+        }
+
+        assert_eq!(
+            tracker.snapshot(),
+            vec![
+                SessionSnapshot { game_id: "a".into(), state: "playing".into() },
+                SessionSnapshot { game_id: "b".into(), state: "launching".into() },
+                SessionSnapshot { game_id: "c".into(), state: "updating".into() },
+            ]
+        );
     }
 
     /// 冷却期内的会话跳过点查（避免在「句柄打不开」的会话上每拍全表刷新）

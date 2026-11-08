@@ -209,11 +209,15 @@ fn steam_root_from_registry() -> Option<PathBuf> {
         .map(|r| format!(r"{}\System32\reg.exe", r))
         .unwrap_or_else(|_| r"C:\Windows\System32\reg.exe".to_string());
 
-    let out = std::process::Command::new(&reg)
-        .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
+    // 【2026-11-08】带硬超时：`.output()` 无等待上限，reg.exe 被安全软件
+    // 挂起时会把「平台扫描」这条命令永久卡住（utils/net.rs 同款治理）。
+    let mut cmd = std::process::Command::new(&reg);
+    cmd.args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
+        .creation_flags(CREATE_NO_WINDOW);
+    let out = crate::utils::net::command_output_with_timeout(
+        cmd,
+        std::time::Duration::from_secs(crate::utils::constants::REG_QUERY_TIMEOUT_SECS),
+    )?;
     if !out.status.success() {
         return None;
     }

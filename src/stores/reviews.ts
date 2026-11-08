@@ -4,6 +4,14 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import type { Review } from "../lib/tauri";
 import * as api from "../lib/tauri";
 import { displayName } from "../lib/format";
+import {
+  draftFor,
+  pruneDrafts,
+  putDraft,
+  removeDraft,
+  type ReviewDraft,
+  type ReviewDraftBook,
+} from "../lib/reviewDrafts";
 
 /**
  * 界面展示名：英文名优先（中英文名都搜，展示纯英文策略）。
@@ -23,6 +31,17 @@ export const useReviewsStore = defineStore("reviews", () => {
   const refreshingIds = ref<Set<string>>(new Set());
   // 封面路径映射（键 `review:<id>`），含封面行的 updated_at 供破缓存用
   const coverPaths = ref<Record<string, api.CoverSet>>({});
+  // 写库失败的托底草稿（按 reviewId 存；放 store 里，组件卸载也不丢）
+  const unsavedDrafts = ref<ReviewDraftBook>({});
+  function saveUnsavedDraft(reviewId: string, draft: ReviewDraft) {
+    unsavedDrafts.value = putDraft(unsavedDrafts.value, reviewId, draft);
+  }
+  function getUnsavedDraft(reviewId: string) {
+    return draftFor(unsavedDrafts.value, reviewId);
+  }
+  function clearUnsavedDraft(reviewId: string) {
+    unsavedDrafts.value = removeDraft(unsavedDrafts.value, reviewId);
+  }
   // 游玩时长映射（键 review id）：按名匹配游戏库得来，含已删游戏的历史（2026-10-24）
   const playTimes = ref<Record<string, api.ReviewPlayTime>>({});
   // 筛选与排序状态
@@ -150,6 +169,11 @@ export const useReviewsStore = defineStore("reviews", () => {
     error.value = null;
     try {
       reviews.value = await api.getReviews();
+      // 条目可能被别的入口删掉，顺手清掉永远不会被认领的失败草稿。
+      unsavedDrafts.value = pruneDrafts(
+        unsavedDrafts.value,
+        reviews.value.map((r) => r.id),
+      );
       await loadAllCovers();
       await loadPlayTimes();
     } catch (e) {
@@ -166,13 +190,19 @@ export const useReviewsStore = defineStore("reviews", () => {
     }
   }
 
-  /** 添加手账条目（只填名字），随后自动刷新元数据与封面 */
+  /**
+   * 添加手账条目（只填名字），随后自动跑一次 LLM 补全（元数据 + 命名 + 官方英文名）。
+   *
+   * **不再自动拉封面**（2026-10-30 按老爷要求改）：旧实现连带抓一张 SteamGridDB 的图，
+   * 抓回来是什么全凭运气；现在封面三个来源（本地 / Steam 官方 / SteamGridDB）
+   * 全归用户手动挑选，添加完自己挑一张。
+   */
   async function addReview(name: string) {
     const review = await api.addReview(name);
     reviews.value.unshift(review);
     // 新名字可能直接对上游戏库的时长，补拉一次
     loadPlayTimes().catch(() => {});
-    // 自动刷新信息（LLM + 封面），失败不阻断添加
+    // 自动补全信息（只跑 LLM），失败不阻断添加
     refreshReviewInfo(review.id).catch(() => {});
     return review;
   }
@@ -191,14 +221,15 @@ export const useReviewsStore = defineStore("reviews", () => {
     return review;
   }
 
-  /** 刷新单个条目的元数据与封面 */
+  /** 刷新单个条目的元数据（只跑 LLM；封面自 2026-10-30 起由「更换封面」手动指定） */
   async function refreshReviewInfo(reviewId: string) {
     refreshingIds.value.add(reviewId);
     try {
       const updated = await api.refreshReviewInfo(reviewId);
       updateReviewInStore(reviewId, updated);
-      // 该次刷新可能换了封面（时间戳变）→ 重拉映射，否则 URL 参数还停在旧的
-      await loadAllCovers();
+      // LLM 刷新也会改写 name / name_en，而游玩时长是按名认领的：
+      // 不补拉的话，「我的游玩时长」会继续照着旧名字匹配（2026-10-28 审查指出）
+      loadPlayTimes().catch(() => {});
       return updated;
     } finally {
       refreshingIds.value.delete(reviewId);
@@ -241,6 +272,7 @@ export const useReviewsStore = defineStore("reviews", () => {
   async function removeReview(reviewId: string, keepCover = true) {
     await api.deleteReview(reviewId, keepCover);
     reviews.value = reviews.value.filter((r) => r.id !== reviewId);
+    clearUnsavedDraft(reviewId);
     if (selectedReview.value?.id === reviewId) {
       selectedReview.value = null;
     }
@@ -250,14 +282,34 @@ export const useReviewsStore = defineStore("reviews", () => {
     return api.fetchReviewCoverOptions(reviewId);
   }
 
-  async function setCoverFromUrl(reviewId: string, url: string) {
-    await api.setReviewCoverFromUrl(reviewId, url);
+  /**
+   * 换封面后的统一收尾：条目字段（`cover_local`）与封面映射都得重拉。
+   *
+   * 映射里的时间戳是 asset URL 的破缓存参数，不重拉的话 WebView 仍显示旧图。
+   */
+  async function syncCoverState(reviewId: string) {
     const updated = await api.getReviewDetail(reviewId);
     if (updated) {
       updateReviewInStore(reviewId, updated);
     }
-    // 封面行时间戳变了 → 必须重拉映射，否则 URL 参数还是旧的、WebView 仍显示旧图
     await loadAllCovers();
+  }
+
+  async function setCoverFromUrl(reviewId: string, url: string) {
+    await api.setReviewCoverFromUrl(reviewId, url);
+    await syncCoverState(reviewId);
+  }
+
+  /** 本地图片当封面（只把内容收进封面库，用户选的原文件不动） */
+  async function setCoverFromLocal(reviewId: string, coverPath: string) {
+    await api.setReviewCoverFromLocal(reviewId, coverPath);
+    await syncCoverState(reviewId);
+  }
+
+  /** Steam 官方封面（appid 先按名认领游戏库，认不到再查 Steam 商店搜索） */
+  async function setCoverFromSteam(reviewId: string) {
+    await api.setReviewCoverFromSteam(reviewId);
+    await syncCoverState(reviewId);
   }
 
   function selectReview(review: Review) {
@@ -293,6 +345,10 @@ export const useReviewsStore = defineStore("reviews", () => {
     coverSrc,
     coverPaths,
     playTimes,
+    unsavedDrafts,
+    saveUnsavedDraft,
+    getUnsavedDraft,
+    clearUnsavedDraft,
     loadAllCovers,
     loadPlayTimes,
     loadReviews,
@@ -306,6 +362,8 @@ export const useReviewsStore = defineStore("reviews", () => {
     removeReview,
     fetchCoverOptions,
     setCoverFromUrl,
+    setCoverFromLocal,
+    setCoverFromSteam,
     selectReview,
     clearSelection,
     updateReviewInStore,

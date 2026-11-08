@@ -44,7 +44,6 @@ import type {
   GenreStats,
   HeatmapDay,
   HourlyStats,
-  StatusStats,
   PlaySessionDetail,
 } from "../lib/tauri";
 import { useGamesStore } from "../stores/games";
@@ -70,6 +69,8 @@ use([
 ]);
 
 const loading = ref(true);
+// 加载失败不能只 console.error：否则概览显示 0、图表空白，用户以为真没数据
+const statsError = ref<string | null>(null);
 const overview = ref<{
   game_count: number;
   total_play_time: number;
@@ -85,15 +86,14 @@ const playStats = ref<PlayStats[]>([]);
 // 时长排行一次取全：库里玩过的条目（含已移除但留有历史）通常几十条。
 // 上界与后端 STATS_MAX_LIMIT（1000）对齐——多传也没用，命令层会钳位。
 const PLAY_STATS_LIMIT = 1000;
+// 榜单仍取全量数据，但 DOM 分批渲染：一次挂 1000 个含封面/渐变的条形行，
+// 首屏与滚动都会掉帧。用户点「显示更多」再追加，排名与数据都不变。
+const RANK_PAGE_SIZE = 100;
+const rankLimit = ref(RANK_PAGE_SIZE);
 const dailyStats = ref<DailyStats[]>([]);
 const genreStats = ref<GenreStats[]>([]);
 const heatmapStats = ref<HeatmapDay[]>([]);
 const hourlyStats = ref<HourlyStats[]>([]);
-const statusStats = ref<StatusStats>({
-  unplayed: 0,
-  played: 0,
-  completed: 0,
-});
 
 // 游玩会话历史
 const sessionHistory = ref<PlaySessionDetail[]>([]);
@@ -101,6 +101,7 @@ const sessionGameFilter = ref<string>("");
 const sessionLoading = ref(false);
 const sessionOffset = ref(0);
 const sessionHasMore = ref(true);
+const sessionError = ref<string | null>(null);
 const SESSION_PAGE_SIZE = 50;
 
 // 库内游戏 id 集合：会话历史里查不到的就是已移除条目
@@ -127,7 +128,7 @@ const gameFilterOptions = computed(() => {
 const gameColors = ref<Record<string, string>>({});
 
 // 当前活跃的 tab
-const activeTab = ref("overview");
+const activeTab = ref("duration");
 
 // 响应式网格列数
 const gridCols = ref(4);
@@ -192,123 +193,6 @@ const overviewCards = computed(() => [
     suffix: "h",
   },
 ]);
-
-// 游戏状态分布饼图（三态口径与首页筛选一致：未游玩=未通关且无时长 / 已游玩=启动过未通关 / 已通关=手动标记）
-const statusPieOption = computed(() => {
-  const data = [
-    { name: "未游玩", value: statusStats.value.unplayed, itemStyle: { color: "#8b5cf6" } },
-    { name: "已游玩", value: statusStats.value.played, itemStyle: { color: "#3b82f6" } },
-    { name: "已通关", value: statusStats.value.completed, itemStyle: { color: "#22c55e" } },
-  ].filter((item) => item.value > 0);
-
-  return {
-    tooltip: {
-      trigger: "item",
-      formatter: "{b}: {c} 款 ({d}%)",
-    },
-    legend: {
-      orient: "vertical",
-      right: "2%",
-      top: "center",
-      textStyle: { color: "#aaa", fontSize: 12 },
-      itemWidth: 12,
-      itemHeight: 12,
-      itemGap: 16,
-    },
-    series: [
-      {
-        type: "pie",
-        radius: ["40%", "65%"],
-        center: ["35%", "50%"],
-        avoidLabelOverlap: false,
-        itemStyle: {
-          borderRadius: 6,
-          borderColor: COLOR_DARK_BG,
-          borderWidth: 2,
-        },
-        label: {
-          show: false,
-          position: "center",
-        },
-        emphasis: {
-          label: {
-            show: true,
-            fontSize: 16,
-            fontWeight: "bold",
-            color: "#fff",
-          },
-        },
-        labelLine: {
-          show: false,
-        },
-        data,
-      },
-    ],
-  };
-});
-
-// 游戏类型分布环形图（仅显示有游玩时长的类型）
-const genrePieOption = computed(() => {
-  const playedGenres = genreStats.value.filter((g) => g.total_seconds > 0);
-  const topGenres = playedGenres.slice(0, 10);
-  const colors = [
-    "#6366f1", "#8b5cf6", "#ec4899", "#f43f5e", "#f97316",
-    "#eab308", "#22c55e", "#14b8a6", "#06b6d4", "#3b82f6",
-  ];
-
-  return {
-    tooltip: {
-      trigger: "item",
-      formatter: (params: any) => {
-        const hours = (params.data.value / 3600).toFixed(1);
-        return `${params.name}<br/>时长: ${hours}h<br/>游戏数: ${params.data.gameCount} 款`;
-      },
-    },
-    legend: {
-      type: "scroll",
-      orient: "vertical",
-      right: "2%",
-      top: "center",
-      bottom: 20,
-      textStyle: { color: "#aaa", fontSize: 11 },
-      itemWidth: 12,
-      itemHeight: 12,
-      itemGap: 12,
-      pageTextStyle: { color: "#aaa" },
-      pageIconColor: "#aaa",
-      pageIconInactiveColor: "#555",
-    },
-    series: [
-      {
-        type: "pie",
-        radius: ["40%", "65%"],
-        center: ["30%", "50%"],
-        itemStyle: {
-          borderRadius: 6,
-          borderColor: COLOR_DARK_BG,
-          borderWidth: 2,
-        },
-        label: {
-          show: false,
-        },
-        emphasis: {
-          label: {
-            show: true,
-            fontSize: 14,
-            fontWeight: "bold",
-            color: "#fff",
-          },
-        },
-        data: topGenres.map((g, i) => ({
-          name: g.genre,
-          value: g.total_seconds,
-          gameCount: g.game_count,
-          itemStyle: { color: colors[i % colors.length] },
-        })),
-      },
-    ],
-  };
-});
 
 // 游戏类型 - 按游戏数量饼图
 const genreCountPieOption = computed(() => {
@@ -452,10 +336,13 @@ const rankedStats = computed(() => {
     hours: Number((s.total_seconds / 3600).toFixed(1)),
   }));
 });
+const visibleRankedStats = computed(() => rankedStats.value.slice(0, rankLimit.value));
 
 // bar 宽度百分比（相对最大值）
 function barWidth(hours: number): string {
-  const maxHours = rankedStats.value.length > 0 ? rankedStats.value[0].hours : 1;
+  // 榜首可能被四舍五入成 0h（新装游戏只玩了几十秒），此时 0/0 = NaN，
+  // `width: NaN%` 是无效声明会被丢弃，条形反而退化成整行满宽。
+  const maxHours = Math.max(rankedStats.value[0]?.hours ?? 0, 0.1);
   return Math.max((hours / maxHours) * 100, 2) + "%";
 }
 
@@ -525,23 +412,34 @@ function extractDominantColor(imgSrc: string): Promise<string> {
   });
 }
 
-// 加载封面并提取颜色
+/** 取色只做榜单前 N 条：排行榜现在全量展示，逐条解码封面在几百款时会把主线程压垮 */
+const COVER_COLOR_MAX = 40;
+/** 同时解码的图片张数——不设上限时首屏会一口气发几十个请求 */
+const COVER_COLOR_CONCURRENCY = 6;
+
+// 加载封面并提取颜色（分批，避免全量并发）
 async function loadGameColors(stats: PlayStats[]) {
-  const tasks: Promise<void>[] = [];
+  const pending = stats
+    .filter((s) => !gameColors.value[s.game_id]) // 已有缓存跳过
+    .slice(0, COVER_COLOR_MAX)
+    .map((s) => ({ id: s.game_id, cover: gamesStore.coverSrc(s.game_id) }))
+    .filter((t): t is { id: string; cover: string } => !!t.cover);
 
-  for (const s of stats) {
-    if (gameColors.value[s.game_id]) continue; // 已有缓存
-    const cover = gamesStore.coverSrc(s.game_id);
-    if (cover) {
-      tasks.push(
-        extractDominantColor(cover).then((color) => {
-          gameColors.value[s.game_id] = color;
-        })
-      );
-    }
+  // 【2026-11-08】先收集到普通对象，全部完成后一次性合并。
+  // 旧版每拿到一张主色就写一次 `gameColors.value[id]`，最多 40 次响应式
+  // 写入，每次都让读它的整张榜单 render effect 失效并重算。
+  const patch: Record<string, string> = {};
+  for (let i = 0; i < pending.length; i += COVER_COLOR_CONCURRENCY) {
+    const batch = pending.slice(i, i + COVER_COLOR_CONCURRENCY);
+    await Promise.all(
+      batch.map(async ({ id, cover }) => {
+        patch[id] = await extractDominantColor(cover);
+      })
+    );
   }
-
-  await Promise.all(tasks);
+  if (Object.keys(patch).length > 0) {
+    gameColors.value = { ...gameColors.value, ...patch };
+  }
 }
 
 // 每日游玩时长趋势图
@@ -830,6 +728,7 @@ async function loadSessionHistory(reset = false) {
   if (!sessionHasMore.value) return;
 
   sessionLoading.value = true;
+  sessionError.value = null;
   try {
     const gameId = sessionGameFilter.value || undefined;
     const sessions = await api.getPlaySessions(gameId, SESSION_PAGE_SIZE, sessionOffset.value);
@@ -840,6 +739,7 @@ async function loadSessionHistory(reset = false) {
     sessionHistory.value.push(...sessions);
     sessionOffset.value += sessions.length;
   } catch (e) {
+    sessionError.value = `加载游玩记录失败: ${e instanceof Error ? e.message : String(e)}`;
     console.error("加载会话历史失败:", e);
   } finally {
     if (seq === sessionRequestSeq) {
@@ -862,15 +762,15 @@ watch(activeTab, (tab) => {
 
 async function loadStats() {
   loading.value = true;
+  statsError.value = null;
   try {
-    const [ov, ps, ds, gs, hs, hls, ss] = await Promise.all([
+    const [ov, ps, ds, gs, hs, hls] = await Promise.all([
       api.getOverviewStats(),
       api.getPlayStats(PLAY_STATS_LIMIT),
       api.getDailyStats(30),
       api.getGenreStats(),
       api.getHeatmapStats(365),
       api.getHourlyStats(),
-      api.getStatusStats(),
     ]);
     overview.value = ov;
     playStats.value = ps;
@@ -880,8 +780,8 @@ async function loadStats() {
     genreStats.value = gs;
     heatmapStats.value = hs;
     hourlyStats.value = hls;
-    statusStats.value = ss;
   } catch (e) {
+    statsError.value = `加载统计数据失败: ${e instanceof Error ? e.message : String(e)}`;
     console.error("加载统计数据失败:", e);
   } finally {
     loading.value = false;
@@ -900,12 +800,20 @@ onMounted(() => {
   window.addEventListener('resize', onWindowResize);
 });
 
-// 当 store 中的封面路径更新时，补充提取颜色（使用 shallow watch 避免深层遍历）
-watch(() => Object.keys(gamesStore.coverPaths).length, (newLen, oldLen) => {
-  if (newLen > (oldLen ?? 0) && playStats.value.length > 0) {
+// 封面映射变化时重新取色（2026-11-08 修）：旧版只 watch key **数量**，
+// 换封面时 `getAllCovers()` 只推进某个 key 的 `updated_at`，数量不变，
+// 于是条形渐变一直用旧图主色直到组件重建。改看时间戳签名，并清掉旧缓存
+// ——否则 loadGameColors 的 `!gameColors[id]` 会把已缓存 id 全跳过。
+watch(
+  () => Object.values(gamesStore.coverPaths)
+    .map((c) => c.updated_at ?? "")
+    .join("|"),
+  (signature, previous) => {
+    if (signature === previous || playStats.value.length === 0) return;
+    gameColors.value = {};
     loadGameColors(playStats.value).catch(() => {});
   }
-});
+);
 
 // keep-alive 缓存的组件再次激活时刷新数据
 onActivated(() => {
@@ -927,6 +835,10 @@ onUnmounted(() => {
 <template>
   <div class="stats-view">
     <n-spin :show="loading">
+      <div v-if="statsError" class="stats-error">
+        <span>{{ statsError }}</span>
+        <n-button size="tiny" type="warning" @click="loadStats">重试</n-button>
+      </div>
       <!-- 概览卡片 -->
       <n-grid :cols="gridCols" :x-gap="16" :y-gap="16" responsive="screen" style="margin-bottom: 24px">
         <n-gi v-for="card in overviewCards" :key="card.label">
@@ -943,22 +855,6 @@ onUnmounted(() => {
 
       <!-- 图表 -->
       <n-tabs v-model:value="activeTab" type="line">
-        <!-- 概览 Tab -->
-        <n-tab-pane name="overview" tab="概览">
-          <n-grid :cols="chartGridCols" :x-gap="16" :y-gap="16" responsive="screen">
-            <n-gi>
-              <n-card title="游戏状态分布">
-                <v-chart :option="statusPieOption" style="height: 350px" autoresize />
-              </n-card>
-            </n-gi>
-            <n-gi>
-              <n-card title="游戏类型分布">
-                <v-chart :option="genrePieOption" style="height: 350px" autoresize />
-              </n-card>
-            </n-gi>
-          </n-grid>
-        </n-tab-pane>
-
         <!-- 时长 Tab -->
         <n-tab-pane name="duration" tab="时长分析">
           <n-grid :cols="1" :y-gap="16">
@@ -966,7 +862,7 @@ onUnmounted(() => {
               <n-card title="时长排行">
                 <div class="custom-bar-chart">
                   <div
-                    v-for="(game, index) in rankedStats"
+                    v-for="(game, index) in visibleRankedStats"
                     :key="game.game_id"
                     class="bar-row"
                   >
@@ -1000,6 +896,12 @@ onUnmounted(() => {
                       </div>
                     </div>
                   </div>
+                </div>
+                <div v-if="rankedStats.length > rankLimit" class="rank-more">
+                  <span>共 {{ rankedStats.length }} 款，已显示 {{ visibleRankedStats.length }} 款</span>
+                  <n-button size="tiny" @click="rankLimit += RANK_PAGE_SIZE">
+                    显示更多（+{{ RANK_PAGE_SIZE }}）
+                  </n-button>
                 </div>
               </n-card>
             </n-gi>
@@ -1162,11 +1064,20 @@ onUnmounted(() => {
               </n-space>
             </template>
 
-            <div v-if="sessionHistory.length === 0 && !sessionLoading" style="padding: 40px 0">
+            <!-- 错误条独立成一条链，不参与下面的 v-if/v-else：
+                 翻页加载失败时已有记录仍要看得见，只额外给一条重试提示 -->
+            <div v-if="sessionError" class="stats-error" style="margin-top: 16px">
+              <span>{{ sessionError }}</span>
+              <n-button size="tiny" type="warning" @click="loadSessionHistory(true)">重试</n-button>
+            </div>
+            <div
+              v-if="sessionHistory.length === 0 && !sessionLoading && !sessionError"
+              style="padding: 40px 0"
+            >
               <n-empty description="暂无游玩记录" />
             </div>
 
-            <div v-else class="session-list">
+            <div v-else-if="sessionHistory.length > 0" class="session-list">
               <div
                 v-for="session in sessionHistory"
                 :key="session.id"
@@ -1356,6 +1267,30 @@ onUnmounted(() => {
 /* 自定义条形图 */
 /* 榜单限高滚动：10 行（40px 行高 + 8px 间距）加内边距正好 480px，
    与原先只显示前 10 时卡片高度一致；再多就靠滚轮下翻，卡片不随条目数长高 */
+.stats-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 10px 14px;
+  border: 1px solid rgba(232, 128, 128, 0.35);
+  border-radius: 8px;
+  background: rgba(232, 128, 128, 0.08);
+  color: #e88080;
+  font-size: 13px;
+}
+
+.rank-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding-top: 12px;
+  font-size: 12px;
+  color: #8a8f98;
+}
+
 .custom-bar-chart {
   display: flex;
   flex-direction: column;

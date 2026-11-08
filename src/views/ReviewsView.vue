@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick, watch, h } from "vue";
+import { ref, computed, onMounted, onUnmounted, nextTick, watch, h } from "vue";
 import {
   NInput,
   NButton,
@@ -19,6 +19,7 @@ import {
   NGi,
   NTag,
   NText,
+  NDropdown,
   useMessage,
   useDialog,
 } from "naive-ui";
@@ -35,6 +36,7 @@ import {
   GameControllerOutline,
 } from "@vicons/ionicons5";
 import { useDebounceFn } from "@vueuse/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useReviewsStore, displayName } from "../stores/reviews";
 import { useGamesStore } from "../stores/games";
 import { getScreenshotDir, openScreenshotDir, listScreenshotDirs } from "../lib/tauri";
@@ -82,6 +84,13 @@ const onSearch = useDebounceFn(() => {
   store.searchQuery = searchInput.value.trim();
 }, DEBOUNCE_MS);
 const searchInput = ref("");
+
+/** 空态「清空筛选」：搜索框是本地 ref，store 里另有搜索词与类型筛选 */
+function clearReviewFilters() {
+  searchInput.value = "";
+  store.searchQuery = "";
+  store.genreFilter = "";
+}
 
 // ==================== 添加弹窗 ====================
 
@@ -187,6 +196,19 @@ async function finishReviewEdit() {
   if (!ok) reviewEditing.value = true;
 }
 
+/**
+ * 评价框的快捷键：Ctrl/Cmd + Enter 收刀。
+ *
+ * `isComposing` 守卫不能省：中文输入法还在组字时按回车是「上屏」，
+ * 直接收刀会把没上屏的候选词连同输入框一起扔掉。
+ */
+function onReviewKeydown(e: KeyboardEvent) {
+  if (e.isComposing) return;
+  if (e.key !== "Enter" || !(e.ctrlKey || e.metaKey)) return;
+  e.preventDefault();
+  void finishReviewEdit();
+}
+
 // ==================== 评价自动保存 ====================
 //
 // 口径（2026-10-17）：
@@ -217,19 +239,36 @@ const reviewSavedAtText = computed(() => {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 });
 
-/** 正在飞的那一次写库；并发调用方直接复用它，避免连点触发两次 UPDATE */
+/** 正在飞的写库链尾；并发调用方接在它后面，保证「最新文本」一定被写一次 */
 let savingPromise: Promise<boolean> | null = null;
 
-/** 立即把当前文本落库；返回是否成功（无变化也算成功） */
+/**
+ * 写库失败时的托底草稿放在 `useReviewsStore` 的 `unsavedDrafts` 里。
+ *
+ * 组件本地单槽会在不同条目连续失败时互相覆盖，也会随视图卸载消失；
+ * store 里的草稿簿按 reviewId 保留多份，重开条目时原样恢复并自动重试。
+ */
+
+/**
+ * 立即把当前文本落库；返回的 promise **覆盖到最新文本真正落库**。
+ *
+ * 在飞期间又来了保存请求时，旧实现返回旧快照那次写库的 promise 并
+ * fire-and-forget 补写 —— 调用方（切条目 / 关抽屉 / 退出编辑态）拿到
+ * `ok=true` 就以为存好了。现在把补写串进同一条链，await 到的就是
+ * 「当前文本」的最终结果；链尾结束才清 `savingPromise`。
+ */
 function saveReviewNow(): Promise<boolean> {
-  if (savingPromise) return savingPromise;
-  savingPromise = doSaveReview().finally(() => {
-    savingPromise = null;
+  const prev = savingPromise;
+  const next = (prev ?? Promise.resolve(true)).then(() => saveLatestReview());
+  savingPromise = next;
+  void next.finally(() => {
+    // 只有仍是链尾才清空，防止后到的并发请求把标记提前抹掉
+    if (savingPromise === next) savingPromise = null;
   });
-  return savingPromise;
+  return next;
 }
 
-async function doSaveReview(): Promise<boolean> {
+async function saveLatestReview(): Promise<boolean> {
   const id = editingReviewId;
   if (!id) return true;
 
@@ -238,6 +277,19 @@ async function doSaveReview(): Promise<boolean> {
     // 无变化：把「待保存」的指示收回，回到「修改后自动保存」。
     // 不覆盖错误态——那个要用户手动重试，不能被一次空跑抹掉。
     if (reviewSaveState.value === "pending") reviewSaveState.value = "idle";
+    // 例外：恢复托底草稿后若发现内容与库里一致，说明上次其实已落库、
+    // 只是回执丢了（store 抛错发生在写库之后）；此时要清掉这条误报，
+    // 否则「保存失败」会一直挂着且永远等不到重试。只清同文本的草稿，
+    // 其它文本/其它条目的失败草稿必须继续保留。
+    if (reviewSaveState.value === "error") {
+      const draft = store.getUnsavedDraft(id);
+      if (!draft || draft.text === text) {
+        reviewSaveState.value = "saved";
+        reviewSaveError.value = null;
+        reviewSavedAt.value = new Date();
+        store.clearUnsavedDraft(id);
+      }
+    }
     return true;
   }
 
@@ -245,6 +297,11 @@ async function doSaveReview(): Promise<boolean> {
   try {
     await store.setReview(id, text);
     savedText = text;
+    // 确认落库后按 id 清掉本条目的失败草稿，不比对文本：
+    // 链式补写是串行的，能走到这里说明「本条目的最新文本」已入库，
+    // 之前那次失败留下的旧草稿必须作废，否则重开条目会把旧字
+    // 恢复回来、反倒盖掉刚保存成功的新内容。其它条目不受影响。
+    store.clearUnsavedDraft(id);
     // 保存期间可能已切到别的条目：只在仍是同一条目时更新可见状态
     if (editingReviewId === id) {
       reviewSaveState.value = "saved";
@@ -253,10 +310,12 @@ async function doSaveReview(): Promise<boolean> {
     }
     return true;
   } catch (e) {
-    if (editingReviewId === id) {
-      reviewSaveState.value = "error";
-      reviewSaveError.value = e instanceof Error ? e.message : String(e);
-    }
+    const msg = e instanceof Error ? e.message : String(e);
+    store.saveUnsavedDraft(id, { text, error: msg });
+    // 无条件记录错误：调用方可能已经切条目 / 关抽屉，旧版的
+    // `editingReviewId === id` 守卫会把这次失败静默吞掉。
+    reviewSaveState.value = "error";
+    reviewSaveError.value = msg;
     return false;
   }
 }
@@ -285,8 +344,15 @@ watch(showDetail, (open) => {
   // 本次清理必须让位——否则会把新条目刚设好的 editingReviewId / selected 清掉。
   const seq = detailOpenSeq;
   const closingId = editingReviewId;
-  void saveReviewNow().finally(() => {
+  void saveReviewNow().then((ok) => {
     if (detailOpenSeq !== seq) return;
+    if (!ok) {
+      // 写库失败：抽屉已经关了，但内容已在 store 草稿簿按 id 托底，不会丢。
+      // 保留 editingReviewId 与错误态，重开这一条会自动恢复并提示重试。
+      reviewSaveState.value = "error";
+      message.error("评价没能保存到本地，内容已保留；重新打开该条目即可继续重试");
+      return;
+    }
     store.clearSelection();
     if (editingReviewId === closingId) editingReviewId = null;
     reviewSaveState.value = "idle";
@@ -351,7 +417,7 @@ async function commitNameEdit() {
       if (trimmed === current) return;
       await store.updateMeta(id, { name_en: trimmed });
       editingNameEn.value = trimmed;
-      message.success(trimmed ? "英文名已更新，点「刷新信息」可重新拉取封面" : "英文名已清除");
+      message.success(trimmed ? "英文名已更新" : "英文名已清除");
     }
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e));
@@ -368,11 +434,16 @@ const selectedNameIsAscii = computed(() => {
 
 async function openDetail(review: (typeof store.reviews)[number]) {
   const seq = ++detailOpenSeq;
+  const previousId = editingReviewId;
+  const sameEntry = previousId === review.id;
 
-  // 切条目先把上一条的未落库评价冲掉：防抖队列里那次保存是按
-  // editingReviewId 取的，若先把它改成新条目，旧内容就再也写不回去了。
-  if (editingReviewId && editingReviewId !== review.id) {
-    await saveReviewNow();
+  // 切条目 / 同条目快速重开，都要先把未落库的评价冲掉。
+  // 【2026-11-08 复审】失败时**不能 return**：错误条、重试按钮、缓冲恢复
+  // 全在抽屉里，提前 return 会让点卡片毫无反应，把内容锁死在看不见的地方。
+  let flushFailed = false;
+  if (previousId && (!sameEntry || reviewText.value !== savedText)) {
+    flushFailed = !(await saveReviewNow());
+    if (flushFailed) reviewSaveState.value = "error";
   }
 
   // 等待写库期间用户可能又点了别的条目——本次让位，否则会用旧条目的
@@ -380,18 +451,38 @@ async function openDetail(review: (typeof store.reviews)[number]) {
   if (seq !== detailOpenSeq) return;
 
   editingReviewId = review.id;
-  savedText = review.review ?? "";
-  // 刚打开时显示「修改后自动保存」即可；不冒充一次「已保存」，
-  // 否则会有「已保存」却没有时间戳的怪状态（那条内容本来就在库里）。
-  reviewSaveState.value = "idle";
+
+  // 【2026-11-08 复审】绝不能用点击瞬间传进来的 `review.review` 重置
+  // savedText：store 的 updateReviewInStore 是「替换数组元素」，旧引用的
+  // .review 仍是上一次的文本。关抽屉 flush 成功后再立刻重开同一条目时，
+  // 拿旧对象会把 savedText / reviewText 一起打回旧值，用户再敲一个字就
+  // 会用「旧文本+新字」覆盖掉刚存好的新内容。
+  //  - 重开同条目且 flush 成功：链尾已保证最新文本落库，直接沿用 savedText；
+  //  - 其余情况：从 **store 当前值**取，而不是点击时的快照。
+  if (!(sameEntry && !flushFailed)) {
+    const current = store.reviews.find((r) => r.id === review.id);
+    savedText = current?.review ?? review.review ?? "";
+  }
+
+  // 草稿簿按 id 保存：只取当前条目的并清空；其它条目的失败草稿继续留在 store。
+  const buffered = store.getUnsavedDraft(review.id);
+  if (buffered) store.clearUnsavedDraft(review.id);
+
+  reviewSaveState.value = buffered || flushFailed ? "error" : "idle";
+  reviewSaveError.value = buffered?.error ?? (flushFailed ? reviewSaveError.value : null);
   reviewSavedAt.value = null;
-  reviewSaveError.value = null;
 
   store.selectReview(review);
   editingName.value = review.name;
   editingNameEn.value = review.name_en ?? "";
   ratingInput.value = review.rating;
-  reviewText.value = savedText;
+  reviewText.value = buffered?.text ?? savedText;
+  if (buffered) {
+    message.warning("上次有内容没保存成功，已为你恢复并重新保存");
+    void saveReviewNow();
+  } else if (flushFailed && !sameEntry) {
+    message.error("上一条评价没能保存，内容已保留；重新打开那一条即可继续重试");
+  }
   // 换条目一律回到阅读态、收起长文：沿用上一条的展开状态会让人以为换了一篇
   reviewEditing.value = false;
   reviewExpanded.value = false;
@@ -538,13 +629,13 @@ async function saveNameEn() {
   if (trimmed === current) return;
   try {
     await store.updateMeta(selected.value.id, { name_en: trimmed });
-    message.success(trimmed ? "英文名已更新，点「刷新信息」可重新拉取封面" : "英文名已清除");
+    message.success(trimmed ? "英文名已更新" : "英文名已清除");
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e));
   }
 }
 
-/** 刷新信息（LLM + 封面） */
+/** 刷新信息（只跑 LLM；封面走「更换封面」三源手动指定） */
 async function handleRefreshInfo(review: (typeof store.reviews)[number]) {
   try {
     await store.refreshReviewInfo(review.id);
@@ -559,14 +650,19 @@ function confirmDelete(review: (typeof store.reviews)[number]) {
   const hasCover = !!(review.cover_local || review.cover_url);
 
   const doDelete = async (keepCover: boolean) => {
+    // 声明在 try 之外：catch 块与 try 块是不同作用域，写在里面 catch 看不见
+    let prevEditingId: string | null = null;
     try {
       // 条目即将消失：断开自动保存的归属，避免关闭抽屉时又
-      // 对着一个已删除的 id 发起 UPDATE（会以「条目不存在」失败告终）
+      // 对着一个已删除的 id 发起 UPDATE（会以「条目不存在」失败告终）。
+      // 删除失败必须恢复，否则这条的自动保存被永久解除（显示「修改后自动保存」，实则不落库）。
+      prevEditingId = editingReviewId;
       editingReviewId = null;
       await store.removeReview(review.id, keepCover);
       showDetail.value = false;
       message.success(keepCover ? "已删除，封面图片已留档" : "已删除");
     } catch (e) {
+      editingReviewId = prevEditingId;
       message.error(e instanceof Error ? e.message : String(e));
     }
   };
@@ -623,6 +719,9 @@ const displayedCovers = computed(() => filteredCovers.value.slice(0, coverCount.
 const hasMoreCovers = computed(() => coverCount.value < filteredCovers.value.length);
 
 async function openCoverPicker(review: (typeof store.reviews)[number]) {
+  // 与 openDetail 共用同一个序号：关抽屉的清理逻辑靠它判断「期间是否又开了新东西」。
+  // 不递增的话，写库收尾时会把这里刚选中的条目清空，表现为「更换封面」点了没反应。
+  detailOpenSeq += 1;
   store.selectReview(review);
   showCoverPicker.value = true;
   coverOptions.value = [];
@@ -655,6 +754,54 @@ async function selectCover(option: CoverOption) {
   }
 }
 
+// ==================== 封面来源（三源并列，与游戏库详情页同口径） ====================
+//
+// 2026-10-30 补齐：此前手账只有 SteamGridDB 一个来源，比游戏库少了「本地图片」和
+// 「Steam 官方封面」。三个来源互不合并 —— 用户点哪个就是哪个，不做自动串接。
+
+const coverDropdownOptions = [
+  { label: "从本地选择", key: "local" },
+  { label: "使用 Steam 官方封面", key: "steam" },
+  { label: "从 SteamGridDB 选择", key: "steamgriddb" },
+];
+
+async function handleCoverDropdown(key: string) {
+  const review = selected.value;
+  if (!review) return;
+  if (key === "local") await pickLocalCover(review);
+  else if (key === "steam") await useSteamCover(review);
+  else if (key === "steamgriddb") await openCoverPicker(review);
+}
+
+/** 本地图片当封面：只把内容收进封面库，用户选的原文件不动 */
+async function pickLocalCover(review: (typeof store.reviews)[number]) {
+  try {
+    const picked = await open({
+      multiple: false,
+      filters: [{ name: "图片", extensions: ["jpg", "jpeg", "png", "webp"] }],
+      title: "选择封面图片",
+    });
+    if (!picked) return;
+    await store.setCoverFromLocal(review.id, picked as string);
+    message.success("封面已更换");
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e));
+  }
+}
+
+/** Steam 官方封面：appid 先按名认领游戏库，认不到再查 Steam 商店搜索 */
+async function useSteamCover(review: (typeof store.reviews)[number]) {
+  const tip = message.loading("正在获取 Steam 官方封面…", { duration: 0 });
+  try {
+    await store.setCoverFromSteam(review.id);
+    message.success("已使用 Steam 官方封面");
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e));
+  } finally {
+    tip.destroy();
+  }
+}
+
 // ==================== 右键菜单 ====================
 
 const showMenu = ref(false);
@@ -684,8 +831,19 @@ const menuItems = computed<ContextMenuItem[]>(() => {
       icon: "🔄",
       action: () => handleRefreshInfo(review),
     },
+    // 封面三源（与详情页下拉同口径）
     {
-      label: "更换封面",
+      label: "封面：从本地选择",
+      icon: "📁",
+      action: () => pickLocalCover(review),
+    },
+    {
+      label: "封面：使用 Steam 官方",
+      icon: "🎮",
+      action: () => useSteamCover(review),
+    },
+    {
+      label: "封面：从 SteamGridDB 选",
       icon: "🖼️",
       action: () => openCoverPicker(review),
     },
@@ -717,6 +875,12 @@ const selectedPlayTime = computed(() =>
 );
 
 // ==================== 初始化 ====================
+
+onUnmounted(() => {
+  // 防抖队列里那次保存可能还没跑（停手不足 1s 就切走），这里兜一次。
+  // 即使这次写库失败，失败草稿也会写进 Pinia store，不随本组件卸载消失。
+  if (editingReviewId) void saveReviewNow();
+});
 
 onMounted(async () => {
   await store.loadReviews();
@@ -787,6 +951,8 @@ onMounted(async () => {
                   v-if="coverOf(review)"
                   :src="coverOf(review)!"
                   class="card-cover"
+                  loading="lazy"
+                  decoding="async"
                   draggable="false"
                   alt=""
                 />
@@ -815,11 +981,30 @@ onMounted(async () => {
             </div>
           </div>
         </template>
+        <!-- 加载失败必须单独给错误态：旧版一律显示「还没有手账条目」，
+             把 DB 异常伪装成空库，还把用户往「添加」按钮上引 -->
+        <n-empty v-else-if="store.error" class="empty-state" description="手账列表加载失败">
+          <template #extra>
+            <div class="empty-error">
+              <span>{{ store.error }}</span>
+              <n-button size="small" @click="store.loadReviews()">重试</n-button>
+            </div>
+          </template>
+        </n-empty>
+        <!-- 库空 vs 筛选无结果：两者该给的建议完全不同 -->
         <n-empty
           v-else-if="!store.loading"
           class="empty-state"
-          description="还没有手账条目，点击右上角「添加手账」开始吧"
-        />
+          :description="
+            store.reviews.length === 0
+              ? '还没有手账条目，点击右上角「添加手账」开始吧'
+              : '没有符合条件的手账，换个关键词或清空筛选试试'
+          "
+        >
+          <template v-if="store.reviews.length > 0" #extra>
+            <n-button size="small" @click="clearReviewFilters">清空筛选</n-button>
+          </template>
+        </n-empty>
       </n-spin>
     </div>
 
@@ -839,7 +1024,7 @@ onMounted(async () => {
             clearable
             @keyup.enter="confirmAdd"
           />
-          <p class="add-hint">添加后将自动通过 LLM 拉取游戏信息、SteamGridDB 拉取封面</p>
+          <p class="add-hint">添加后自动通过 LLM 补全游戏信息与命名；封面在详情页「更换封面」里手动挑选</p>
         </n-tab-pane>
         <n-tab-pane name="import" tab="从游戏库导入">
           <n-select
@@ -883,12 +1068,18 @@ onMounted(async () => {
                 </template>
                 刷新信息
               </n-button>
-              <n-button size="small" @click="openCoverPicker(selected)">
-                <template #icon>
-                  <n-icon :component="ImageOutline" />
-                </template>
-                更换封面
-              </n-button>
+              <n-dropdown
+                :options="coverDropdownOptions"
+                trigger="click"
+                @select="handleCoverDropdown"
+              >
+                <n-button size="small">
+                  <template #icon>
+                    <n-icon :component="ImageOutline" />
+                  </template>
+                  更换封面
+                </n-button>
+              </n-dropdown>
             </div>
           </div>
 
@@ -1080,6 +1271,16 @@ onMounted(async () => {
                 >
                   已保存 · {{ reviewSavedAtText }}
                 </span>
+                <!-- 阅读态也必须看得见失败：关掉编辑框后若失败态被藏起来，
+                     用户会以为内容已存好（2026-11-08 修复静默丢字） -->
+                <span
+                  v-if="reviewSaveState === 'error'"
+                  class="section-count failed"
+                  :title="reviewSaveError ?? ''"
+                >
+                  保存失败 · 内容已保留
+                  <n-button text size="tiny" type="error" @click="saveReviewNow()">重试</n-button>
+                </span>
                 <n-button text size="tiny" type="primary" @click="startReviewEdit">
                   <template #icon>
                     <n-icon :component="CreateOutline" />
@@ -1133,8 +1334,7 @@ onMounted(async () => {
                 type="textarea"
                 :autosize="REVIEW_AUTOSIZE"
                 placeholder="写下你对这款游戏的评价…（空行分段、行首 - 列表、**加粗**）"
-                @keydown.ctrl.enter.prevent="finishReviewEdit"
-                @keydown.meta.enter.prevent="finishReviewEdit"
+                @keydown="onReviewKeydown"
               />
               <div class="review-save-row">
                 <span class="save-hint muted">{{ reviewCharCount }} 字</span>
@@ -1441,6 +1641,18 @@ onMounted(async () => {
   margin-top: 80px;
 }
 
+.empty-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  max-width: 420px;
+  margin: 0 auto;
+  font-size: 12px;
+  color: #8a8f98;
+  word-break: break-all;
+}
+
 /* 评价摘要：固定 2 行，无评价不渲染，让卡片高度差得最少 */
 .card-summary {
   margin-top: 2px;
@@ -1691,6 +1903,14 @@ onMounted(async () => {
 .section-count.saved {
   color: #36ad6a;
   opacity: 1;
+}
+
+.section-count.failed {
+  color: #e88080;
+  opacity: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .review-body {

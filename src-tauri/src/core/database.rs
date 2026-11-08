@@ -5,6 +5,16 @@ use std::path::Path;
 use crate::models::*;
 use crate::utils::constants::{SESSION_MERGE_WINDOW_SECS, SESSION_MIN_DURATION_SECS};
 
+/// 名字匹配的**唯一口径**：`name` 或 `name_en` 任一命中（?1 = 归一化前的名字）。
+///
+/// 墓碑认领、防误接闸门、按名认领游戏库必须共用这一份，不能各写一套 SQL：
+/// 旧版 `count_games_by_name` 只比 `name`，而 `find_tombstone_for_reclaim`
+/// 是 2×2 双字段，闸门可被绕过、把一个无关旧 id 接回来（2026-11-08 修）。
+/// 空 `name_en` 不参与匹配，避免多条空串互相命中。
+const NAME_MATCH_ANY: &str = "((LOWER(TRIM(name)) = LOWER(TRIM(?1))) \
+     OR (name_en IS NOT NULL AND TRIM(name_en) <> '' \
+         AND LOWER(TRIM(name_en)) = LOWER(TRIM(?1))))";
+
 /// 将时区偏移（秒）格式化为 SQLite 的 strftime 修饰符
 /// 支持非整小时时区（如 UTC+5:30 → "+5.5 hours"，UTC+5:45 → "+5.75 hours"）
 fn format_offset_for_sqlite(offset_secs: i32) -> String {
@@ -258,9 +268,15 @@ impl Database {
 
         // 回填：首次建表后从明细全量重算预聚合（表非空则跳过）
         self.rebuild_play_stats_if_empty()?;
-        // 创建 status 索引（在列存在之后）
+        // 依赖「列迁移之后」才能创建的索引统一放这里（建表 batch 里不能引用
+        // name_en —— 旧库在那个时点还没有这一列）。
         self.conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_games_status ON games(status);"
+            "CREATE INDEX IF NOT EXISTS idx_games_status ON games(status);
+             -- find_game_by_any_name / count_games_by_name 用 LOWER(TRIM(...)) 做等值匹配，
+             -- 普通的 idx_games_name 对函数表达式无效，只能全表扫描。
+             -- 表达式索引让「按名认领游戏库 / 墓碑」走索引（SQLite 3.9+，bundled 3.45）。
+             CREATE INDEX IF NOT EXISTS idx_games_name_norm ON games(LOWER(TRIM(name)));
+             CREATE INDEX IF NOT EXISTS idx_games_name_en_norm ON games(LOWER(TRIM(name_en)));"
         )?;
 
         Ok(())
@@ -874,6 +890,37 @@ impl Database {
         }
     }
 
+    /// 按一组名字反查游戏库条目（手账「Steam 官方封面」认领 appid 用）。
+    ///
+    /// 逐个 key 依次查、命中即返回；比对口径与 `find_review_id_by_game_name` 对称 ——
+    /// 传入名只要对上 `games.name` 或 `games.name_en` 任一即算同一款游戏（trim + 小写）。
+    /// 空 key 一律跳过：已删游戏的孤儿历史名字可能被还原成空串，
+    /// 绝不能让空串"命中"任意库里条目（同 `pick_play_time` 那条防线）。
+    pub fn find_game_by_any_name(&self, names: &[String]) -> Result<Option<Game>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM games
+             WHERE LOWER(TRIM(name)) = ?1
+                OR (name_en IS NOT NULL AND TRIM(name_en) <> ''
+                    AND LOWER(TRIM(name_en)) = ?1)
+             LIMIT 1",
+            Self::GAME_COLUMNS
+        ))?;
+
+        for raw in names {
+            let key = raw.trim().to_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            let mut rows = stmt.query_map(params![key], Self::row_to_game)?;
+            match rows.next() {
+                Some(Ok(game)) => return Ok(Some(game)),
+                Some(Err(e)) => return Err(e.into()),
+                None => continue,
+            }
+        }
+        Ok(None)
+    }
+
     /// 删除游戏
     pub fn delete_game(&self, id: &str) -> Result<()> {
         self.conn.execute("DELETE FROM games WHERE id = ?1", params![id])?;
@@ -928,15 +975,12 @@ impl Database {
         name: &str,
         exe_name: Option<&str>,
     ) -> Result<Option<String>> {
-        /// ?1 = 待认领的名字；墓碑的 name 或 name_en 任一命中即可
-        const NAME_MATCH: &str = "((LOWER(TRIM(name)) = LOWER(TRIM(?1))) \
-             OR (name_en IS NOT NULL AND TRIM(name_en) <> '' \
-                 AND LOWER(TRIM(name_en)) = LOWER(TRIM(?1))))";
+        // ?1 = 待认领的名字；与防误接闸门共用模块级 NAME_MATCH_ANY
         let result = if let Some(exe) = exe_name {
             self.conn.query_row(
                 &format!(
                     "SELECT id FROM game_tombstones
-                     WHERE {NAME_MATCH}
+                     WHERE {NAME_MATCH_ANY}
                        AND LOWER(TRIM(exe_name)) = LOWER(TRIM(?2))
                      ORDER BY deleted_at DESC LIMIT 1"
                 ),
@@ -947,7 +991,7 @@ impl Database {
             self.conn.query_row(
                 &format!(
                     "SELECT id FROM game_tombstones
-                     WHERE {NAME_MATCH}
+                     WHERE {NAME_MATCH_ANY}
                      ORDER BY deleted_at DESC LIMIT 1"
                 ),
                 params![name],
@@ -987,8 +1031,11 @@ impl Database {
 
     /// 统计同名游戏数量（名字兜底认领的防误接判定：库中已无同名活条目才允许按名认领）
     pub fn count_games_by_name(&self, name: &str) -> Result<u32> {
+        // 【2026-11-08】与墓碑认领同口径：name / name_en 任一命中都算「库中已有」。
+        // 旧版只比 name，活条目 A(name=中文, name_en=英文) 遇上新导入条目
+        // B(name=该英文名) 时闸门返回 0，放行按名兜底认领一个可能无关的旧 id。
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM games WHERE LOWER(TRIM(name)) = LOWER(TRIM(?1))",
+            &format!("SELECT COUNT(*) FROM games WHERE {NAME_MATCH_ANY}"),
             params![name],
             |r| r.get(0),
         )?;
@@ -1746,10 +1793,30 @@ impl Database {
         Ok(stats)
     }
 
+    /// 手账条目 id / 名称 / 英文名（认领游玩时长专用）。
+    ///
+    /// 为什么另开一条：`get_reviews` 会把评价正文、封面路径等整行读出来，而认领只需要
+    /// 两个名字。手账条目多、评价长时，为了取名字把全表正文搬一遍是白花钱
+    /// （2026-10-28 审查指出）。
+    pub fn get_review_names(&self) -> Result<Vec<(String, String, Option<String>)>> {
+        let mut stmt = self.conn.prepare("SELECT id, name, name_en FROM reviews")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// 游玩时长候选行（手账「我的游玩时长」按名匹配游戏库用）。
     ///
     /// 两路来源与 `get_play_stats` 同口径：在库游戏取 `games.play_time_seconds` 卡片累计；
-    /// 已删游戏取 `play_stats_daily` 孤儿历史汇总、墓碑还原名字（墓碑不存 name_en，故恒 None）。
+    /// 已删游戏取 `play_stats_daily` 孤儿历史汇总、墓碑还原名字。
+    /// 墓碑自 2026-10-09 起也有 `name_en`（见 `migrate_add_tombstone_name_en_column`），
+    /// 这里必须一并带出，否则「删游戏前能按英文名认领、删后认领不上」——
+    /// 手账的「我的游玩时长」会在删除后凭空消失。
     /// 零时长不返回——手账只在真有游玩历史时才显示这一栏。
     pub fn get_play_time_candidates(&self) -> Result<Vec<PlayTimeCandidate>> {
         let mut stmt = self.conn.prepare(
@@ -1759,7 +1826,7 @@ impl Database {
 
              UNION ALL
 
-             SELECT COALESCE(t.name, ''), NULL,
+             SELECT COALESCE(t.name, ''), t.name_en,
                     COALESCE(SUM(d.total_seconds), 0), MAX(d.last_end)
              FROM play_stats_daily d
              LEFT JOIN game_tombstones t ON t.id = d.game_id
@@ -2057,49 +2124,10 @@ impl Database {
         Ok(stats)
     }
 
-    /// 获取游戏状态统计（三态口径，2026-09-06 与前端筛选对齐）：
-    /// - completed：用户手动标记已通关（优先判定，通关但从未启动也算已通关）
-    /// - played：启动过（play_time_seconds > 0）且未通关
-    /// - unplayed：从未启动（无时长）且未通关
-    ///
-    /// 收藏是独立维度不参与互斥；不再产出 playing / abandoned 桶
-    /// （前端筛选已从四态精简为三态，见 stores/games.ts 与 HomeView statusOptions）。
-    pub fn get_status_stats(&self) -> Result<StatusStats> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                CASE
-                    WHEN status = 'completed' THEN 'completed'
-                    WHEN play_time_seconds > 0 THEN 'played'
-                    ELSE 'unplayed'
-                END as effective_status,
-                COUNT(*)
-            FROM games GROUP BY effective_status"
-        )?;
-
-        let mut stats = StatusStats {
-            unplayed: 0,
-            played: 0,
-            completed: 0,
-        };
-
-        let rows = stmt.query_map([], |row| {
-            let status: String = row.get(0)?;
-            let count: i64 = row.get(1)?;
-            Ok((status, count as u32))
-        })?;
-
-        for row in rows {
-            let (status, count) = row?;
-            match status.as_str() {
-                "unplayed" => stats.unplayed = count,
-                "played" => stats.played = count,
-                "completed" => stats.completed = count,
-                _ => {}
-            }
-        }
-
-        Ok(stats)
-    }
+    // 【2026-11-08】删除 `get_status_stats` 及其 SQL：状态分布饼图早已下线，
+    // 前端封装与命令都已移除，这份 CASE 表达式是第二套三态口径，留着只会
+    // 和 `src/lib/gameFilter.ts`（唯一真相源）各自漂移。需要统计时请按
+    // gameFilter 的口径在该文件里补纯函数，别再复制一份 SQL。
 
     /// 获取所有游戏类型（去重）
     pub fn get_all_genres(&self) -> Result<Vec<String>> {
@@ -4215,5 +4243,58 @@ mod tests {
             !db2.get_achievement_global_stats().unwrap().has_full_week,
             "只有 6 天不得算完整一周"
         );
+    }
+
+    // ==================== find_game_by_any_name（手账认领游戏库取 Steam appid） ====================
+
+    fn seed_named(db: &Database, id: &str, name: &str, name_en: Option<&str>) {
+        let mut g = Game::new(name.to_string());
+        g.id = id.to_string();
+        g.name_en = name_en.map(|s| s.to_string());
+        db.upsert_game(&g).unwrap();
+    }
+
+    /// 2×2 交叉：手账传来的 key 撞 `games.name` 或 `games.name_en` 任一都算同一款游戏
+    #[test]
+    fn find_game_by_any_name_crosses_both_fields() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+        seed_named(&db, "g1", "空洞骑士", Some("Hollow Knight"));
+
+        // 中文名命中 games.name
+        let hit = db.find_game_by_any_name(&["空洞骑士".to_string()]).unwrap();
+        assert_eq!(hit.map(|g| g.id), Some("g1".to_string()));
+
+        // 英文名命中 games.name_en
+        let hit = db.find_game_by_any_name(&["Hollow Knight".to_string()]).unwrap();
+        assert_eq!(hit.map(|g| g.id), Some("g1".to_string()));
+
+        // 手账 name 被 LLM 改成别名时，第一个 key 打空、第二个 key 仍能认领
+        let hit = db
+            .find_game_by_any_name(&["空之骑士".to_string(), "hollow knight".to_string()])
+            .unwrap();
+        assert_eq!(hit.map(|g| g.id), Some("g1".to_string()));
+    }
+
+    /// 大小写/首尾空格不敏感；空 key 一律跳过 —— 已删游戏的孤儿历史名字会被还原成空串，
+    /// 若空串能命中，任何手账条目都会误挂到库里第一条游戏上（同 pick_play_time 那条防线）
+    #[test]
+    fn find_game_by_any_name_ignores_blank_and_case() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存库初始化失败");
+        seed_named(&db, "g1", "Hollow Knight", None);
+
+        assert_eq!(
+            db.find_game_by_any_name(&["  hollow KNIGHT  ".to_string()])
+                .unwrap()
+                .map(|g| g.id),
+            Some("g1".to_string())
+        );
+        assert!(db
+            .find_game_by_any_name(&["".to_string(), "   ".to_string()])
+            .unwrap()
+            .is_none());
+        assert!(db
+            .find_game_by_any_name(&["Sekiro".to_string()])
+            .unwrap()
+            .is_none());
     }
 }

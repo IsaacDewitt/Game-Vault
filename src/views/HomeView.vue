@@ -18,7 +18,7 @@ import {
 } from "naive-ui";
 import { SearchOutline, CloudDownloadOutline, AddOutline, DocumentTextOutline, FolderOutline, RefreshOutline, InformationCircleOutline } from "@vicons/ionicons5";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ref, computed, onMounted, onUnmounted, h } from "vue";
+import { ref, computed, onMounted, onUnmounted, watch, h } from "vue";
 import { useDebounceFn } from "@vueuse/core";
 import { listen } from "@tauri-apps/api/event";
 import { useGamesStore } from "../stores/games";
@@ -39,11 +39,26 @@ const dialog = useDialog();
 
 // 监听截图结果事件（全局热键触发截图后由后端推送）
 let unlistenScreenshot: (() => void) | null = null;
-// 平台游戏：待命转正 / 待命窗口内未现身（后端 lib.rs 的 tick.activated / tick.arm_timeouts）
-let unlistenPlatformStarted: (() => void) | null = null;
-let unlistenPlatformTimeout: (() => void) | null = null;
-// 与后端 PLATFORM_ARM_WINDOW_SECS（300 秒）保持一致，仅用于提示文案
-const PLATFORM_ARM_WINDOW_TEXT = "5 分钟";
+// 平台游戏的三态事件（转正 / 更新中 / 超时）已上移到全局 store：
+// 挂在视图里一旦视图生命周期变化就会丢事件，状态永远清不掉。
+// 此处只负责把 store 记下的超时事实弹成一条说明。
+// 【2026-11-08】watcher 必须在 `<script setup>` 顶层同步作用域创建：
+// 旧版放在 `onMounted(async ...)` 的 `await listen(...)` 之后，此时
+// `getCurrentScope()` 已复位，watcher 不挂到组件 effect scope，视图一旦
+// 被销毁重建（keep-alive 加 max / 条件渲染）就会残留旧 watcher 重复弹提示。
+watch(
+  () => store.launchNotice,
+  (notice) => {
+    if (!notice || notice.kind !== "timeout") return;
+    const name = store.games.find((g) => g.id === notice.gameId)?.name ?? "该游戏";
+    message.warning(
+      `《${name}》未启动成功：等待期间客户端没有拉起游戏进程（可能已取消更新、未登录或启动被中断），本次不计入时长`,
+      { duration: 8000 }
+    );
+    store.clearLaunchNotice();
+  }
+);
+
 onMounted(async () => {
   try {
     unlistenScreenshot = await listen<api.ScreenshotOutcome>("screenshot-taken", (event) => {
@@ -66,39 +81,6 @@ onMounted(async () => {
     console.error("监听截图事件失败:", e);
   }
 
-  // 平台游戏（Steam / Epic）由客户端异步拉起：待命转正后立刻把卡片标成"运行中"，
-  // 不必等下一次列表刷新；否则点了启动到游戏现身之间，界面一直像没反应。
-  try {
-    unlistenPlatformStarted = await listen<string[]>("platform-game-started", (event) => {
-      for (const id of event.payload) {
-        if (!store.activeGames.includes(id)) {
-          store.activeGames.push(id);
-        }
-      }
-    });
-  } catch (e) {
-    console.error("监听平台游戏启动事件失败:", e);
-  }
-
-  // 待命窗口内没等到游戏进程（正在更新 / 客户端未登录 / 用户取消）→ 必须给个交代：
-  // 此前后端只写了日志，界面毫无反馈，用户会以为"点了启动什么也没发生"。
-  try {
-    unlistenPlatformTimeout = await listen<string>("platform-launch-timeout", (event) => {
-      const gameId = event.payload;
-      const idx = store.activeGames.indexOf(gameId);
-      if (idx !== -1) {
-        store.activeGames.splice(idx, 1);
-      }
-      const name = store.games.find((g) => g.id === gameId)?.name ?? "该游戏";
-      message.warning(
-        `《${name}》启动超时：${PLATFORM_ARM_WINDOW_TEXT}内没等到游戏进程（可能正在更新、客户端未登录或已取消），本次不计入时长`,
-        { duration: 8000 }
-      );
-    });
-  } catch (e) {
-    console.error("监听平台启动超时事件失败:", e);
-  }
-
   // 检测截图热键是否注册成功（如 F12 被 Steam 等程序占用，启动时提示换键）
   try {
     const hotkeyError = await api.getScreenshotHotkeyStatus();
@@ -116,14 +98,6 @@ onUnmounted(() => {
   if (unlistenScreenshot) {
     unlistenScreenshot();
     unlistenScreenshot = null;
-  }
-  if (unlistenPlatformStarted) {
-    unlistenPlatformStarted();
-    unlistenPlatformStarted = null;
-  }
-  if (unlistenPlatformTimeout) {
-    unlistenPlatformTimeout();
-    unlistenPlatformTimeout = null;
   }
 });
 
@@ -164,7 +138,8 @@ const homeContextMenuY = ref(0);
 // 状态筛选选项
 // 三态模型：未游玩（从未启动）/ 已游玩（启动过）/ 已通关（用户手动标记）。
 // 是否「玩过」用 play_time_seconds 判断、是否「通关」用 status=completed 判断，
-// 与后端 get_status_stats 的智能推导口径一致；收藏是独立维度，不参与三态互斥。
+// 口径唯一真相源是 lib/gameFilter.ts（后端第二套 SQL 已于 2026-11-08 删除）；
+// 收藏是独立维度，不参与三态互斥。
 const statusOptions = [
   { label: "全部", value: "" },
   { label: "收藏", value: "favorites" },
@@ -397,6 +372,19 @@ async function handleLaunchGame(gameId: string) {
   }
 }
 
+/** 停止计时：只结束 GV 的会话，不关闭游戏进程 */
+async function handleStopGame(gameId: string) {
+  const game = store.games.find((g) => g.id === gameId);
+  const gameName = game?.name || "该游戏";
+  try {
+    await store.stop(gameId);
+    message.success(`已停止「${gameName}」的计时`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    message.error(`停止「${gameName}」计时失败: ${msg}`);
+  }
+}
+
 async function handleOpenScreenshots(gameId: string) {
   try {
     await api.openScreenshotDir(gameId);
@@ -420,14 +408,27 @@ async function handleRefreshCovers() {
     const authError = result.errors.find((e: string) =>
       e.includes("API Key 无效") || e.includes("401") || e.includes("403")
     );
+    // 后端因网络全断而中止整批时会给这条："网络异常，已中止：剩余 N 个游戏未尝试…"
+    // 它必须优先于「未找到」分支显示——旧顺序里 total>0 恒成立，网络故障永远被
+    // 说成「SteamGridDB 未找到」（2026-10-28 审查指出）。
+    const aborted = result.errors.find((e: string) => e.includes("已中止"));
 
     if (authError) {
       message.error("SteamGridDB API Key 无效，请在设置中重新配置");
+    } else if (aborted) {
+      message.error(aborted);
+      result.errors
+        .filter((e: string) => e !== aborted)
+        .slice(0, 3)
+        .forEach((e: string) => console.warn("封面获取:", e));
     } else if (result.fetched > 0) {
-      message.success(`已获取 ${result.fetched} 个游戏的封面`);
+      const rest = result.errors.length;
+      message.success(
+        `已获取 ${result.fetched} 个游戏的封面${rest ? `，另有 ${rest} 个没成功（详见控制台）` : ""}`
+      );
     } else if (result.total > 0) {
       message.warning(
-        `${result.total} 个游戏缺少封面，但在 SteamGridDB 中未找到。可尝试手动设置封面`
+        `${result.total} 个游戏缺少封面，自动抓取未找到可用图片。可尝试手动设置封面`
       );
       result.errors.forEach((e: string) => console.warn("封面获取:", e));
     } else if (result.errors.length === 0) {
@@ -772,6 +773,7 @@ function handleDeleteGame(gameId: string) {
           :key="game.id"
           :game="game"
           :is-active="store.activeGames.includes(game.id)"
+          :launch-state="store.launchState(game.id)"
           :save-path-exists="Object.keys(store.savePathStatus).length > 0 ? store.savePathStatus[game.id] : undefined"
           @click="store.selectGame(game)"
           @launch="handleLaunchGame(game.id)"
@@ -793,8 +795,10 @@ function handleDeleteGame(gameId: string) {
       v-if="store.selectedGame"
       :game="store.selectedGame"
       :is-active="store.activeGames.includes(store.selectedGame.id)"
+      :launch-state="store.launchState(store.selectedGame.id)"
       @close="store.clearSelection()"
       @launch="handleLaunchGame(store.selectedGame!.id)"
+      @stop="handleStopGame(store.selectedGame!.id)"
       @favorite="store.toggleFav(store.selectedGame!.id)"
       @delete="handleDeleteGame(store.selectedGame!.id)"
       @set-status="handleSetGameStatus(store.selectedGame!.id, $event)"

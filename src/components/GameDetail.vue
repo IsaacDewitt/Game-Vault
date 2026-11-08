@@ -17,6 +17,7 @@ import {
 } from "naive-ui";
 import {
   PlayOutline,
+  StopOutline,
   HeartOutline,
   Heart,
   TrashOutline,
@@ -37,6 +38,7 @@ import LaunchArgsModal from "./LaunchArgsModal.vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Game, PlaySessionDetail } from "../lib/tauri";
+import type { LaunchState } from "../lib/launchState";
 import * as api from "../lib/tauri";
 import { formatPlayTime, formatDate } from "../lib/format";
 import { useGamesStore } from "../stores/games";
@@ -45,15 +47,43 @@ import { useCoverImage } from "../lib/useCoverImage";
 const props = defineProps<{
   game: Game;
   isActive?: boolean;
+  /** 启动三态（后端真相源）；旧调用方可只传 isActive */
+  launchState?: LaunchState | null;
 }>();
 
 const emit = defineEmits<{
   close: [];
   launch: [];
+  /** 停止计时（不关闭游戏进程） */
+  stop: [];
   favorite: [];
   delete: [];
   setStatus: [status: string];
 }>();
+
+/** 只有后端确认「正式计时中」才把主按钮换成「停止游戏」 */
+const state = computed<LaunchState | null>(
+  () => props.launchState ?? (props.isActive ? "playing" : null),
+);
+const actionLabel = computed(() => {
+  switch (state.value) {
+    case "playing":
+      return "停止游戏";
+    case "updating":
+      return "客户端更新中";
+    case "launching":
+      return "启动中…";
+    default:
+      return "启动游戏";
+  }
+});
+function handleAction() {
+  if (state.value === "playing") {
+    emit("stop");
+  } else if (!state.value) {
+    emit("launch");
+  }
+}
 
 // 阻止 drawer 遮罩层的右键默认菜单（Naive UI 内部渲染的 mask 元素，Vue 的 @contextmenu.prevent 管不到）
 // 仅拦截遮罩层本身，避免像之前那样在 document 上全局禁用右键（会导致输入框粘贴菜单等全部失效）
@@ -542,11 +572,16 @@ async function handleRemoveSavePath(index: number) {
       <!-- 操作按钮 -->
       <div class="actions-section">
         <n-space>
-          <n-button type="primary" size="large" @click="emit('launch')">
+          <n-button
+            :type="state === 'playing' ? 'error' : 'primary'"
+            size="large"
+            :disabled="state === 'launching' || state === 'updating'"
+            @click="handleAction"
+          >
             <template #icon>
-              <n-icon :component="PlayOutline" />
+              <n-icon :component="state === 'playing' ? StopOutline : PlayOutline" />
             </template>
-            {{ isActive ? '游玩中' : '启动游戏' }}
+            {{ actionLabel }}
           </n-button>
           <n-button
             :type="game.status === 'completed' ? 'success' : 'default'"

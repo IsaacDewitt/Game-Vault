@@ -23,6 +23,19 @@ pub struct AchievementDef {
     pub tier_total: u32,
     /// 目标值（秒/次数/个数等），用于进度条展示
     pub target: u64,
+    /// 目标值量纲：`"seconds"`（秒） | `"count"`（次/款/天等计数）。
+    ///
+    /// 前端据此选择「1h 0m / 2h 0m」还是「120 / 250」的文案，**禁止靠 target
+    /// 数值大小猜单位**：HLTB 参考时长可能只有 600 秒，而「老江湖 500 次启动」
+    /// 数值更大却是计数型。旧版按 `target >= 60` 猜分钟，把藏书家 250 款
+    /// 显示成「4 分钟 / 4 分钟」（2026-11-08 修复）。
+    /// `#[serde(default)]` 保证旧数据/手写 JSON 缺字段时按计数处理，不破坏反序列化。
+    #[serde(default = "default_achievement_unit")]
+    pub unit: String,
+}
+
+fn default_achievement_unit() -> String {
+    "count".to_string()
 }
 
 /// 解锁记录（对应数据库 achievement_unlocks 表）

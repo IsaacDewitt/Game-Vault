@@ -879,7 +879,7 @@ async function handleImportSaves() {
             v-model:value="settings.steamgriddb_api_key"
             type="password"
             show-password-on="click"
-            placeholder="可选，用于自动获取封面图"
+            placeholder="可选，用于封面检索（SteamGridDB 选图与批量补封面）"
           />
         </n-form-item>
       </n-form>
