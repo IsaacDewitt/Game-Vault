@@ -3,32 +3,25 @@ import {
   NSpace,
   NInput,
   NButton,
-  NIcon,
   NSpin,
   NEmpty,
   NModal,
   NProgress,
-  NSelect,
-  NButtonGroup,
-  NDropdown,
-  NTooltip,
   useMessage,
   useDialog,
-  type DropdownOption,
 } from "naive-ui";
-import { SearchOutline, CloudDownloadOutline, AddOutline, DocumentTextOutline, FolderOutline, RefreshOutline, InformationCircleOutline } from "@vicons/ionicons5";
-import { open } from "@tauri-apps/plugin-dialog";
 import { ref, computed, onMounted, onUnmounted, watch, h } from "vue";
 import { useDebounceFn } from "@vueuse/core";
 import { listen } from "@tauri-apps/api/event";
 import { useGamesStore } from "../stores/games";
 import * as api from "../lib/tauri";
 import { DEBOUNCE_MS } from "../lib/constants";
+import { openAddGame } from "../lib/addGameFlow";
+import { useRefreshActions } from "../lib/refreshActions";
 import GameCard from "../components/GameCard.vue";
 import GameDetail from "../components/GameDetail.vue";
 import GameInfoEditModal from "../components/GameInfoEditModal.vue";
 import LaunchArgsModal from "../components/LaunchArgsModal.vue";
-import PlatformImportModal from "../components/PlatformImportModal.vue";
 import ContextMenu from "../components/ContextMenu.vue";
 import type { ContextMenuItem } from "../components/ContextMenu.vue";
 import { formatPlayTime } from "../lib/format";
@@ -36,6 +29,8 @@ import { formatPlayTime } from "../lib/format";
 const store = useGamesStore();
 const message = useMessage();
 const dialog = useDialog();
+// 刷新动作与侧边栏共用同一份实现（含 loading 状态），右键菜单仍保留入口
+const { refreshCovers, refreshAllInfo } = useRefreshActions();
 
 // 监听截图结果事件（全局热键触发截图后由后端推送）
 let unlistenScreenshot: (() => void) | null = null;
@@ -60,6 +55,9 @@ watch(
 );
 
 onMounted(async () => {
+  // 筛选弹层点外部关闭（挂在 document 上，避免全屏遮罩挡住卡片点击）
+  document.addEventListener("mousedown", handleDocMouseDown);
+
   try {
     unlistenScreenshot = await listen<api.ScreenshotOutcome>("screenshot-taken", (event) => {
       const o = event.payload;
@@ -95,20 +93,13 @@ onMounted(async () => {
   }
 });
 onUnmounted(() => {
+  document.removeEventListener("mousedown", handleDocMouseDown);
   if (unlistenScreenshot) {
     unlistenScreenshot();
     unlistenScreenshot = null;
   }
 });
 
-// 添加游戏弹窗状态
-const showNameModal = ref(false);
-const pendingExePath = ref("");
-const gameNameInput = ref("");
-// 游戏来源选择 + 平台导入（Steam / Epic）
-const showPlatformPicker = ref(false);
-const showPlatformImport = ref(false);
-const importPlatform = ref("steam");
 // 重命名游戏弹窗状态
 const showRenameModal = ref(false);
 const renamingGameId = ref("");
@@ -125,34 +116,43 @@ const launchArgsGameId = ref("");
 const launchArgsGame = computed(() =>
   launchArgsGameId.value ? store.games.find((g) => g.id === launchArgsGameId.value) ?? null : null
 );
-// 封面获取 loading 状态
-const refreshingCovers = ref(false);
-// 游戏信息获取 loading 状态
-const refreshingInfo = ref(false);
-
 // 主页右键菜单状态
 const showHomeContextMenu = ref(false);
 const homeContextMenuX = ref(0);
 const homeContextMenuY = ref(0);
 
-// 状态筛选选项
+// 搜索框本地值（防抖后才写进 store，避免每次按键重算整个列表）
+const searchInput = ref(store.searchQuery);
+const applySearch = useDebounceFn((value: string) => {
+  store.searchQuery = value;
+}, DEBOUNCE_MS);
+watch(searchInput, (value) => applySearch(value));
+
+function clearSearch() {
+  searchInput.value = "";
+  store.searchQuery = "";
+}
+
+// 状态筛选（单选，点亮的项再点一次即取消 = 全部）
 // 三态模型：未游玩（从未启动）/ 已游玩（启动过）/ 已通关（用户手动标记）。
 // 是否「玩过」用 play_time_seconds 判断、是否「通关」用 status=completed 判断，
-// 口径唯一真相源是 lib/gameFilter.ts（后端第二套 SQL 已于 2026-11-08 删除）；
-// 收藏是独立维度，不参与三态互斥。
-const statusOptions = [
-  { label: "全部", value: "" },
+// 口径唯一真相源是 lib/gameFilter.ts；收藏是独立维度，与三态互斥（选中收藏即不再按状态过滤）。
+// 2026-11-08：主页顶部那排按钮收进「筛选」弹层，值域与语义完全不变，只是不再占横排空间。
+const statusChipOptions = [
   { label: "收藏", value: "favorites" },
   { label: "未游玩", value: "unplayed" },
   { label: "已游玩", value: "played" },
   { label: "已通关", value: "completed" },
 ];
 
-// 类型筛选选项（从 store 动态加载）
-const genreSelectOptions = computed(() => [
-  { label: "全部类型", value: "" },
-  ...store.allGenres.map((g) => ({ label: g, value: g })),
-]);
+function toggleStatus(value: string) {
+  store.statusFilter = store.statusFilter === value ? "" : value;
+}
+
+// 类型筛选：同样单选，点亮的项再点一次取消
+function toggleGenre(genre: string) {
+  store.genreFilter = store.genreFilter === genre ? "" : genre;
+}
 
 // 排序选项：与手账（ReviewsView）同款两段式——排序字段 + 升降序。
 // 排序在前端内存里做（lib/gameFilter.ts），切排序不重新拉库，即时生效。
@@ -164,38 +164,22 @@ const sortOptions = [
   { label: "名称", value: "name" },
 ];
 
-const sortOrderOptions = [
-  { label: "降序", value: "desc" },
-  { label: "升序", value: "asc" },
-];
+// 「筛选」弹层：点外部关闭
+const filterOpen = ref(false);
+const filterPopRef = ref<HTMLElement | null>(null);
+const activeFilterCount = computed(
+  () => (store.statusFilter ? 1 : 0) + (store.genreFilter ? 1 : 0)
+);
 
-// 「刷新」合并下拉菜单：把刷新封面 / 刷新游戏信息 / 检查存档三项收进一个按钮
-const refreshMenuOptions: DropdownOption[] = [
-  {
-    label: "刷新封面",
-    key: "covers",
-    icon: () => h(NIcon, null, { default: () => h(CloudDownloadOutline) }),
-  },
-  {
-    label: "刷新游戏信息",
-    key: "info",
-    icon: () => h(NIcon, null, { default: () => h(DocumentTextOutline) }),
-  },
-  {
-    label: "检查存档",
-    key: "saves",
-    icon: () => h(NIcon, null, { default: () => h(FolderOutline) }),
-  },
-];
+function resetFilters() {
+  store.statusFilter = "";
+  store.genreFilter = "";
+}
 
-// 下拉菜单项点击分发到对应刷新动作
-function handleRefreshSelect(key: string | number) {
-  if (key === "covers") {
-    handleRefreshCovers();
-  } else if (key === "info") {
-    handleRefreshAllInfo();
-  } else if (key === "saves") {
-    store.checkSavePaths();
+function handleDocMouseDown(e: MouseEvent) {
+  if (!filterOpen.value) return;
+  if (filterPopRef.value && !filterPopRef.value.contains(e.target as Node)) {
+    filterOpen.value = false;
   }
 }
 
@@ -224,17 +208,17 @@ const homeContextMenuItems = computed<ContextMenuItem[]>(() => [
   {
     label: "添加游戏",
     icon: "🎮",
-    action: () => handleAddGame(),
+    action: () => openAddGame(),
   },
   {
     label: "刷新封面",
     icon: "🖼️",
-    action: () => handleRefreshCovers(),
+    action: () => refreshCovers(),
   },
   {
     label: "刷新游戏信息",
     icon: "📝",
-    action: () => handleRefreshAllInfo(),
+    action: () => refreshAllInfo(),
   },
   { label: "", icon: "", action: () => {}, divider: true },
   {
@@ -246,84 +230,6 @@ const homeContextMenuItems = computed<ContextMenuItem[]>(() => [
     },
   },
 ]);
-
-/** 点击「添加游戏」：先让老爷选游戏来源（本地 / Steam / Epic） */
-function handleAddGame() {
-  showPlatformPicker.value = true;
-}
-
-/** 来源选「本地游戏」→ 走原有的选择 exe 流程 */
-function handlePickLocalExe() {
-  showPlatformPicker.value = false;
-  pickExeFile();
-}
-
-/** 来源选 Steam / Epic → 打开平台导入弹窗 */
-function handlePickPlatform(platform: string) {
-  showPlatformPicker.value = false;
-  importPlatform.value = platform;
-  showPlatformImport.value = true;
-}
-
-/** 选择本地游戏的 exe 文件（原「添加游戏」流程） */
-async function pickExeFile() {
-  try {
-    const selected = await open({
-      multiple: false,
-      title: "选择游戏程序",
-      filters: [
-        {
-          name: "可执行文件",
-          extensions: ["exe"],
-        },
-      ],
-    });
-    if (selected) {
-      const exePath = selected as string;
-      // 从 exe 路径提取文件名（不含扩展名）作为默认游戏名
-      const fileName = exePath.split(/[/\\]/).pop() || "";
-      const defaultName = fileName.replace(/\.exe$/i, "");
-      pendingExePath.value = exePath;
-      gameNameInput.value = defaultName;
-      showNameModal.value = true;
-    }
-  } catch (e) {
-    console.error(e);
-    message.error("选择文件失败");
-  }
-}
-
-async function handleConfirmAddGame() {
-  const name = gameNameInput.value.trim();
-  if (!name) {
-    message.warning("请输入游戏名称");
-    return;
-  }
-  try {
-    await store.addGameManual(name, pendingExePath.value);
-    message.success(`已添加游戏: ${name}`);
-    showNameModal.value = false;
-    pendingExePath.value = "";
-    gameNameInput.value = "";
-  } catch (e) {
-    message.error("添加游戏失败");
-  }
-}
-
-function handleCancelAddGame() {
-  showNameModal.value = false;
-  pendingExePath.value = "";
-  gameNameInput.value = "";
-}
-
-/** 平台导入完成后刷新列表（导入是后端批量入库，前端需重新拉取） */
-async function handlePlatformImported() {
-  try {
-    await store.loadGames();
-  } catch (e) {
-    console.error("刷新游戏列表失败:", e);
-  }
-}
 
 function handleRenameGame(gameId: string) {
   const game = store.games.find((g) => g.id === gameId);
@@ -391,81 +297,6 @@ async function handleOpenScreenshots(gameId: string) {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     message.error(`打开截图文件夹失败: ${msg}`);
-  }
-}
-
-// 搜索去抖动（300ms）
-const handleSearch = useDebounceFn((value: string) => {
-  store.searchQuery = value;
-}, DEBOUNCE_MS);
-
-async function handleRefreshCovers() {
-  refreshingCovers.value = true;
-  try {
-    const result = await store.fetchCovers();
-
-    // 检查是否有 API Key 认证失败
-    const authError = result.errors.find((e: string) =>
-      e.includes("API Key 无效") || e.includes("401") || e.includes("403")
-    );
-    // 后端因网络全断而中止整批时会给这条："网络异常，已中止：剩余 N 个游戏未尝试…"
-    // 它必须优先于「未找到」分支显示——旧顺序里 total>0 恒成立，网络故障永远被
-    // 说成「SteamGridDB 未找到」（2026-10-28 审查指出）。
-    const aborted = result.errors.find((e: string) => e.includes("已中止"));
-
-    if (authError) {
-      message.error("SteamGridDB API Key 无效，请在设置中重新配置");
-    } else if (aborted) {
-      message.error(aborted);
-      result.errors
-        .filter((e: string) => e !== aborted)
-        .slice(0, 3)
-        .forEach((e: string) => console.warn("封面获取:", e));
-    } else if (result.fetched > 0) {
-      const rest = result.errors.length;
-      message.success(
-        `已获取 ${result.fetched} 个游戏的封面${rest ? `，另有 ${rest} 个没成功（详见控制台）` : ""}`
-      );
-    } else if (result.total > 0) {
-      message.warning(
-        `${result.total} 个游戏缺少封面，自动抓取未找到可用图片。可尝试手动设置封面`
-      );
-      result.errors.forEach((e: string) => console.warn("封面获取:", e));
-    } else if (result.errors.length === 0) {
-      message.info("所有游戏封面已是最新");
-    } else {
-      message.error(result.errors[0]);
-      result.errors.slice(1).forEach((e: string) => console.warn("封面获取:", e));
-    }
-  } catch (e) {
-    message.error("获取封面失败");
-  } finally {
-    refreshingCovers.value = false;
-  }
-}
-
-async function handleRefreshAllInfo() {
-  refreshingInfo.value = true;
-  try {
-    const result = await store.fetchGameInfo();
-
-    if (result.fetched > 0) {
-      message.success(`已获取 ${result.fetched} 个游戏的信息`);
-    } else if (result.total > 0) {
-      message.warning(
-        `${result.total} 个游戏缺少信息，但获取失败。请检查 LLM 配置`
-      );
-      result.errors.forEach((e: string) => console.warn("游戏信息获取:", e));
-    } else if (result.errors.length === 0) {
-      message.info("所有游戏信息已是最新");
-    } else {
-      message.error(result.errors[0]);
-      result.errors.slice(1).forEach((e: string) => console.warn("游戏信息获取:", e));
-    }
-  } catch (e) {
-    message.error("获取游戏信息失败，请检查 LLM 配置");
-  } finally {
-    refreshingInfo.value = false;
   }
 }
 
@@ -629,94 +460,123 @@ function handleDeleteGame(gameId: string) {
       </div>
     </div>
 
-    <!-- 顶部工具栏 -->
-    <div class="toolbar">
-      <n-space align="center" justify="space-between" style="width: 100%">
-        <n-space align="center">
-          <n-input
-            placeholder="搜索游戏..."
-            clearable
-            style="width: 240px"
-            @update:value="handleSearch"
-          >
-            <template #prefix>
-              <n-icon :component="SearchOutline" />
-            </template>
-          </n-input>
+    <!-- 顶部工具栏：搜索 + 排序 + 筛选（样式参照 Cine Vault 顶栏，见 .library-toolbar） -->
+    <div class="library-toolbar">
+      <div class="search-box">
+        <svg
+          class="search-ico"
+          width="15"
+          height="15"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+        >
+          <circle cx="11" cy="11" r="7" />
+          <path d="M21 21l-4.35-4.35" />
+        </svg>
+        <input v-model="searchInput" placeholder="搜索游戏名称…" spellcheck="false" />
+        <button v-if="searchInput" class="search-clear" title="清空" @click="clearSearch">✕</button>
+      </div>
 
-          <!-- 状态筛选 -->
-          <n-button-group>
-            <n-button
-              v-for="opt in statusOptions"
-              :key="opt.value"
-              :type="store.statusFilter === opt.value ? 'primary' : 'default'"
-              size="small"
-              @click="store.statusFilter = opt.value"
-            >
+      <!-- 排序：字段下拉 + ▲▼ 方向切换（内存排序，切换即时生效，不重新拉库） -->
+      <div class="sort-combo">
+        <div class="sort-selwrap">
+          <select v-model="store.sortBy" class="sort-sel" aria-label="排序方式">
+            <option v-for="opt in sortOptions" :key="opt.value" :value="opt.value">
               {{ opt.label }}
-            </n-button>
-          </n-button-group>
+            </option>
+          </select>
+        </div>
+        <div class="sort-dir">
+          <button
+            :class="{ on: store.sortOrder === 'asc' }"
+            title="升序"
+            aria-label="升序"
+            :aria-pressed="store.sortOrder === 'asc'"
+            @click="store.sortOrder = 'asc'"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M6 15l6-6 6 6" />
+            </svg>
+          </button>
+          <button
+            :class="{ on: store.sortOrder === 'desc' }"
+            title="降序"
+            aria-label="降序"
+            :aria-pressed="store.sortOrder === 'desc'"
+            @click="store.sortOrder = 'desc'"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M6 9l6 6 6-6" />
+            </svg>
+          </button>
+        </div>
+      </div>
 
-          <!-- 类型筛选 -->
-          <n-select
-            v-model:value="store.genreFilter"
-            :options="genreSelectOptions"
-            placeholder="游戏类型"
-            clearable
-            style="width: 150px"
-            size="small"
-          />
+      <!-- 筛选漏斗 + 弹层：状态与类型都收在这里，顶部不再摆一排按钮 -->
+      <div ref="filterPopRef" class="filter-anchor">
+        <button
+          class="filter-btn"
+          :class="{ active: activeFilterCount > 0 }"
+          :aria-expanded="filterOpen"
+          aria-haspopup="dialog"
+          @click="filterOpen = !filterOpen"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 5h18l-7 8v5.5l-4 2V13z" />
+          </svg>
+          筛选
+          <span v-if="activeFilterCount > 0" class="filter-badge">{{ activeFilterCount }}</span>
+        </button>
 
-          <!-- 排序：字段 + 升降序（内存排序，切换即时生效，不重新拉库） -->
-          <n-select
-            v-model:value="store.sortBy"
-            :options="sortOptions"
-            style="width: 118px"
-            size="small"
-          />
-          <n-select
-            v-model:value="store.sortOrder"
-            :options="sortOrderOptions"
-            style="width: 84px"
-            size="small"
-          />
-        </n-space>
-
-        <n-space align="center">
-          <!-- 「刷新」合并下拉：三个刷新动作收进一个按钮 -->
-          <n-dropdown trigger="click" :options="refreshMenuOptions" @select="handleRefreshSelect">
-            <n-button :loading="refreshingCovers || refreshingInfo || store.checkingSavePaths">
-              <template #icon>
-                <n-icon :component="RefreshOutline" />
-              </template>
-              刷新
-            </n-button>
-          </n-dropdown>
-
-          <!-- 圈感叹号：悬停解释每个刷新动作具体做什么 -->
-          <n-tooltip trigger="hover" placement="bottom-end" :style="{ maxWidth: '340px', whiteSpace: 'normal' }">
-            <template #trigger>
-              <n-button quaternary circle>
-                <template #icon>
-                  <n-icon :component="InformationCircleOutline" />
-                </template>
-              </n-button>
-            </template>
-            <div style="font-size: 12px; line-height: 1.8; text-align: left;">
-              <div><b>刷新封面</b> — 从 SteamGridDB 下载缺少封面的游戏封面图</div>
-              <div><b>刷新游戏信息</b> — 调用 AI 补全游戏简介、类型、发售日期等资料</div>
-              <div><b>检查存档</b> — 检测各游戏是否已正确配置存档目录</div>
+        <transition name="fb-pop">
+          <div v-if="filterOpen" class="filter-pop" role="dialog" aria-label="筛选">
+            <div class="fb-title">游戏状态</div>
+            <div class="fb-chips">
+              <button
+                v-for="opt in statusChipOptions"
+                :key="opt.value"
+                class="fb-chip"
+                :class="{ on: store.statusFilter === opt.value }"
+                :aria-pressed="store.statusFilter === opt.value"
+                @click="toggleStatus(opt.value)"
+              >
+                <span class="fb-ck">
+                  <svg viewBox="0 0 24 24" fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 12l6 6L20 6" />
+                  </svg>
+                </span>
+                {{ opt.label }}
+              </button>
             </div>
-          </n-tooltip>
 
-          <n-button type="primary" @click="handleAddGame">
-            <template #icon>
-              <n-icon :component="AddOutline" />
-            </template>
-            添加游戏
-          </n-button>
-        </n-space>
-      </n-space>
+            <div class="fb-title fb-title-gap">游戏类型</div>
+            <div class="fb-chips fb-genres">
+              <button
+                v-for="genre in store.allGenres"
+                :key="genre"
+                class="fb-chip"
+                :class="{ on: store.genreFilter === genre }"
+                :aria-pressed="store.genreFilter === genre"
+                @click="toggleGenre(genre)"
+              >
+                <span class="fb-ck">
+                  <svg viewBox="0 0 24 24" fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 12l6 6L20 6" />
+                  </svg>
+                </span>
+                {{ genre }}
+              </button>
+              <span v-if="store.allGenres.length === 0" class="fb-empty">库里还没有类型信息</span>
+            </div>
+
+            <div class="fb-actions">
+              <button @click="resetFilters">重置筛选</button>
+            </div>
+          </div>
+        </transition>
+      </div>
     </div>
 
     <!-- 封面获取进度条 -->
@@ -757,9 +617,11 @@ function handleDeleteGame(gameId: string) {
 
       <!-- 空状态 -->
       <div v-else-if="store.filteredGames.length === 0" class="empty">
-        <n-empty :description="store.games.length > 0 ? '没有符合筛选条件的游戏' : '还没有游戏，点击上方按钮添加'">
+        <n-empty
+          :description="store.games.length > 0 ? '没有符合筛选条件的游戏' : '还没有游戏，点左下角「添加游戏」开始'"
+        >
           <template #extra v-if="store.games.length === 0">
-            <n-button type="primary" @click="handleAddGame">
+            <n-button type="primary" @click="openAddGame()">
               添加游戏
             </n-button>
           </template>
@@ -803,76 +665,6 @@ function handleDeleteGame(gameId: string) {
       @delete="handleDeleteGame(store.selectedGame!.id)"
       @set-status="handleSetGameStatus(store.selectedGame!.id, $event)"
     />
-
-    <!-- 游戏来源选择弹窗：本地 / Steam / Epic -->
-    <n-modal
-      :show="showPlatformPicker"
-      preset="card"
-      title="添加游戏"
-      class="source-picker-modal"
-      :closable="true"
-      @close="showPlatformPicker = false"
-    >
-      <p style="margin-bottom: 14px; color: #999; font-size: 13px;">
-        请选择游戏来源：
-      </p>
-      <div class="source-list">
-        <button class="source-item" @click="handlePickLocalExe()">
-          <span class="source-icon">🖥️</span>
-          <span class="source-text">
-            <span class="source-title">本地游戏</span>
-            <span class="source-desc">手动选择游戏 exe，由本应用直接启动</span>
-          </span>
-        </button>
-        <button class="source-item" @click="handlePickPlatform('steam')">
-          <span class="source-icon">🎮</span>
-          <span class="source-text">
-            <span class="source-title">Steam 游戏</span>
-            <span class="source-desc">扫描本机 Steam 库，交由 Steam 启动并记录时长</span>
-          </span>
-        </button>
-        <button class="source-item" @click="handlePickPlatform('epic')">
-          <span class="source-icon">🕹️</span>
-          <span class="source-text">
-            <span class="source-title">Epic 游戏</span>
-            <span class="source-desc">扫描本机 Epic 库，交由 Epic 启动、记录时长并支持截图</span>
-          </span>
-        </button>
-      </div>
-    </n-modal>
-
-    <!-- 平台游戏导入弹窗 -->
-    <PlatformImportModal
-      :show="showPlatformImport"
-      :platform="importPlatform"
-      @close="showPlatformImport = false"
-      @imported="handlePlatformImported()"
-    />
-
-    <!-- 输入游戏名称弹窗 -->
-    <n-modal
-      :show="showNameModal"
-      preset="card"
-      title="添加游戏"
-      style="width: 450px"
-      :closable="true"
-      @close="handleCancelAddGame()"
-    >
-      <p style="margin-bottom: 12px; color: #999;">
-        请输入游戏名称：
-      </p>
-      <n-input
-        v-model:value="gameNameInput"
-        placeholder="游戏名称"
-        @keyup.enter="handleConfirmAddGame()"
-      />
-      <template #footer>
-        <n-space justify="end">
-          <n-button @click="handleCancelAddGame()">取消</n-button>
-          <n-button type="primary" @click="handleConfirmAddGame()">确认添加</n-button>
-        </n-space>
-      </template>
-    </n-modal>
 
     <!-- 重命名游戏弹窗 -->
     <n-modal
@@ -928,71 +720,15 @@ function handleDeleteGame(gameId: string) {
   </div>
 </template>
 
-<!-- 非 scoped：弹窗被 teleport 到 body，scoped 选择器无法命中内部卡片 -->
-<style>
-/* 「添加游戏」来源选择弹窗宽度：Modal 会把 class 透传到内部卡片 .n-modal 上
-   （与 .n-modal 同属一个元素，故此处用复合选择器）。卡片默认按内容撑满全宽，须显式定宽。 */
-.n-modal.source-picker-modal {
-  width: 440px;
-  max-width: 92vw;
-}
-</style>
-
 <style scoped>
+/* 纵向三段：最近游玩 / 工具栏 / 内容区。
+   内容区用 flex:1 吃掉剩余高度——旧版是 calc(100vh - 260px) 的硬编码，
+   工具栏一改高就会算错（多出空白或被裁掉），这里顺手收敛掉。 */
 .home-view {
   position: relative;
   height: calc(100vh - 48px);
-}
-
-/* 游戏来源选择弹窗 */
-.source-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-}
-
-.source-item {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 12px 14px;
-  text-align: left;
-  background: rgba(128, 128, 128, 0.08);
-  border: 1px solid rgba(128, 128, 128, 0.18);
-  border-radius: 8px;
-  cursor: pointer;
-  transition: all 0.15s;
-  font-family: inherit;
-  color: inherit;
-}
-
-.source-item:hover {
-  border-color: #6366f1;
-  background: rgba(99, 102, 241, 0.1);
-}
-
-.source-icon {
-  font-size: 22px;
-  line-height: 1;
-  flex-shrink: 0;
-}
-
-.source-text {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  min-width: 0;
-}
-
-.source-title {
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.source-desc {
-  font-size: 11.5px;
-  color: #888;
-  line-height: 1.4;
 }
 
 /* 最近游玩区域 */
@@ -1111,8 +847,384 @@ function handleDeleteGame(gameId: string) {
   margin-top: 2px;
 }
 
-.toolbar {
+
+/* ============================================
+   顶部工具栏（搜索 + 排序 + 筛选）
+   参照 Cine Vault 顶栏：内嵌图标的搜索框、排序组合控件（原生 select + ▲▼ 双键）、
+   筛选收进漏斗弹层。原生 select 靠 color-scheme 让下拉列表跟随深/浅主题。
+   ============================================ */
+.library-toolbar {
+  --tb-bg: rgba(255, 255, 255, 0.045);
+  --tb-bg-hover: rgba(255, 255, 255, 0.08);
+  --tb-border: rgba(255, 255, 255, 0.1);
+  --tb-border-strong: rgba(255, 255, 255, 0.2);
+  --tb-text: #d6d8e2;
+  --tb-text-dim: #85889a;
+  --tb-accent: var(--accent-color, #6366f1);
+  --tb-accent-dim: color-mix(in srgb, var(--tb-accent) 16%, transparent);
+
+  display: flex;
+  align-items: center;
+  gap: 10px;
   margin-bottom: 16px;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 40; /* 弹层要压住卡片（卡片 hover 用 z-index:2） */
+}
+
+/* ---- 搜索框 ---- */
+.search-box {
+  flex: 0 1 360px;
+  min-width: 180px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 12px;
+  background: var(--tb-bg);
+  border: 1px solid var(--tb-border);
+  border-radius: 10px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.search-box:focus-within {
+  border-color: var(--tb-accent);
+  box-shadow: 0 0 0 3px var(--tb-accent-dim);
+}
+
+.search-ico {
+  color: var(--tb-text-dim);
+  flex-shrink: 0;
+}
+
+.search-box input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 13.5px;
+}
+
+.search-box input::placeholder {
+  color: var(--tb-text-dim);
+}
+
+.search-clear {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: var(--tb-bg-hover);
+  color: var(--tb-text-dim);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.search-clear:hover {
+  color: var(--tb-text);
+}
+
+/* ---- 排序组合：字段下拉 + 方向双键 ---- */
+.sort-combo {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+}
+
+.sort-selwrap {
+  position: relative;
+}
+
+.sort-selwrap::after {
+  content: "▾";
+  position: absolute;
+  right: 9px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--tb-text-dim);
+  font-size: 10px;
+  pointer-events: none;
+}
+
+.sort-sel {
+  appearance: none;
+  -webkit-appearance: none;
+  color-scheme: dark;
+  height: 34px;
+  padding: 0 24px 0 10px;
+  background: var(--tb-bg);
+  border: 1px solid var(--tb-border);
+  border-radius: 8px;
+  color: var(--tb-text);
+  font-family: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: border-color 0.13s;
+}
+
+.sort-sel:hover {
+  border-color: var(--tb-border-strong);
+}
+
+.sort-sel:focus {
+  outline: none;
+  border-color: var(--tb-accent);
+}
+
+.sort-dir {
+  display: flex;
+  flex-direction: column;
+  height: 34px;
+  border: 1px solid var(--tb-border);
+  border-radius: 8px;
+  background: var(--tb-bg);
+  overflow: hidden;
+}
+
+.sort-dir button {
+  flex: 1;
+  width: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--tb-text-dim);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.sort-dir button:hover {
+  background: var(--tb-bg-hover);
+}
+
+.sort-dir button.on {
+  color: var(--tb-accent);
+  background: var(--tb-accent-dim);
+}
+
+.sort-dir svg {
+  width: 11px;
+  height: 11px;
+}
+
+/* ---- 筛选漏斗 ---- */
+.filter-anchor {
+  position: relative;
+}
+
+.filter-btn {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 12px;
+  background: var(--tb-bg);
+  border: 1px solid var(--tb-border);
+  border-radius: 8px;
+  color: var(--tb-text);
+  font-family: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: border-color 0.13s, color 0.13s;
+}
+
+.filter-btn:hover {
+  border-color: var(--tb-border-strong);
+}
+
+.filter-btn.active {
+  border-color: color-mix(in srgb, var(--tb-accent) 45%, transparent);
+  color: var(--tb-accent);
+}
+
+.filter-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.filter-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--tb-accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 筛选弹层 ---- */
+.filter-pop {
+  position: absolute;
+  top: 42px;
+  right: 0;
+  width: 368px;
+  padding: 14px 16px;
+  background: #1e1f33;
+  border: 1px solid var(--tb-border-strong);
+  border-radius: 12px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+  z-index: 60;
+}
+
+.fb-pop-enter-active,
+.fb-pop-leave-active {
+  transition: opacity 0.14s ease, transform 0.14s ease;
+}
+
+.fb-pop-enter-from,
+.fb-pop-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.fb-title {
+  font-size: 11px;
+  color: var(--tb-text-dim);
+  letter-spacing: 1px;
+  margin-bottom: 9px;
+}
+
+.fb-title-gap {
+  margin-top: 14px;
+}
+
+.fb-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.fb-genres {
+  max-height: 168px;
+  overflow-y: auto;
+  padding-right: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+}
+
+.fb-empty {
+  font-size: 12px;
+  color: var(--tb-text-dim);
+}
+
+.fb-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px solid var(--tb-border);
+  background: var(--tb-bg);
+  color: var(--tb-text-dim);
+  font-family: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: border-color 0.13s, color 0.13s, background 0.13s;
+}
+
+.fb-chip:hover {
+  border-color: var(--tb-border-strong);
+}
+
+.fb-chip.on {
+  background: var(--tb-accent-dim);
+  border-color: color-mix(in srgb, var(--tb-accent) 45%, transparent);
+  color: var(--tb-accent);
+}
+
+.fb-ck {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  border-radius: 4px;
+  border: 1.5px solid var(--tb-text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: transparent;
+  transition: background 0.13s, border-color 0.13s, color 0.13s;
+}
+
+.fb-ck svg {
+  width: 9px;
+  height: 9px;
+  fill: none;
+  stroke: currentColor;
+}
+
+.fb-chip.on .fb-ck {
+  background: var(--tb-accent);
+  border-color: var(--tb-accent);
+  color: #fff;
+}
+
+.fb-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--tb-border);
+}
+
+.fb-actions button {
+  border: none;
+  background: transparent;
+  color: var(--tb-text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
+}
+
+.fb-actions button:hover {
+  color: var(--tb-text);
+  background: var(--tb-bg-hover);
+}
+
+/* 亮色主题：同一套控件换一套灰度，弹层改白底 */
+.light-theme .library-toolbar {
+  --tb-bg: rgba(0, 0, 0, 0.03);
+  --tb-bg-hover: rgba(0, 0, 0, 0.06);
+  --tb-border: rgba(0, 0, 0, 0.1);
+  --tb-border-strong: rgba(0, 0, 0, 0.2);
+  --tb-text: #333;
+  --tb-text-dim: #7c818f;
+}
+
+.light-theme .sort-sel {
+  color-scheme: light;
+}
+
+.light-theme .filter-pop {
+  background: #fff;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.12);
+}
+
+.light-theme .fb-genres {
+  scrollbar-color: rgba(0, 0, 0, 0.16) transparent;
 }
 
 .cover-progress {
@@ -1130,7 +1242,8 @@ function handleDeleteGame(gameId: string) {
 }
 
 .content-area {
-  height: calc(100vh - 260px);
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
 
   /* Dark scrollbar to match project theme */

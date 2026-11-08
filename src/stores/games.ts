@@ -306,14 +306,16 @@ export const useGamesStore = defineStore("games", () => {
   }
 
   /**
-   * 手动添加游戏：入库后自动跑一次 LLM 补全（元数据 + 正式命名）。
+   * 手动添加游戏：**纯本地入库，不发任何网络请求**（2026-11-08 按老爷要求改）。
    *
-   * **不再自动拉封面**（2026-10-30 按老爷要求改）：旧实现这里调 `fetchCovers()`，
-   * 而它是个「批量补全库内**所有**缺失封面」的动作 —— 加一个游戏会把整库扫一遍，
-   * 图和这条新条目还未必对得上。封面改由详情页「更换封面」三源手动指定。
+   * 两段自动化都是被老爷逐次砍掉的，别再好心补回来：
+   * - 2026-10-30 砍 `fetchCovers()`：它是个「批量补全库内**所有**缺失封面」的动作，
+   *   加一个游戏会把整库扫一遍，图和这条新条目还未必对得上。
+   * - 2026-11-08 砍 `fetchGameInfoLlm()`：加游戏就该是"填进去即完事"，
+   *   不该在后台偷偷发一次 LLM 请求，还顺手把用户刚敲的名字改写一遍。
    *
-   * 补全失败一律静默（未配置 LLM / 断网 / 模型返回异常都很常见），只留日志：
-   * 添加本身已经成功，没理由弹红框让用户以为没加进去。
+   * 补信息 / 补封面全部改为手动入口：详情页的「获取信息」「更换封面」，
+   * 侧边栏的「刷新游戏信息 / 刷新封面」。本函数只保证入库 + 刷新内存列表 + 本地成就。
    * 返回入库后的条目，调用方据此立刻给出"已添加"反馈。
    */
   async function addGameManual(name: string, exePath: string) {
@@ -321,10 +323,6 @@ export const useGamesStore = defineStore("games", () => {
       const game = await api.addGameManual(name, exePath);
       await loadGames();
       checkAchievementsQuietly();
-      // LLM 一次要几秒到十几秒，后台跑，不挡住"已添加"的反馈；成功后 store 内就地更新
-      fetchGameInfoLlm(game.id)
-        .then(() => loadGames())
-        .catch((e) => console.warn("添加后自动补全游戏信息失败:", e));
       return game;
     } catch (e) {
       console.error("添加游戏失败:", e);

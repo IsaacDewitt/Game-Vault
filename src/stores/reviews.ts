@@ -191,19 +191,20 @@ export const useReviewsStore = defineStore("reviews", () => {
   }
 
   /**
-   * 添加手账条目（只填名字），随后自动跑一次 LLM 补全（元数据 + 命名 + 官方英文名）。
+   * 添加手账条目（只填名字）：**纯本地入库，不发任何网络请求**（2026-11-08 按老爷要求改）。
    *
-   * **不再自动拉封面**（2026-10-30 按老爷要求改）：旧实现连带抓一张 SteamGridDB 的图，
-   * 抓回来是什么全凭运气；现在封面三个来源（本地 / Steam 官方 / SteamGridDB）
-   * 全归用户手动挑选，添加完自己挑一张。
+   * - 2026-10-30 砍掉自动拉封面：旧实现连带抓一张 SteamGridDB 的图，抓回来是什么全凭运气；
+   *   现在封面三个来源（本地 / Steam 官方 / SteamGridDB）全归用户手动挑选。
+   * - 2026-11-08 砍掉自动 LLM 补全：与游戏库 `addGameManual` 同一轮拍板，
+   *   「添加」一律不发请求，元数据由详情页的「获取信息」手动触发。
+   *
+   * `loadPlayTimes()` 保留：它只读本地库做按名匹配，不出网。
    */
   async function addReview(name: string) {
     const review = await api.addReview(name);
     reviews.value.unshift(review);
-    // 新名字可能直接对上游戏库的时长，补拉一次
+    // 新名字可能直接对上游戏库的时长，补拉一次本地映射
     loadPlayTimes().catch(() => {});
-    // 自动补全信息（只跑 LLM），失败不阻断添加
-    refreshReviewInfo(review.id).catch(() => {});
     return review;
   }
 

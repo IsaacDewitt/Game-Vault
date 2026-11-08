@@ -6,6 +6,8 @@ import { HomeOutline, StatsChartOutline, SettingsOutline, GameControllerOutline,
 import HomeView from "./views/HomeView.vue";
 import AboutModal from "./components/AboutModal.vue";
 import AchievementToast from "./components/AchievementToast.vue";
+import SidebarActions from "./components/SidebarActions.vue";
+import AddGameFlow from "./components/AddGameFlow.vue";
 import { useGamesStore } from "./stores/games";
 import * as api from "./lib/tauri";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -348,20 +350,24 @@ onUnmounted(() => {
             @expand="collapsed = false"
             :native-scrollbar="false"
           >
-            <div class="logo" :class="{ collapsed }">
-              <n-icon size="28" :color="accentColor">
-                <GameControllerOutline />
-              </n-icon>
-              <span v-if="!collapsed" class="logo-text" :style="{ color: accentColor }">Game Vault</span>
+            <div class="sider-inner">
+              <div class="logo" :class="{ collapsed }">
+                <n-icon size="28" :color="accentColor">
+                  <GameControllerOutline />
+                </n-icon>
+                <span v-if="!collapsed" class="logo-text" :style="{ color: accentColor }">Game Vault</span>
+              </div>
+              <n-menu
+                :collapsed="collapsed"
+                :collapsed-width="64"
+                :collapsed-icon-size="22"
+                :options="menuOptions"
+                :value="activeView"
+                @update:value="handleMenuUpdate"
+              />
+              <!-- 全局动作（刷新 / 添加游戏）：与当前视图无关，常驻左下角 -->
+              <SidebarActions :collapsed="collapsed" />
             </div>
-            <n-menu
-              :collapsed="collapsed"
-              :collapsed-width="64"
-              :collapsed-icon-size="22"
-              :options="menuOptions"
-              :value="activeView"
-              @update:value="handleMenuUpdate"
-            />
           </n-layout-sider>
 
           <!-- 主内容区 -->
@@ -377,6 +383,8 @@ onUnmounted(() => {
 
       <!-- 关于对话框 -->
       <AboutModal :show="showAbout" :version="appVersion" @close="showAbout = false" />
+      <!-- 添加游戏流程（弹窗宿主与视图解耦，任何页面都能唤起） -->
+      <AddGameFlow />
       <!-- 成就解锁通知 -->
       <AchievementToast />
     </n-config-provider>
@@ -563,6 +571,15 @@ textarea,
 .light-theme .title-btn-close:hover {
   background: #e81123;
   color: #fff;
+}
+
+/* 侧栏内容：min-height 撑满「窗口高度 - 标题栏 32px」，配合子项 margin-top:auto
+   把左下角的刷新/添加按钮压到底部。不用 height:100%——sider 内部是
+   NScrollbar 的容器，百分比高度在 auto 高度链上不生效。 */
+.sider-inner {
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100vh - 32px);
 }
 
 .logo {
